@@ -1147,23 +1147,39 @@ impl Click for CRec {
 
 const NO_CLICK: u32 = u32::MAX;
 
+/// 8 session starts, or their latest clicks, held in a register
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+type V8 = core::arch::x86_64::__m256i;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+type V8 = [u32; 8];
+
+#[inline(always)]
+unsafe fn load8(p: *const u32) -> V8 {
+    (p as *const V8).read_unaligned()
+}
+
+#[inline(always)]
+unsafe fn store8(p: *mut u32, v: V8) {
+    (p as *mut V8).write_unaligned(v)
+}
+
 /// Click `k` at time `lo` against 8 session starts. Bit i of the results:
 /// `ss[i] >= lo`, `ss[i] <= hi`, and "the latest click so far for session i
 /// is at this very time". Where the click is at or before the start and
 /// later than the latest so far, it becomes the latest.
 #[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), allow(dead_code))]
 #[inline(always)]
-unsafe fn click8_plain(ss: *const u32, bkey: *mut u32, bidx: *mut u32, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+fn click8_plain(ss: &[u32; 8], bkey: &mut [u32; 8], bidx: &mut [u32; 8], lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
     let (mut ge, mut le, mut tie) = (0u64, 0u64, 0u64);
     for i in 0..8 {
-        let x = *ss.add(i);
+        let x = ss[i];
         le |= ((x <= hi) as u64) << i;
         if x >= lo {
             ge |= 1 << i;
-            if *bidx.add(i) == NO_CLICK || lo > *bkey.add(i) {
-                *bkey.add(i) = lo;
-                *bidx.add(i) = k;
-            } else if lo == *bkey.add(i) {
+            if bidx[i] == NO_CLICK || lo > bkey[i] {
+                bkey[i] = lo;
+                bidx[i] = k;
+            } else if lo == bkey[i] {
                 tie |= 1 << i;
             }
         }
@@ -1173,29 +1189,29 @@ unsafe fn click8_plain(ss: *const u32, bkey: *mut u32, bidx: *mut u32, lo: u32, 
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn click8(ss: *const u32, bkey: *mut u32, bidx: *mut u32, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+fn click8(x: V8, bkey: &mut V8, bidx: &mut V8, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
     use core::arch::x86_64::*;
-    let bits = |v: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 as u64;
-    let x = _mm256_loadu_si256(ss as *const __m256i);
-    let key = _mm256_set1_epi32(lo as i32);
-    let ge = _mm256_cmpeq_epi32(_mm256_max_epu32(x, key), x);
-    let le = _mm256_cmpeq_epi32(_mm256_min_epu32(x, _mm256_set1_epi32(hi as i32)), x);
-    let bk = _mm256_loadu_si256(bkey as *const __m256i);
-    let bi = _mm256_loadu_si256(bidx as *const __m256i);
-    let none = _mm256_cmpeq_epi32(bi, _mm256_set1_epi32(-1));
-    // a latest click that is no earlier than this one stays
-    let stays = _mm256_andnot_si256(none, _mm256_cmpeq_epi32(_mm256_max_epu32(bk, key), bk));
-    let takes = _mm256_andnot_si256(stays, ge);
-    let tie = _mm256_and_si256(_mm256_andnot_si256(none, _mm256_cmpeq_epi32(bk, key)), ge);
-    _mm256_storeu_si256(bkey as *mut __m256i, _mm256_blendv_epi8(bk, key, takes));
-    _mm256_storeu_si256(bidx as *mut __m256i, _mm256_blendv_epi8(bi, _mm256_set1_epi32(k as i32), takes));
-    (bits(ge), bits(le), bits(tie))
+    unsafe {
+        let bits = |v: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 as u64;
+        let key = _mm256_set1_epi32(lo as i32);
+        let ge = _mm256_cmpeq_epi32(_mm256_max_epu32(x, key), x);
+        let le = _mm256_cmpeq_epi32(_mm256_min_epu32(x, _mm256_set1_epi32(hi as i32)), x);
+        let (bk, bi) = (*bkey, *bidx);
+        let none = _mm256_cmpeq_epi32(bi, _mm256_set1_epi32(-1));
+        // a latest click that is no earlier than this one stays
+        let stays = _mm256_andnot_si256(none, _mm256_cmpeq_epi32(_mm256_max_epu32(bk, key), bk));
+        let takes = _mm256_andnot_si256(stays, ge);
+        let tie = _mm256_and_si256(_mm256_andnot_si256(none, _mm256_cmpeq_epi32(bk, key)), ge);
+        *bkey = _mm256_blendv_epi8(bk, key, takes);
+        *bidx = _mm256_blendv_epi8(bi, _mm256_set1_epi32(k as i32), takes);
+        (bits(ge), bits(le), bits(tie))
+    }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn click8(ss: *const u32, bkey: *mut u32, bidx: *mut u32, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
-    click8_plain(ss, bkey, bidx, lo, hi, k)
+fn click8(x: V8, bkey: &mut V8, bidx: &mut V8, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+    click8_plain(&x, bkey, bidx, lo, hi, k)
 }
 
 /// Credit and assists for a person of at most `SMALL` sessions, the clicks
@@ -1211,27 +1227,44 @@ fn attribute_small<C: Click>(ctx: &Ctx, cl: &[C], at: usize, t: &mut Tmp, o: &mu
     let groups = (ns + 7) / 8;
     let ssp = t.ss.as_ptr();
     let (bkey, bidx) = (t.bkey.as_mut_ptr(), t.bidx.as_mut_ptr());
+    // sessionize left the last group of 8 starts whole. The first group and
+    // its latest clicks stay in registers while the clicks go by: no click
+    // waits for the stores of the one before.
+    let (ss0, mut key0, mut idx0) = unsafe { (load8(ssp), load8(bkey), load8(bidx)) };
     for (k, c) in cl.iter().enumerate() {
         let lo = c.ts();
         let hi = lo.saturating_add(WEEK);
-        // sessionize left the last group of 8 starts whole
-        let (mut ge, mut le, mut tie) = unsafe { click8(ssp, bkey, bidx, lo, hi, k as u32) };
+        let (mut ge, mut le, mut tie) = click8(ss0, &mut key0, &mut idx0, lo, hi, k as u32);
         for g in 1..groups {
-            let (a, b, e) = unsafe { click8(ssp.add(8 * g), bkey.add(8 * g), bidx.add(8 * g), lo, hi, k as u32) };
+            let (a, b, e) = unsafe {
+                let (mut bk, mut bi) = (load8(bkey.add(8 * g)), load8(bidx.add(8 * g)));
+                let r = click8(load8(ssp.add(8 * g)), &mut bk, &mut bi, lo, hi, k as u32);
+                store8(bkey.add(8 * g), bk);
+                store8(bidx.add(8 * g), bi);
+                r
+            };
             ge |= a << (8 * g);
             le |= b << (8 * g);
             tie |= e << (8 * g);
         }
         t.cm[c.camp()] |= ge & le & valid;
         tie &= valid;
-        // several clicks in one millisecond: the smallest id is the latest
-        while tie != 0 {
-            let i = tie.trailing_zeros() as usize;
-            tie &= tie - 1;
-            if c.id(ctx, at) < cl[t.bidx[i] as usize].id(ctx, at) {
-                t.bidx[i] = k as u32;
+        if tie != 0 {
+            // several clicks in one millisecond: the smallest id is the latest
+            unsafe { store8(bidx, idx0) };
+            while tie != 0 {
+                let i = tie.trailing_zeros() as usize;
+                tie &= tie - 1;
+                if c.id(ctx, at) < cl[t.bidx[i] as usize].id(ctx, at) {
+                    t.bidx[i] = k as u32;
+                }
             }
+            idx0 = unsafe { load8(bidx) };
         }
+    }
+    unsafe {
+        store8(bkey, key0);
+        store8(bidx, idx0);
     }
 
     // credit: the latest click, if it is within 7 days of the start
@@ -2865,8 +2898,14 @@ mod tests {
             let (mut kb, mut ib) = (ka, ia);
             for k in 0..6u32 {
                 let (lo, hi) = (pick(&mut x), pick(&mut x));
-                let a = unsafe { click8(ss.as_ptr(), ka.as_mut_ptr(), ia.as_mut_ptr(), lo, hi, k) };
-                let b = unsafe { click8_plain(ss.as_ptr(), kb.as_mut_ptr(), ib.as_mut_ptr(), lo, hi, k) };
+                let a = unsafe {
+                    let (mut bk, mut bi) = (load8(ka.as_ptr()), load8(ia.as_ptr()));
+                    let r = click8(load8(ss.as_ptr()), &mut bk, &mut bi, lo, hi, k);
+                    store8(ka.as_mut_ptr(), bk);
+                    store8(ia.as_mut_ptr(), bi);
+                    r
+                };
+                let b = click8_plain(&ss, &mut kb, &mut ib, lo, hi, k);
                 assert_eq!(a, b, "{:?} {} {}", ss, lo, hi);
                 assert_eq!((ka, ia), (kb, ib), "{:?} {} {}", ss, lo, hi);
                 let ge: u64 = (0..8).map(|i| ((ss[i] >= lo) as u64) << i).sum();

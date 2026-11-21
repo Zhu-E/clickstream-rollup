@@ -971,7 +971,7 @@ struct Frag {
 struct Wk<'a> {
     cl2: Vec<CRec>,
     slots: Blob<FRec>,
-    /// a bucket's events in counter order: room for every slot
+    /// the current user's events in counter order: room for every slot of a bucket
     ev: Blob<PRec>,
     run: Vec<PRec>,
     cl: Vec<CRec>,
@@ -1089,14 +1089,14 @@ impl<'a> Wk<'a> {
         }
     }
 
-    /// one user's events `from..to` of the bucket's buffer
+    /// one user's events, the first `n` of the buffer
     #[inline(never)]
-    fn end_run(&mut self, sh: &Sh, ui: u32, at: u32, edge: bool, unsorted: bool, from: usize, to: usize) {
-        if from == to {
+    fn end_run(&mut self, sh: &Sh, ui: u32, at: u32, edge: bool, unsorted: bool, n: usize) {
+        if n == 0 {
             return;
         }
-        // the buffer is only written by `bucket`, which is not using this part
-        let run = unsafe { std::slice::from_raw_parts_mut(self.ev.as_mut_ptr().add(from), to - from) };
+        // `bucket` writes the buffer and is not doing so now
+        let run = unsafe { std::slice::from_raw_parts_mut(self.ev.as_mut_ptr(), n) };
         if edge || sh.defer[(ui >> 6) as usize] >> (ui & 63) & 1 != 0 {
             self.frags.push(Frag { ui, at, ev: run.to_vec() });
         } else {
@@ -1170,8 +1170,8 @@ impl<'a> Wk<'a> {
         let mut back = 0u32;
         // a plain event of the current user's own person has (user:31 tag:2) in own..=own + 4 * top
         let (mut own, mut top) = (u64::MAX, 0u64);
-        // events written, and where the current user's begin
-        let (mut to, mut from) = (0usize, 0usize);
+        // events of the current user written so far
+        let mut to = 0usize;
         for i in 0..n {
             let s = unsafe { *slots.add(i) };
             // one compare for: live, this user, an alias of the own person
@@ -1201,14 +1201,15 @@ impl<'a> Wk<'a> {
             let ui = (un >> 9) as u32;
             if ui != cur {
                 if cur != NONE {
-                    self.end_run(sh, cur, (b as u32) << 1, runs == 1, back >> 31 != 0, from, to);
+                    self.end_run(sh, cur, (b as u32) << 1, runs == 1, back >> 31 != 0, to);
                 }
                 cur = ui;
                 ue = sh.u[ui as usize];
                 runs += 1;
                 last = 0;
                 back = 0;
-                from = to;
+                // the run is folded or copied out: the next one reuses the warm start of the buffer
+                to = 0;
                 (own, top) = if ue & GENERAL == 0 { (((ui as u64) << 11) | LIVE, (ue & 511) as u64) } else { (u64::MAX, 0) };
             }
             if member(ue, un & ALIAS) {
@@ -1222,7 +1223,7 @@ impl<'a> Wk<'a> {
             }
         }
         if cur != NONE {
-            self.end_run(sh, cur, ((b as u32) << 1) | (runs > 1) as u32, true, back >> 31 != 0, from, to);
+            self.end_run(sh, cur, ((b as u32) << 1) | (runs > 1) as u32, true, back >> 31 != 0, to);
         }
     }
 
