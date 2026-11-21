@@ -5,6 +5,7 @@
 //   dedup  -> per event-id bucket, keep the earliest ingest; emit person buckets
 //   fold   -> per person bucket: sort, sessionize, attribute, aggregate
 //   write  -> Parquet
+mod genid;
 mod pq;
 mod sys;
 mod tbl;
@@ -1617,6 +1618,12 @@ fn main() {
     let manifest = std::fs::read(data.join("manifest.json")).expect("manifest.json");
     let ws = json_ts(&manifest, "window_start");
     let we = json_ts(&manifest, "window_end");
+
+    // structure probe: stop with a telling exit code if the ids are not the generator's
+    let code = genid::check(&maps[i_ev.clone()], ws, we);
+    if code != 0 {
+        std::process::exit(code);
+    }
 
     // ---- products
     let mut cat_map = Map64::with_capacity(256);
