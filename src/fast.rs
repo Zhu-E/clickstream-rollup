@@ -463,8 +463,8 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
             return;
         }
         rows += 1;
-        let ing_ms = parse_ts_c(fld(3), dc).unwrap_or(0);
-        let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
+        let g = ingest(fld(3), dc);
+        let (ing_ms, ing) = (g.ms, g.sec);
         let user = fld(1);
         let mut valid = false;
         let mut ts = 0i64;
@@ -480,7 +480,7 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
             if ts < ctx.ev_lo || ts >= ctx.ev_hi {
                 break;
             }
-            if ing_ms.saturating_sub(ts) > LATE_MS {
+            if ing_ms > ts.saturating_add(LATE_MS) {
                 break;
             }
             let ety = fld(4);
