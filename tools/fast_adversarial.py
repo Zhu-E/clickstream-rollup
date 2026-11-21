@@ -239,6 +239,18 @@ def v_shuffled_users(src, dst):
     rewrite(src, dst, "events", lambda fi, ri, f: [f[0], us[(ri * 7 + fi) % 64]] + f[2:] if f[1] and ri % 2 == 0 else None)
 
 
+def v_wide_fast(src, dst, general=False):
+    # one person-day past 32 bits: every user_daily file must then be 64-bit
+    a = busiest(src)[0]
+    rewrite(src, dst, "events", lambda fi, ri, f: f[:4] + ["purchase", f[5], "10000000"] if f[1] == a else None)
+    if general:
+        add(dst, "links", "zz-extra.csv", LK_HEAD, ["%s,%s" % (a.upper(), a)])
+
+
+def v_wide_general(src, dst):
+    v_wide_fast(src, dst, True)
+
+
 VARIANTS = {k[2:]: v for k, v in list(globals().items()) if k.startswith("v_")}
 
 

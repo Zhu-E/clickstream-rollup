@@ -13,8 +13,12 @@ is one ~500 KB binary; it needs no network at run time and no files outside
 Five passes, each spread over all eight threads, over one bump-allocated arena
 backed by transparent huge pages.
 
-1. **Links.** Every `links/*.csv` row is parsed in parallel, then a union-find
-   joins the ids into people. A person is named by the byte-wise smallest of
+1. **Links.** One worker scans every `links/*.csv` row and joins the ids into
+   people with a union-find, while the other seven are already parsing
+   events. A union always hangs the larger id under the smaller, so a root is
+   the byte-wise smallest id of its person and no pass has to go looking for
+   it; the id -> node map built on the way is rewritten in place into the
+   id -> person map. A person is named by the byte-wise smallest of
    its ids, and that name *is* the person key: ids that fit ten bytes of the
    63-symbol alphabet are packed six bits to a byte into a u64, which is
    injective and keeps byte order, so comparing two keys compares two ids and
@@ -51,6 +55,12 @@ backed by transparent huge pages.
    probe misses the TLB as well as the cache.
    Each event is scattered into one of up to 8192 buckets by its `event_id`,
    each click into a bucket by person.
+   Events parsed before the link map exists are written with the user in
+   place of the person. The first time a worker sees the map it rewrites what
+   it has written so far, in place and behind an eight-entry prefetch ring,
+   and resolves at parse time from then on. Resolving twice is harmless: a
+   person's name maps to itself. Click chunks sit at the end of the queue and
+   wait for the map, because a click is scattered by person.
 3. **Dedup.** An event-id bucket is sized to dedup in cache: one
    open-addressing table keyed on a 96-bit event-id key — exact, not a hash,
    for ids up to eleven bytes — keeps the copy with the smallest `ingest_ts`.
@@ -63,10 +73,20 @@ backed by transparent huge pages.
    are merged into `[click, click + 7 days]` intervals and the sessions in an
    interval are counted per day from a prefix sum, which keeps the shared
    devices that merge thousands of people linear instead of quadratic.
-5. **Write.** Each thread writes its own `user_daily` file as it finishes
-   folding; `campaign_daily` is a dense `(campaign, day)` array reduced across
-   threads. The Parquet writer is about 250 lines: one row group, one
-   uncompressed PLAIN page per column, Thrift-compact metadata.
+5. **Write.** Each thread writes its own `user_daily` file once every thread
+   has folded, and `campaign_daily`, a dense `(campaign, day)` array reduced
+   across threads, is written at the same time. The Parquet writer is about
+   500 lines: one row group, one uncompressed page per column, Thrift-compact
+   metadata, written straight from the column buffers. Integers in a narrow
+   range (`day`, the counts) and `top_category` are bit-packed dictionary
+   indexes, and the integer columns are INT32 when every value of the run
+   fits, which the threads agree on before any of them writes: files of one
+   table must not differ in type. That halves the output.
+
+Any block of 2 MB or more is allocated on huge pages (`HugeAlloc` in
+`sys.rs`), because 4K anonymous memory costs twice as much to touch and
+twenty times as much to give back at exit, and the process leaves with
+`exit` as soon as both tables are closed.
 
 ### Things that bit, and would bite again
 
@@ -110,9 +130,11 @@ make bench DATA=../data/d20 N=5
 the same two against the scalar scanner (`SS_NOSIMD=1`) and against the
 all-ids-hashed binary (`SS_NOENC=1`); identical output under
 `NCPU=1,3,5,8` plus the rules' own cross-table totals, on the dev set and on
-three freshly generated seeds; a products file rewritten to 40 and to 200
-categories, checked against the answer on every category-independent column;
-and inputs with no rows, no clicks and no links at all.
+three freshly generated seeds; a products file padded and rewritten to 40 and
+to 200 categories, checked against the answer on every column the rewrite
+leaves alone (all of them when padding); a person-day whose revenue needs 64
+bits; every installed Parquet reader (pyarrow, polars, duckdb) seeing the same
+rows; and inputs with no rows, no clicks and no links at all.
 
 The x86 scanner cannot be executed on an arm64 laptop, so startup compares the
 vector scanner against the scalar one over delimiters at every offset, runs of
@@ -131,9 +153,15 @@ over real files. Twelve deliberate breaks of the first pass (a carry dropped,
 a rule left out, the chunk end ignored) were each caught by the unit tests
 and by the startup check.
 
+`SS_LINK_DELAY=<ms>` holds link building back so that every other worker
+parses all of its events first, which is how the rewrite-in-place path gets
+checked against the same answers; `NCPU=1` never takes it.
+
 `SS_TIMING=1` prints a per-stage breakdown on stderr, including the share of
 rows that pass validation (97.8% on the dev set, which is why the person key
-is computed before validation rather than after). `SS_BENCH=<0..6>` runs
+is computed before validation rather than after). `SS_MEM=1` adds how much
+anonymous memory is still mapped at exit and how much of it is on 4K pages.
+`SS_BENCH=<0..6>` runs
 only the parse with that many steps enabled, which is how the per-step costs
 were measured; `tools/perf.sh` reports instructions retired and cycles, which
 unlike wall time do not move when a laptop throttles.

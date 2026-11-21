@@ -58,9 +58,9 @@ fn hash_long(b: &[u8]) -> u64 {
         i += 16;
     }
     if i < b.len() {
+        // the last sixteen bytes, overlapping the block before
         let n = b.len();
-        let a = if n >= 8 { rd8(b, n - 8) } else { 0 };
-        h = mix(h ^ a ^ S1, (n as u64) ^ S2);
+        h = mix(h ^ rd8(b, n - 16) ^ S1, rd8(b, n - 8) ^ S2);
     }
     h = mix(h ^ S2, h.rotate_left(29) ^ S0);
     if h == 0 { 1 } else { h }
@@ -802,6 +802,43 @@ mod tests {
                 .collect();
             assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
         }
+    }
+
+    #[test]
+    fn long_hash_reads_every_byte() {
+        for n in 16..=64usize {
+            let base: Vec<u8> = (0..n).map(|i| b'a' + (i % 26) as u8).collect();
+            let h = hash(&base);
+            for i in 0..n {
+                let mut v = base.clone();
+                v[i] ^= 1;
+                assert_ne!(hash(&v), h, "length {} ignores byte {}", n, i);
+            }
+        }
+    }
+
+    #[test]
+    fn bloom_has_no_false_negatives_and_few_false_positives() {
+        let id = |i: u64| -> u64 {
+            let mut x = i.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut v = vec![b'u'];
+            for _ in 0..7 {
+                v.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(x % 36) as usize]);
+                x /= 36;
+            }
+            person_key(&v)
+        };
+        let n = 200_000u64;
+        let mut b = Bloom::new(n as usize);
+        for i in 0..n {
+            b.insert(id(i));
+        }
+        for i in 0..n {
+            assert!(b.maybe(id(i)));
+        }
+        let fp = (n..3 * n).filter(|&i| b.maybe(id(i))).count();
+        println!("bloom false positives: {} of {}", fp, 2 * n);
+        assert!(fp < (2 * n / 100) as usize, "false positive rate {} of {}", fp, 2 * n);
     }
 
     #[test]

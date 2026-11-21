@@ -6,6 +6,8 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    #[cfg(target_os = "linux")]
+    fn mremap(addr: *mut u8, old_len: usize, new_len: usize, flags: i32, ...) -> *mut u8;
 }
 
 const PROT_READ: i32 = 1;
@@ -22,6 +24,10 @@ const MAP_NORESERVE: i32 = 0x40;
 const MADV_WILLNEED: i32 = 3;
 #[cfg(target_os = "linux")]
 const MADV_HUGEPAGE: i32 = 14;
+#[cfg(target_os = "linux")]
+const MREMAP_MAYMOVE: i32 = 1;
+#[cfg(target_os = "linux")]
+const MREMAP_FIXED: i32 = 2;
 
 /// Zeroed anonymous memory for the big hash tables. The pages arrive zeroed
 /// without a memset, and on Linux they can be huge pages, which matters
@@ -40,13 +46,20 @@ const HUGE: usize = 1 << 21;
 
 impl<T: Copy> Blob<T> {
     pub fn zeroed(len: usize) -> Blob<T> {
+        Self::map(len, 0)
+    }
+    // for a generous upper bound: untouched pages are never backed
+    pub fn reserved(len: usize) -> Blob<T> {
+        Self::map(len, MAP_NORESERVE)
+    }
+    fn map(len: usize, flags: i32) -> Blob<T> {
         let want = len * std::mem::size_of::<T>();
         // Over-allocate large tables so the start can be moved to a 2 MB
         // boundary; without that the kernel has nowhere to put a huge page.
         let pad = if want >= HUGE { HUGE } else { 0 };
         let bytes = want + pad;
         let base = unsafe {
-            mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+            mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | flags, -1, 0)
         };
         assert!(base as isize != -1, "blob mmap failed");
         let ptr = if pad == 0 {
@@ -81,6 +94,107 @@ impl<T: Copy> std::ops::DerefMut for Blob<T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+// malloc, except that a block of 2 MB or more gets its own huge-page mapping
+pub struct HugeAlloc;
+
+pub static HUGE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+pub static HUGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
+mod huge {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    fn whole(bytes: usize) -> usize {
+        (bytes + HUGE - 1) & !(HUGE - 1)
+    }
+
+    // zeroed, starting on a 2 MB boundary; null when out of memory
+    unsafe fn map(bytes: usize) -> *mut u8 {
+        let base = mmap(std::ptr::null_mut(), bytes + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if base as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        let p = whole(base as usize) as *mut u8;
+        let head = p as usize - base as usize;
+        if head > 0 {
+            munmap(base, head);
+        }
+        munmap(p.add(bytes), HUGE - head);
+        madvise(p, bytes, MADV_HUGEPAGE);
+        HUGE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        HUGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        p
+    }
+
+    unsafe impl GlobalAlloc for HugeAlloc {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if l.size() < HUGE {
+                return System.alloc(l);
+            }
+            map(whole(l.size()))
+        }
+        #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if l.size() < HUGE {
+                return System.alloc_zeroed(l);
+            }
+            map(whole(l.size()))
+        }
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if l.size() < HUGE {
+                return System.dealloc(p, l);
+            }
+            munmap(p, whole(l.size()));
+        }
+        #[inline]
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            if l.size() < HUGE && new < HUGE {
+                return System.realloc(p, l, new);
+            }
+            if l.size() < HUGE || new < HUGE {
+                let q = self.alloc(Layout::from_size_align_unchecked(new, l.align()));
+                if !q.is_null() {
+                    std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                    self.dealloc(p, l);
+                }
+                return q;
+            }
+            let (old, want) = (whole(l.size()), whole(new));
+            if want < old {
+                munmap(p.add(want), old - want);
+            }
+            if want <= old {
+                return p;
+            }
+            // move the pages to a bigger aligned hole instead of copying them
+            let q = map(want);
+            if q.is_null() || mremap(p, old, want, MREMAP_MAYMOVE | MREMAP_FIXED, q) != q {
+                return std::ptr::null_mut();
+            }
+            q
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        std::alloc::System.alloc(l)
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        std::alloc::System.alloc_zeroed(l)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        std::alloc::System.dealloc(p, l)
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        std::alloc::System.realloc(p, l, new)
     }
 }
 
@@ -373,6 +487,28 @@ impl<'a, T: Copy> Sink<'a, T> {
             *self.rem.get_unchecked_mut(b) -= Self::SREC as u32;
         }
     }
+    // visits every record pushed so far, in place
+    pub fn each_mut(&mut self, mut f: impl FnMut(*mut T)) {
+        for b in 0..self.nb {
+            for blk in &self.blocks[b] {
+                for i in 0..blk.len as usize {
+                    f(unsafe { (blk.ptr as *mut T).add(i) });
+                }
+            }
+            if !self.cur[b].is_null() {
+                let used = self.blk_items - self.rem[b] as usize;
+                let first = unsafe { self.cur[b].sub(used) };
+                for i in 0..used {
+                    f(unsafe { first.add(i) });
+                }
+            }
+            // records still staged; only with SS_WC
+            let line = unsafe { self.stg.as_mut_ptr().add(b * Self::LINE * WC as usize) } as *mut T;
+            for i in 0..self.sn[b] as usize {
+                f(unsafe { line.add(i) });
+            }
+        }
+    }
     #[cold]
     fn grow(&mut self, b: usize) {
         let p = self.bump.alloc(self.blk_items * std::mem::size_of::<T>()) as *mut T;
@@ -437,3 +573,28 @@ pub fn merge_blocks<T: Copy>(parts: Vec<Vec<Vec<Blk<T>>>>, nb: usize) -> Vec<Vec
 pub struct Shared<T>(pub T);
 unsafe impl<T> Send for Shared<T> {}
 unsafe impl<T> Sync for Shared<T> {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn big_blocks_survive_growing_shrinking_and_crossing_the_threshold() {
+        let item = |i: usize| (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..3_000_000 {
+            v.push(item(i));
+        }
+        assert!(v.iter().enumerate().all(|(i, &x)| x == item(i)));
+        if cfg!(target_os = "linux") {
+            assert_eq!(v.as_ptr() as usize % (1 << 21), 0);
+        }
+        v.truncate(700_000);
+        v.shrink_to_fit();
+        assert!(v.iter().enumerate().all(|(i, &x)| x == item(i)));
+        v.truncate(1000);
+        v.shrink_to_fit();
+        v.reserve_exact(4_000_000);
+        assert!(v.iter().enumerate().all(|(i, &x)| x == item(i)));
+        let z = vec![0u8; 5 << 20];
+        assert!(z.iter().all(|&b| b == 0));
+    }
+}

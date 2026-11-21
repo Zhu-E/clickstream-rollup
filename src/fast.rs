@@ -644,6 +644,19 @@ fn build_utab(links: &Links, k: &Keys) -> Blob<u32> {
             continue;
         }
         match (dec(id), dec(root)) {
+            // a root listed under itself is a member, not one more id
+            (Some(i), Some(r)) if i == r => {
+                let e = &mut u[(i >> 9) as usize];
+                let ra = (r & ALIAS) as u32;
+                if *e & GENERAL != 0 {
+                    continue;
+                }
+                if *e & HAS == 0 {
+                    *e = HAS | ra | (ra << 19);
+                } else if *e & 511 != ra {
+                    *e = GENERAL;
+                }
+            }
             (Some(i), Some(r)) if i >> 9 == r >> 9 => {
                 let e = &mut u[(i >> 9) as usize];
                 if *e & GENERAL != 0 {
@@ -748,6 +761,8 @@ struct Sh<'a> {
     eb: &'a [Vec<Blk<FRec>>],
     cg: &'a [CG],
     esc: &'a HashMap<u64, Esc>,
+    /// rows to reserve in a worker's output
+    out_rows: usize,
     /// users whose own person has clicks only the general fold can read
     forced: &'a [u64],
     /// users whose own person has events outside the slots
@@ -853,37 +868,6 @@ fn new_tmp(ctx: &Ctx) -> Tmp {
     }
 }
 
-fn new_out(ctx: &Ctx) -> Out {
-    let stride = ctx.ndays + 2;
-    Out {
-        cd: vec![CD::default(); (ctx.ncamp + 1) * stride],
-        uid: Vec::new(),
-        day: Vec::new(),
-        sessions: Vec::new(),
-        events: Vec::new(),
-        rev: Vec::new(),
-        tcval: Vec::new(),
-        tcdef: Vec::new(),
-        tcn: 0,
-    }
-}
-
-fn write_part(o: &Out, path: &Path) {
-    let n = o.day.len();
-    if n == 0 {
-        return;
-    }
-    let cols = [
-        pq::Col { name: "user_id", kind: pq::Kind::Utf8, vals: &o.uid, defs: &[], nvals: n as i64 },
-        pq::Col { name: "day", kind: pq::Kind::Date, vals: pq::as_bytes(&o.day), defs: &[], nvals: n as i64 },
-        pq::Col { name: "sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&o.sessions), defs: &[], nvals: n as i64 },
-        pq::Col { name: "events", kind: pq::Kind::I64, vals: pq::as_bytes(&o.events), defs: &[], nvals: n as i64 },
-        pq::Col { name: "revenue_cents", kind: pq::Kind::I64, vals: pq::as_bytes(&o.rev), defs: &[], nvals: n as i64 },
-        pq::Col { name: "top_category", kind: pq::Kind::Utf8Opt, vals: &o.tcval, defs: &o.tcdef, nvals: o.tcn },
-    ];
-    pq::write(path, n as i64, &cols).unwrap();
-}
-
 impl<'a> Wk<'a> {
     fn new(sh: &Sh, arena: &'a Arena) -> Wk<'a> {
         let nbg = 1usize << sh.gbits;
@@ -892,7 +876,7 @@ impl<'a> Wk<'a> {
             run: Vec::new(),
             cl: Vec::new(),
             t: new_tmp(sh.ctx),
-            o: new_out(sh.ctx),
+            o: Out::new(sh.out_rows, (sh.ctx.ncamp + 1) * (sh.ctx.ndays + 2)),
             gp: Sink::new(arena, nbg, 64),
             gc: Sink::new(arena, nbg, 64),
             frags: Vec::new(),
@@ -922,7 +906,7 @@ impl<'a> Wk<'a> {
     /// an event whose user id is not the generator's: resolve the bytes
     fn general_str(&mut self, sh: &Sh, user: Span, ts: u32, pc: u32) {
         let person = sh.ctx.person_of(user.bytes(sh.ctx), &mut self.hits);
-        if person & PTAG != 0 && sh.ctx.names.get(person).is_none() {
+        if person & PTAG != 0 && sh.ctx.links().names.get(person).is_none() {
             self.xn.push((person, user.sref()));
         }
         self.general_ev += 1;
@@ -1074,37 +1058,25 @@ impl<'a> Wk<'a> {
 pub(crate) struct FastOut {
     pub(crate) pb: Vec<Vec<Blk<PRec>>>,
     pub(crate) cb: Vec<Vec<Blk<CRec>>>,
-    pub(crate) cd: Vec<CD>,
-    pub(crate) rows: usize,
+    /// one per worker, unwritten: the caller settles the column width
+    pub(crate) outs: Vec<Out>,
     pub(crate) xn: Vec<(u64, u64)>,
 }
 
-pub(crate) fn no_links() -> Links {
-    Links { link: Map64::with_capacity(0), lbloom: Bloom::new(0), names: Map64::with_capacity(0) }
-}
-
-/// some: folded persons are written, `pb`/`cb` hold the rest; none: nothing written
+/// some: `outs` hold the folded persons, `pb`/`cb` the rest; none: structure did not hold
 pub(crate) fn run(
-    ctx: &mut Ctx,
+    ctx: &Ctx,
     k: &Keys,
     arena: &Arena,
     i_ev: Range<usize>,
     i_cl: Range<usize>,
     i_lk: Range<usize>,
-    outdir: &Path,
     nt: usize,
 ) -> Option<FastOut> {
     let timing = std::env::var("SS_TIMING").is_ok();
     let t0 = std::time::Instant::now();
-    let set_links = |ctx: &mut Ctx, l: Links| {
-        ctx.link = l.link;
-        ctx.lbloom = l.lbloom;
-        ctx.names = l.names;
-    };
     // timestamps travel as 31-bit offsets from the click window's start
     if ctx.cl_hi - ctx.base >= (1 << 31) || ctx.cl_hi < ctx.base || ctx.base < 0 {
-        let l = build_links(&ctx.maps, i_lk, nt);
-        set_links(ctx, l);
         return None;
     }
 
@@ -1124,7 +1096,7 @@ pub(crate) fn run(
     let nb_e = ((k.ncap >> k.shift) + 1) as usize;
     let nb_c = ((k.ucap >> CSHIFT) + 1) as usize;
     let next = AtomicUsize::new(0);
-    let (parts, links, utab) = {
+    let (parts, utab) = {
         let cx: &Ctx = ctx;
         let work = || -> Parsed {
             let mut st = PSt {
@@ -1154,17 +1126,17 @@ pub(crate) fn run(
         };
         std::thread::scope(|s| {
             let hs: Vec<_> = (1..nt).map(|_| s.spawn(work)).collect();
-            let links = build_links(&cx.maps, i_lk.clone(), nt.min(2));
+            let links = build_links(&cx.maps, i_lk.clone());
             let utab = build_utab(&links, k);
+            // the fast parsers never read links, so publishing now is safe
+            cx.set_links(links);
             let mut parts = vec![work()];
             for h in hs {
                 parts.push(h.join().unwrap());
             }
-            (parts, links, utab)
+            (parts, utab)
         })
     };
-    set_links(ctx, links);
-    let ctx: &Ctx = ctx;
     let u: &[u32] = &utab;
     if timing {
         let ng = u.iter().filter(|&&e| e & GENERAL != 0).count();
@@ -1291,7 +1263,7 @@ pub(crate) fn run(
                 *e = i;
             }
         }
-        let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, forced: &[], defer: &[], seen: &seen, bad: &bad, cl0, gbits };
+        let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows: 0, forced: &[], defer: &[], seen: &seen, bad: &bad, cl0, gbits };
         // the user whose own person these bytes name, if they name one
         let own = |bytes: &[u8]| -> Option<u32> {
             let un = k.user(bytes)?;
@@ -1339,7 +1311,7 @@ pub(crate) fn run(
                 Some(ui) => sh.own_key(ui),
                 None => ctx.person_of(bytes, &mut hits),
             };
-            if person & PTAG != 0 && ctx.names.get(person).is_none() {
+            if person & PTAG != 0 && ctx.links().names.get(person).is_none() {
                 xn.push((person, r.user.sref()));
             }
             gp.push(gbk(person), PRec { person, ts, pc });
@@ -1352,7 +1324,9 @@ pub(crate) fn run(
     }
 
     // ---- walk the counters
-    let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, forced: &forced, defer: &defer, seen: &seen, bad: &bad, cl0, gbits };
+    // about one output row per nine events, with room to spare
+    let out_rows = rows * 3 / (16 * nt.max(1)) + 4096;
+    let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows, forced: &forced, defer: &defer, seen: &seen, bad: &bad, cl0, gbits };
     let sh = &sh;
     let nbu = ((maxc >> k.shift) + 1) as usize;
     let next = AtomicUsize::new(0);
@@ -1428,33 +1402,17 @@ pub(crate) fn run(
         return None;
     }
 
-    // ---- write what was folded here
-    let ud = outdir.join("user_daily");
-    std::fs::create_dir_all(&ud).unwrap();
-    let stride = ctx.ndays + 2;
-    let mut cd = vec![CD::default(); (ctx.ncamp + 1) * stride];
-    let mut nrows = 0usize;
+    // ---- hand the folded rows back unwritten
+    let mut outs: Vec<Out> = Vec::new();
     let (mut n_inline, mut n_general) = (0usize, 0usize);
-    std::thread::scope(|s| {
-        for (t, w) in wks.iter().enumerate() {
-            let ud = &ud;
-            s.spawn(move || write_part(&w.0.o, &ud.join(format!("fast-{:02}.parquet", t))));
-        }
-    });
     for w in wks {
         let w = w.0;
-        for (a, c) in cd.iter_mut().zip(w.o.cd.iter()) {
-            a.sessions += c.sessions;
-            a.purch += c.purch;
-            a.assist += c.assist;
-            a.rev += c.rev;
-        }
-        nrows += w.o.day.len();
         n_inline += w.inline_ev;
         n_general += w.general_ev;
         xn.extend_from_slice(&w.xn);
         gpp.push(w.gp.finish());
         gcp.push(w.gc.finish());
+        outs.push(w.o);
     }
     let nb_per = 1usize << ctx.per_bits;
     let mut pb = merge_blocks(gpp, nbg);
@@ -1463,12 +1421,11 @@ pub(crate) fn run(
     cb.resize_with(nb_per, Vec::new);
     if timing {
         eprintln!(
-            "  fast: parse {:?} clicks {:?} walk {:?} stitch {:?} write {:?} | rows {} odd {} esc {} odd clicks {} | folded here {} general {} groups {}",
+            "  fast: parse {:?} clicks {:?} walk {:?} stitch {:?} | rows {} odd {} esc {} odd clicks {} | folded here {} general {} groups {}",
             t_parse,
             t_cg - t_parse,
             t_walk - t_cg,
             t_stitch - t_walk,
-            t0.elapsed() - t_stitch,
             rows,
             odd.len(),
             esc.len(),
@@ -1478,7 +1435,7 @@ pub(crate) fn run(
             groups.len()
         );
     }
-    Some(FastOut { pb, cb, cd, rows: nrows, xn })
+    Some(FastOut { pb, cb, outs, xn })
 }
 
 #[cfg(test)]

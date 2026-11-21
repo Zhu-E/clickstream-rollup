@@ -26,6 +26,14 @@ pair() {
   if grep -q "fast: gave up" "$TMP/a.err"; then how="fell back ($(grep -o 'gave up.*' "$TMP/a.err" | head -1))"
   elif grep -q "folded here" "$TMP/a.err"; then how="fast ($(grep -o 'odd [0-9]* esc [0-9]* odd clicks [0-9]*' "$TMP/a.err"), $(grep -o 'folded here [0-9]* general [0-9]*' "$TMP/a.err"))"
   else how="general (no keys)"; fi
+  # every user_daily file must agree on its column types
+  types=$(python3 -c "
+import glob, sys, pyarrow.parquet as pq
+print(len({str(pq.read_schema(f)) for f in glob.glob(sys.argv[1] + '/user_daily/*.parquet')}), pq.read_schema(sorted(glob.glob(sys.argv[1] + '/user_daily/*.parquet'))[0]).field('revenue_cents').type)" "$TMP/a")
+  case "$types" in "1 "*) how="$how, ${types#1 }";; *) echo "FAIL $name $*: user_daily files disagree on types"; fail=1;; esac
+  if [ -f "$HERE/readers.py" ] && ! python3 "$HERE/readers.py" "$TMP/a" >"$TMP/rd.txt" 2>&1; then
+    echo "FAIL $name $*: a reader rejected the output"; tail -3 "$TMP/rd.txt"; fail=1
+  fi
   if python3 "$CMP" "$TMP/a" "$TMP/b" >"$TMP/cmp.txt" 2>&1; then
     echo "ok   $name $*: $how"
   else
