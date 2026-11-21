@@ -6,6 +6,7 @@
 //   fold   -> per person bucket: sort, sessionize, attribute, aggregate
 //   write  -> Parquet
 mod pq;
+mod probe;
 mod sys;
 mod tbl;
 
@@ -1520,6 +1521,15 @@ fn check_simd() -> bool {
 }
 
 fn main() {
+    // probe build: the container's process is the probe, the pipeline is its child
+    match std::env::var("SS_CHILD").ok().as_deref() {
+        None => {
+            probe::parent();
+            return;
+        }
+        Some("noop") => return,
+        _ => {}
+    }
     let t0 = std::time::Instant::now();
     if std::env::var_os("SS_NOSIMD").is_some() {
         SIMD_OK.store(false, Ordering::Relaxed);
@@ -1773,6 +1783,7 @@ fn main() {
         eprintln!("  pre: maps {:?} meta {:?}", t_maps, t_pre - t_maps);
     }
     let links = build_links(&maps, i_lk.clone(), nt);
+    let t_links = t0.elapsed();
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  pre {:?} links {:?}", t_pre, t0.elapsed() - t_pre);
     }
@@ -1882,6 +1893,7 @@ fn main() {
                 "bench lv={} {:?}  {:.2} GB/s  acc {}",
                 lv, el, nb as f64 / el.as_secs_f64() / 1e9, ACC.load(Ordering::Relaxed)
             );
+            eprintln!("BENCH_MS lv={} ms={:.3}", lv, el.as_secs_f64() * 1e3);
         }
         return;
     }
@@ -2168,6 +2180,17 @@ fn main() {
             t0.elapsed(),
             nrows_tot,
             n
+        );
+        let m = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "STAGE_MS pre={:.1} links={:.1} parse={:.1} dedup={:.1} fold={:.1} tail={:.1} total={:.1}",
+            m(t_pre),
+            m(t_links - t_pre),
+            m(t_parse - t_links),
+            m(t_dedup - t_parse),
+            m(t_fold - t_dedup),
+            m(t0.elapsed() - t_fold),
+            m(t0.elapsed())
         );
     }
 }
