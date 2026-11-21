@@ -6,7 +6,9 @@
 use super::Keys;
 #[cfg(not(all(target_feature = "avx512dq", target_feature = "avx512vl")))]
 use crate::genid::unscramble;
-use crate::genid::{AINV, M40};
+#[cfg(all(target_feature = "avx512dq", target_feature = "avx512vl"))]
+use crate::genid::AINV;
+use crate::genid::M40;
 use core::arch::x86_64::*;
 
 // ------------------------------------------------------------------- tables
@@ -55,15 +57,17 @@ const fn id_half(letter: u8, raw: usize) -> ([u8; 16], [u8; 16], [u8; 16]) {
     (ctrl, subv, lz)
 }
 
+/// row `c0 * 64 + c1` for commas at `c0` and `c1`: the ids are `c0` and `c1 - c0 - 1` bytes
 const fn id_rows(a: u8, b: u8) -> [IdRow; 4096] {
     let mut t = [IdRow { ctrl: [0; 32], subv: [0; 32], lz: [0; 32], pad: [0; 32] }; 4096];
     let mut ra = 0;
     while ra < 64 {
         let x = id_half(a, ra);
-        let mut rb = 0;
-        while rb < 64 {
-            let y = id_half(b, rb);
-            let r = &mut t[ra * 64 + rb];
+        let mut c1 = 0;
+        while c1 < 64 {
+            // no row for commas out of order
+            let y = id_half(b, if c1 > ra { c1 - ra - 1 } else { 0 });
+            let r = &mut t[ra * 64 + c1];
             let mut i = 0;
             while i < 16 {
                 r.ctrl[i] = x.0[i];
@@ -74,7 +78,7 @@ const fn id_rows(a: u8, b: u8) -> [IdRow; 4096] {
                 r.lz[16 + i] = y.2[i];
                 i += 1;
             }
-            rb += 1;
+            c1 += 1;
         }
         ra += 1;
     }
@@ -256,12 +260,12 @@ const fn ts_epoch(r: &mut TsRow, q: bool) {
     r.kb[1] = -1;
 }
 
-/// row `raw * 2 + q3`: `ts` of `raw` bytes, `ingest_ts` quoted or not
-const fn ts_rows() -> [TsRow; 128] {
-    let mut t = [NO_TS; 128];
-    let mut j = 0;
-    while j < 128 {
-        let (raw, q3) = (j / 2, j % 2 == 1);
+/// row `(raw + 1) * 4 + q3 * 2`: `ts` of `raw` bytes, `ingest_ts` quoted or not
+const fn ts_rows() -> [TsRow; 256] {
+    let mut t = [NO_TS; 256];
+    let mut j = 4;
+    while j < 256 {
+        let (raw, q3) = (j / 4 - 1, j % 4 == 2);
         let mut r = NO_TS;
         r.limv = [i32::MAX; 8];
         let ok = match raw {
@@ -283,7 +287,7 @@ const fn ts_rows() -> [TsRow; 128] {
             ts_time(&mut r, 1, 20 + 2 * q3 as usize, false, q3);
             t[j] = r;
         }
-        j += 1;
+        j += 2;
     }
     t
 }
@@ -392,7 +396,7 @@ const fn tail_rows(need: bool) -> [TailRow; 4096] {
 
 #[repr(C, align(64))]
 struct Tables {
-    ts: [TsRow; 128],
+    ts: [TsRow; 256],
     ts1: [TsRow; 64],
     kind: [KindRow; 128],
     tail: [TailRow; 4096],
@@ -545,6 +549,7 @@ unsafe fn words123(v: __m256i) -> (i64, i64, i64) {
 }
 
 /// inverse of the generator's second multiplier mod 2^40; the row checks hold it to `unscramble`
+#[cfg(all(target_feature = "avx512dq", target_feature = "avx512vl"))]
 const BINV: u64 = {
     let b = 0xD6E8_FEB8_6659u64;
     let mut x = b;
@@ -638,6 +643,7 @@ pub struct Ev {
     pub ing_ms: i64,
     /// bytes to the next row
     pub next: usize,
+    pub pur: bool,
     /// the last two fields: see `Tail`
     pub tail: u64,
 }
@@ -713,17 +719,18 @@ pub unsafe fn ev(p: *const u8, k: &Kern) -> Option<Ev> {
     let kr = T.kind.get_unchecked((r4 << 1) | (*rs4.add(3) & 1) as usize);
     let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.mask.as_ptr()));
 
-    let (n, bad_n) = ids36(two(p, p.add(c0 + 1)), T.id.get_unchecked((c0 << 6) | (c1 - c0 - 1)));
+    let (n, bad_n) = ids36(two(p, p.add(c0 + 1)), T.id.get_unchecked((c0 << 6) | c1));
     let (cu, bad_cap) = unscr(n, k);
 
-    let tj = T.ts.get_unchecked(((c2 - c1 - 1) << 1) | q3);
+    let tj = T.ts.get_unchecked(((c2 - c1) << 2) + u3);
     // each date against the cache entry its day picks
     let kp2 = p.add(c1 + tj.koff as usize);
     let kp3 = p.add(c2 + q3);
     let e2 = k.days.add(_pext_u64(rd64(kp2.add(4)), tj.pm) as usize) as *const u8;
     let e3 = k.days.add(_pext_u64(rd64(kp3.add(4)), DATE_BITS) as usize) as *const u8;
-    let bad_key = _mm256_and_si256(_mm256_xor_si256(two(kp2, kp3), two(e2, e3)), ld2(tj.kmask.as_ptr()));
-    let days = two(e2.add(16), e3.add(16));
+    let (y2, y3) = (_mm256_load_si256(e2 as *const __m256i), _mm256_load_si256(e3 as *const __m256i));
+    let bad_key = _mm256_and_si256(_mm256_xor_si256(two(kp2, kp3), _mm256_inserti128_si256::<1>(y2, _mm256_castsi256_si128(y3))), ld2(tj.kmask.as_ptr()));
+    let days = _mm256_permute2x128_si256::<0x31>(y2, y3);
     // what follows the dates, or all of a number
     let x = two(p.add(c2).sub(16), rs4.sub(17));
     let d = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ld2(tj.ctrl.as_ptr())), ld2(tj.base.as_ptr()));
@@ -749,6 +756,7 @@ pub unsafe fn ev(p: *const u8, k: &Kern) -> Option<Ev> {
         ing_sec,
         ing_ms,
         next: m + 33,
+        pur: r4 & 8 != 0,
         tail: (z | (r5 << 8) | (r6 << 16) | (qi << 24) | (r4 << 32)) as u64,
     })
 }
