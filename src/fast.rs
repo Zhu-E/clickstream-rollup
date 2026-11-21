@@ -44,6 +44,24 @@ struct FC {
     b: u64,
 }
 
+impl Click for FC {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        ((self.a >> 9) & 0x7fff_ffff) as u32
+    }
+    #[inline(always)]
+    fn camp(&self) -> usize {
+        (self.b >> 48) as usize
+    }
+    /// `at`: the first click file
+    #[inline(always)]
+    fn id<'a>(&self, ctx: &'a Ctx, at: usize) -> &'a [u8] {
+        let fi = at + ((self.b >> 40) & 255) as usize;
+        let off = ((self.b >> 4) & ((1 << 36) - 1)) as usize;
+        ctx.bytes(sref_of(fi, off, (self.b & 15) as usize))
+    }
+}
+
 #[derive(Copy, Clone)]
 struct Span {
     fi: u32,
@@ -875,14 +893,7 @@ impl<'a> Sh<'a> {
     }
     #[inline]
     fn crec(&self, f: &FC, person: u64) -> CRec {
-        let fi = self.cl0 + ((f.b >> 40) & 255) as usize;
-        let off = ((f.b >> 4) & ((1 << 36) - 1)) as usize;
-        CRec {
-            person,
-            sref: sref_of(fi, off, (f.b & 15) as usize),
-            ts: ((f.a >> 9) & 0x7fff_ffff) as u32,
-            camp: (f.b >> 48) as u32,
-        }
+        crec_of(self.cl0, f, person)
     }
     /// the user's own person as the general fold keys it
     fn own_key(&self, ui: u32) -> u64 {
@@ -898,6 +909,18 @@ impl<'a> Sh<'a> {
         } else {
             (r.b >> 32) as i64
         }
+    }
+}
+
+#[inline(always)]
+fn crec_of(cl0: usize, f: &FC, person: u64) -> CRec {
+    let fi = cl0 + ((f.b >> 40) & 255) as usize;
+    let off = ((f.b >> 4) & ((1 << 36) - 1)) as usize;
+    CRec {
+        person,
+        sref: sref_of(fi, off, (f.b & 15) as usize),
+        ts: ((f.a >> 9) & 0x7fff_ffff) as u32,
+        camp: (f.b >> 48) as u32,
     }
 }
 
@@ -1004,22 +1027,27 @@ impl<'a> Wk<'a> {
         if unsorted {
             run.sort_unstable_by_key(|r| r.ts);
         }
-        let fcs = sh.clicks_of(ui);
-        self.cl.clear();
-        self.cl.reserve(fcs.len());
-        for f in fcs {
-            self.cl.push(sh.crec(f, 0));
-        }
-        if self.cl.len() <= 24 {
-            sort_small_c(&mut self.cl);
-        } else {
-            self.cl.sort_unstable_by_key(|r| r.ts);
-        }
         let mut nb = [0u8; 9];
         let un = ((ui as u64) << 9) | ((sh.u[ui as usize] >> 9) & 511) as u64;
         let n = sh.k.user_str(un, &mut nb);
         self.inline_ev += run.len();
-        process_person(sh.ctx, run, &self.cl, &mut self.t, &mut self.o, &nb[..n]);
+        // as `process_person`, with the clicks as they were grouped
+        let ns = sessionize(sh.ctx, run, &mut self.t, &mut self.o, &nb[..n]);
+        let fcs = sh.clicks_of(ui);
+        if fcs.is_empty() {
+            attribute_none(sh.ctx, &mut self.t, &mut self.o);
+        } else if ns <= SMALL {
+            attribute_small(sh.ctx, fcs, sh.cl0, &mut self.t, &mut self.o);
+        } else {
+            // a person of many sessions wants the clicks in time order
+            self.cl.clear();
+            self.cl.reserve(fcs.len());
+            for f in fcs {
+                self.cl.push(sh.crec(f, 0));
+            }
+            self.cl.sort_unstable_by_key(|r| r.ts);
+            attribute_any(sh.ctx, &self.cl, &mut self.t, &mut self.o);
+        }
     }
 
     /// one user's events `from..to` of the bucket's buffer
@@ -1772,6 +1800,21 @@ mod tests {
                 b.push(b',');
             }
             chk(&b, ends[0], ends[1], ends[2], ends[3]);
+        }
+    }
+
+    #[test]
+    fn a_click_reads_like_its_record() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let f = FC { a: x, b: x.rotate_left(29) };
+            let c = crec_of(5, &f, 0);
+            assert_eq!((Click::ts(&f), Click::camp(&f)), (c.ts, c.camp as usize));
+            let (len, fi, off) = (c.sref >> 56, (c.sref >> 40) & 0xffff, c.sref & 0xff_ffff_ffff);
+            assert_eq!((len, fi, off), (f.b & 15, 5 + ((f.b >> 40) & 255), (f.b >> 4) & ((1 << 36) - 1)));
         }
     }
 

@@ -917,8 +917,9 @@ struct Tmp {
     sx: Vec<u8>,
     /// the sessions of each such run, as bits
     dmask: [u64; SMALL],
-    /// clicks by how many sessions start before them
-    hist: [u32; SMALL + 1],
+    /// per session, the latest click at or before its start: time and index
+    bkey: [u32; SMALL],
+    bidx: [u32; SMALL],
     /// per campaign, the sessions its clicks reach
     cm: Vec<u64>,
     cum: Vec<u32>,
@@ -940,7 +941,8 @@ impl Tmp {
             pd: Vec::new(),
             sx: Vec::new(),
             dmask: [0; SMALL],
-            hist: [0; SMALL + 1],
+            bkey: [0; SMALL],
+            bidx: [NO_CLICK; SMALL],
             cm: vec![0; ctx.ncamp + 1],
             cum: vec![0; ctx.ndays + 4],
             iv: vec![(0, 0); ctx.ncamp + 1],
@@ -1121,88 +1123,131 @@ fn low_bits(i: usize) -> u64 {
     }
 }
 
-/// for 8 values, bit i of the first: `v[i] >= lo`, of the second: `v[i] <= hi`
+/// a click as attribution reads it; `at` is what its kind needs to find the id
+trait Click: Copy {
+    fn ts(&self) -> u32;
+    fn camp(&self) -> usize;
+    fn id<'a>(&self, ctx: &'a Ctx, at: usize) -> &'a [u8];
+}
+
+impl Click for CRec {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        self.ts
+    }
+    #[inline(always)]
+    fn camp(&self) -> usize {
+        self.camp as usize
+    }
+    #[inline(always)]
+    fn id<'a>(&self, ctx: &'a Ctx, _at: usize) -> &'a [u8] {
+        ctx.bytes(self.sref)
+    }
+}
+
+const NO_CLICK: u32 = u32::MAX;
+
+/// Click `k` at time `lo` against 8 session starts. Bit i of the results:
+/// `ss[i] >= lo`, `ss[i] <= hi`, and "the latest click so far for session i
+/// is at this very time". Where the click is at or before the start and
+/// later than the latest so far, it becomes the latest.
 #[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), allow(dead_code))]
 #[inline(always)]
-unsafe fn bounds8_plain(v: *const u32, lo: u32, hi: u32) -> (u64, u64) {
-    let (mut ge, mut le) = (0u64, 0u64);
+unsafe fn click8_plain(ss: *const u32, bkey: *mut u32, bidx: *mut u32, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+    let (mut ge, mut le, mut tie) = (0u64, 0u64, 0u64);
     for i in 0..8 {
-        let x = *v.add(i);
-        ge |= ((x >= lo) as u64) << i;
+        let x = *ss.add(i);
         le |= ((x <= hi) as u64) << i;
+        if x >= lo {
+            ge |= 1 << i;
+            if *bidx.add(i) == NO_CLICK || lo > *bkey.add(i) {
+                *bkey.add(i) = lo;
+                *bidx.add(i) = k;
+            } else if lo == *bkey.add(i) {
+                tie |= 1 << i;
+            }
+        }
     }
-    (ge, le)
+    (ge, le, tie)
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn bounds8(v: *const u32, lo: u32, hi: u32) -> (u64, u64) {
+unsafe fn click8(ss: *const u32, bkey: *mut u32, bidx: *mut u32, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
     use core::arch::x86_64::*;
-    let x = _mm256_loadu_si256(v as *const __m256i);
-    let ge = _mm256_cmpeq_epi32(_mm256_max_epu32(x, _mm256_set1_epi32(lo as i32)), x);
+    let bits = |v: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 as u64;
+    let x = _mm256_loadu_si256(ss as *const __m256i);
+    let key = _mm256_set1_epi32(lo as i32);
+    let ge = _mm256_cmpeq_epi32(_mm256_max_epu32(x, key), x);
     let le = _mm256_cmpeq_epi32(_mm256_min_epu32(x, _mm256_set1_epi32(hi as i32)), x);
-    (
-        _mm256_movemask_ps(_mm256_castsi256_ps(ge)) as u32 as u64,
-        _mm256_movemask_ps(_mm256_castsi256_ps(le)) as u32 as u64,
-    )
+    let bk = _mm256_loadu_si256(bkey as *const __m256i);
+    let bi = _mm256_loadu_si256(bidx as *const __m256i);
+    let none = _mm256_cmpeq_epi32(bi, _mm256_set1_epi32(-1));
+    // a latest click that is no earlier than this one stays
+    let stays = _mm256_andnot_si256(none, _mm256_cmpeq_epi32(_mm256_max_epu32(bk, key), bk));
+    let takes = _mm256_andnot_si256(stays, ge);
+    let tie = _mm256_and_si256(_mm256_andnot_si256(none, _mm256_cmpeq_epi32(bk, key)), ge);
+    _mm256_storeu_si256(bkey as *mut __m256i, _mm256_blendv_epi8(bk, key, takes));
+    _mm256_storeu_si256(bidx as *mut __m256i, _mm256_blendv_epi8(bi, _mm256_set1_epi32(k as i32), takes));
+    (bits(ge), bits(le), bits(tie))
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn bounds8(v: *const u32, lo: u32, hi: u32) -> (u64, u64) {
-    bounds8_plain(v, lo, hi)
+unsafe fn click8(ss: *const u32, bkey: *mut u32, bidx: *mut u32, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+    click8_plain(ss, bkey, bidx, lo, hi, k)
 }
 
-/// Credit and assists for a person of at most `SMALL` sessions. Each click
-/// gets the set of sessions it reaches as bits, so nothing here branches on
-/// how the clicks and the sessions interleave.
-fn attribute_small(ctx: &Ctx, cl: &[CRec], t: &mut Tmp, o: &mut Out) {
+/// Credit and assists for a person of at most `SMALL` sessions, the clicks
+/// in any order. Each click meets the session starts 8 at a time: it gets
+/// the set of sessions it reaches as bits, and takes over as the latest
+/// click of the sessions it precedes. Nothing here branches on how the
+/// clicks and the sessions interleave.
+fn attribute_small<C: Click>(ctx: &Ctx, cl: &[C], at: usize, t: &mut Tmp, o: &mut Out) {
     let ns = t.ss.len();
     let stride = ctx.ndays + 2;
     let organic = ctx.ncamp;
     let valid = low_bits(ns);
     let groups = (ns + 7) / 8;
     let ssp = t.ss.as_ptr();
-    for c in cl {
-        let lo = c.ts;
+    let (bkey, bidx) = (t.bkey.as_mut_ptr(), t.bidx.as_mut_ptr());
+    for (k, c) in cl.iter().enumerate() {
+        let lo = c.ts();
         let hi = lo.saturating_add(WEEK);
         // sessionize left the last group of 8 starts whole
-        let (mut ge, mut le) = unsafe { bounds8(ssp, lo, hi) };
+        let (mut ge, mut le, mut tie) = unsafe { click8(ssp, bkey, bidx, lo, hi, k as u32) };
         for g in 1..groups {
-            let (a, b) = unsafe { bounds8(ssp.add(8 * g), lo, hi) };
+            let (a, b, e) = unsafe { click8(ssp.add(8 * g), bkey.add(8 * g), bidx.add(8 * g), lo, hi, k as u32) };
             ge |= a << (8 * g);
             le |= b << (8 * g);
+            tie |= e << (8 * g);
         }
-        // the sessions before the click are a prefix: the starts are in order
-        t.hist[(!ge & valid).count_ones() as usize] += 1;
-        t.cm[c.camp as usize] |= ge & le & valid;
+        t.cm[c.camp()] |= ge & le & valid;
+        tie &= valid;
+        // several clicks in one millisecond: the smallest id is the latest
+        while tie != 0 {
+            let i = tie.trailing_zeros() as usize;
+            tie &= tie - 1;
+            if c.id(ctx, at) < cl[t.bidx[i] as usize].id(ctx, at) {
+                t.bidx[i] = k as u32;
+            }
+        }
     }
 
-    // credit: `hi` clicks are at or before this start
-    let mut hi = 0usize;
-    let mut memo = (usize::MAX, 0usize);
+    // credit: the latest click, if it is within 7 days of the start
     for i in 0..ns {
-        // every count is taken back out: the next person starts from zeros
-        hi += std::mem::take(&mut t.hist[i]) as usize;
-        let start = t.ss[i];
-        let camp = if hi == 0 {
-            organic
-        } else {
-            let g = credited(ctx, cl, hi, &mut memo);
-            if start - cl[hi - 1].ts <= WEEK {
-                cl[g].camp as usize
-            } else {
-                organic
-            }
-        };
+        let b = t.bidx[i];
+        let camp = if b != NO_CLICK && t.ss[i] - t.bkey[i] <= WEEK { cl[b as usize].camp() } else { organic };
         let v = t.sv[i];
         let e = &mut o.cd[camp * stride + t.sd[i] as usize];
         e.sessions += 1;
         e.purch += (v & 1) as u32;
         e.rev += v >> 1;
     }
-
-    t.hist[ns] = 0;
+    // the next person starts with no clicks
+    for b in t.bidx[..groups * 8].iter_mut() {
+        *b = NO_CLICK;
+    }
 
     // assists: a campaign's sessions, counted day by day
     let nd = t.pd.len();
@@ -1211,7 +1256,7 @@ fn attribute_small(ctx: &Ctx, cl: &[CRec], t: &mut Tmp, o: &mut Out) {
     }
     let (pd, sx, dmask) = (&t.pd[..], &t.sx[..], &t.dmask[..nd]);
     for c in cl {
-        let c = c.camp as usize;
+        let c = c.camp();
         // a campaign's later clicks find nothing left
         let reach = std::mem::take(&mut t.cm[c]);
         if reach == 0 {
@@ -1347,6 +1392,18 @@ fn attribute_any(ctx: &Ctx, cl: &[CRec], t: &mut Tmp, o: &mut Out) {
     }
 }
 
+/// every session of a person without clicks is organic
+fn attribute_none(ctx: &Ctx, t: &mut Tmp, o: &mut Out) {
+    let row = ctx.ncamp * (ctx.ndays + 2);
+    for i in 0..t.ss.len() {
+        let v = t.sv[i];
+        let e = &mut o.cd[row + t.sd[i] as usize];
+        e.sessions += 1;
+        e.purch += (v & 1) as u32;
+        e.rev += v >> 1;
+    }
+}
+
 /// One person: `ev` and `cl` in time order.
 fn process_person(ctx: &Ctx, ev: &[PRec], cl: &[CRec], t: &mut Tmp, o: &mut Out, name: &[u8]) {
     let ns = sessionize(ctx, ev, t, o, name);
@@ -1354,16 +1411,9 @@ fn process_person(ctx: &Ctx, ev: &[PRec], cl: &[CRec], t: &mut Tmp, o: &mut Out,
         return;
     }
     if cl.is_empty() {
-        let row = ctx.ncamp * (ctx.ndays + 2);
-        for i in 0..ns {
-            let v = t.sv[i];
-            let e = &mut o.cd[row + t.sd[i] as usize];
-            e.sessions += 1;
-            e.purch += (v & 1) as u32;
-            e.rev += v >> 1;
-        }
+        attribute_none(ctx, t, o);
     } else if ns <= SMALL {
-        attribute_small(ctx, cl, t, o);
+        attribute_small(ctx, cl, 0, t, o);
     } else {
         attribute_any(ctx, cl, t, o);
     }
@@ -2779,13 +2829,24 @@ mod tests {
                 attribute_any(&ctx, &cl, &mut t, &mut o2);
                 assert_eq!(cells_of(&ctx, &o2), cells, "round {} by the general walk", round);
             }
-            assert!(t.cm.iter().all(|&m| m == 0) && t.hist.iter().all(|&h| h == 0), "round {} left state behind", round);
+            // and the masks do not need the clicks in order
+            if !cl.is_empty() && ns <= SMALL {
+                let mut mixed = cl.clone();
+                for i in (1..mixed.len()).rev() {
+                    mixed.swap(i, (rnd(&mut x) % (i as u64 + 1)) as usize);
+                }
+                let mut o3 = Out::new(64, cd_len);
+                assert_eq!(sessionize(&ctx, &ev, &mut t, &mut o3, b"u1"), ns);
+                attribute_small(&ctx, &mixed, 0, &mut t, &mut o3);
+                assert_eq!(cells_of(&ctx, &o3), cells, "round {} with the clicks out of order", round);
+            }
+            assert!(t.cm.iter().all(|&m| m == 0) && t.bidx.iter().all(|&b| b == NO_CLICK), "round {} left state behind", round);
         }
         assert!(small > 1000 && large > 100 && tied > 1000, "{} {} {}", small, large, tied);
     }
 
     #[test]
-    fn bounds_of_eight() {
+    fn click_against_eight_starts() {
         let mut x = 0x1234_5678_9abc_def1u64;
         let pick = |x: &mut u64| match rnd(x) % 4 {
             0 => (rnd(x) % 8) as u32,
@@ -2793,17 +2854,24 @@ mod tests {
             2 => 0x7fff_fffcu32 + (rnd(x) % 8) as u32,
             _ => rnd(x) as u32,
         };
-        for _ in 0..200_000 {
-            let mut v = [0u32; 8];
-            for e in v.iter_mut() {
+        for _ in 0..50_000 {
+            let mut ss = [0u32; 8];
+            for e in ss.iter_mut() {
                 *e = pick(&mut x);
             }
-            let (lo, hi) = (pick(&mut x), pick(&mut x));
-            let got = unsafe { bounds8(v.as_ptr(), lo, hi) };
-            assert_eq!(got, unsafe { bounds8_plain(v.as_ptr(), lo, hi) }, "{:?} {} {}", v, lo, hi);
-            let ge: u64 = (0..8).map(|i| ((v[i] >= lo) as u64) << i).sum();
-            let le: u64 = (0..8).map(|i| ((v[i] <= hi) as u64) << i).sum();
-            assert_eq!(got, (ge, le));
+            // a few clicks in a row over the same state, both ways
+            let (mut ka, mut ia) = ([0u32; 8], [NO_CLICK; 8]);
+            let (mut kb, mut ib) = (ka, ia);
+            for k in 0..6u32 {
+                let (lo, hi) = (pick(&mut x), pick(&mut x));
+                let a = unsafe { click8(ss.as_ptr(), ka.as_mut_ptr(), ia.as_mut_ptr(), lo, hi, k) };
+                let b = unsafe { click8_plain(ss.as_ptr(), kb.as_mut_ptr(), ib.as_mut_ptr(), lo, hi, k) };
+                assert_eq!(a, b, "{:?} {} {}", ss, lo, hi);
+                assert_eq!((ka, ia), (kb, ib), "{:?} {} {}", ss, lo, hi);
+                let ge: u64 = (0..8).map(|i| ((ss[i] >= lo) as u64) << i).sum();
+                let le: u64 = (0..8).map(|i| ((ss[i] <= hi) as u64) << i).sum();
+                assert_eq!((a.0, a.1), (ge, le));
+            }
         }
     }
 }
