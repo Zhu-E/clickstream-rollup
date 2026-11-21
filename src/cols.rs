@@ -706,7 +706,6 @@ pub(crate) mod va {
     #[cold]
     #[inline(never)]
     fn order_ties(ts: &[u32], camp: &mut [u32], idx: &mut [u32], before: &dyn Fn(usize, usize) -> bool) {
-        let mut pairs: Vec<(u32, u32)> = Vec::new();
         let mut i = 0;
         while i < ts.len() {
             let mut j = i + 1;
@@ -715,12 +714,17 @@ pub(crate) mod va {
             }
             // of one campaign, as copies of a click are, their order changes nothing
             if camp[i..j].iter().any(|&c| c != camp[i]) {
-                pairs.clear();
-                pairs.extend(idx[i..j].iter().copied().zip(camp[i..j].iter().copied()));
-                pairs.sort_by(|a, b| if before(a.0 as usize, b.0 as usize) { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater });
-                for (k, &(x, c)) in pairs.iter().enumerate() {
-                    idx[i + k] = x;
-                    camp[i + k] = c;
+                // a handful: by insertion, one click at a time
+                for a in i + 1..j {
+                    let (x, c) = (idx[a], camp[a]);
+                    let mut b = a;
+                    while b > i && before(x as usize, idx[b - 1] as usize) {
+                        idx[b] = idx[b - 1];
+                        camp[b] = camp[b - 1];
+                        b -= 1;
+                    }
+                    idx[b] = x;
+                    camp[b] = c;
                 }
             }
             i = j;
