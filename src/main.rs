@@ -788,8 +788,18 @@ struct CD {
     rev: u64,
 }
 
+/// sessions credited to one campaign on one day
+#[derive(Copy, Clone, Default)]
+struct Cred {
+    sessions: u32,
+    purch: u32,
+    rev: u64,
+}
+
 struct Out {
-    cd: Vec<CD>,
+    cd: Vec<Cred>,
+    /// assisted sessions, apart: a campaign's days share a cache line
+    asst: Vec<u32>,
     uid: Vec<u8>,
     day: Vec<i32>,
     sessions: Vec<i64>,
@@ -803,7 +813,8 @@ struct Out {
 impl Out {
     fn new(rows: usize, cd_len: usize) -> Out {
         Out {
-            cd: vec![CD::default(); cd_len],
+            cd: vec![Cred::default(); cd_len],
+            asst: vec![0; cd_len],
             uid: Vec::with_capacity(rows * 16),
             day: Vec::with_capacity(rows),
             sessions: Vec::with_capacity(rows),
@@ -812,6 +823,13 @@ impl Out {
             cat: Vec::with_capacity(rows),
             all_bits: 0,
         }
+    }
+    /// the campaign counts, taken out
+    fn campaign_days(&mut self) -> Vec<CD> {
+        let v = self.cd.iter().zip(&self.asst).map(|(c, &a)| CD { sessions: c.sessions, purch: c.purch, assist: a, rev: c.rev }).collect();
+        self.cd = Vec::new();
+        self.asst = Vec::new();
+        v
     }
     fn fits_i32(all_bits: u64) -> bool {
         all_bits <= i32::MAX as u64
@@ -884,13 +902,27 @@ fn write_campaign_daily(ctx: &Ctx, camp_name: &[u64], mut cds: Vec<Vec<CD>>, pat
     n
 }
 
+/// a person with at most this many sessions is attributed with bit masks
+const SMALL: usize = 64;
+
 struct Tmp {
+    /// start, day and (revenue << 1 | purchased) of each session
     ss: Vec<u32>,
     sd: Vec<u8>,
-    sr: Vec<u64>,
-    sp: Vec<bool>,
+    sv: Vec<u64>,
+    /// first session and day of each run of sessions on one day
+    df: Vec<u32>,
+    pd: Vec<u8>,
+    /// the run each session is in
+    sx: Vec<u8>,
+    /// the sessions of each such run, as bits
+    dmask: [u64; SMALL],
+    /// per session, the latest click at or before its start: time and index
+    bkey: [u32; SMALL],
+    bidx: [u32; SMALL],
+    /// per campaign, the sessions its clicks reach
+    cm: Vec<u64>,
     cum: Vec<u32>,
-    cnt: Vec<u32>,
     iv: Vec<(u32, u32)>,
     mark: Vec<u32>,
     tc: Vec<u32>,
@@ -899,76 +931,26 @@ struct Tmp {
     touch: Vec<u32>,
 }
 
-#[inline]
-fn lower_bound(v: &[u32], x: u32) -> usize {
-    let mut lo = 0usize;
-    let mut hi = v.len();
-    while lo < hi {
-        let m = (lo + hi) / 2;
-        if v[m] < x {
-            lo = m + 1;
-        } else {
-            hi = m;
-        }
-    }
-    lo
-}
-
-#[inline]
-fn upper_bound(v: &[u32], x: u32) -> usize {
-    let mut lo = 0usize;
-    let mut hi = v.len();
-    while lo < hi {
-        let m = (lo + hi) / 2;
-        if v[m] <= x {
-            lo = m + 1;
-        } else {
-            hi = m;
-        }
-    }
-    lo
-}
-
-#[inline]
-fn flush_assist(
-    ss: &[u32],
-    sd: &[u8],
-    cum: &[u32],
-    cd: &mut [CD],
-    stride: usize,
-    c: usize,
-    a: u32,
-    b: u32,
-) {
-    let (lo, hi) = if ss.len() <= 24 {
-        let mut lo = 0usize;
-        while lo < ss.len() && ss[lo] < a {
-            lo += 1;
-        }
-        let mut hi = lo;
-        while hi < ss.len() && ss[hi] <= b {
-            hi += 1;
-        }
-        (lo, hi)
-    } else {
-        (lower_bound(ss, a), upper_bound(ss, b))
-    };
-    if hi <= lo {
-        return;
-    }
-    if hi - lo <= 16 {
-        for i in lo..hi {
-            cd[c * stride + sd[i] as usize].assist += 1;
-        }
-    } else {
-        let d0 = sd[lo] as usize;
-        let d1 = sd[hi - 1] as usize;
-        for d in d0..=d1 {
-            let s = (cum[d] as usize).max(lo);
-            let e = (cum[d + 1] as usize).min(hi);
-            if e > s {
-                cd[c * stride + d].assist += (e - s) as u32;
-            }
+impl Tmp {
+    fn new(ctx: &Ctx) -> Tmp {
+        Tmp {
+            ss: Vec::new(),
+            sd: Vec::new(),
+            sv: Vec::new(),
+            df: Vec::new(),
+            pd: Vec::new(),
+            sx: Vec::new(),
+            dmask: [0; SMALL],
+            bkey: [0; SMALL],
+            bidx: [NO_CLICK; SMALL],
+            cm: vec![0; ctx.ncamp + 1],
+            cum: vec![0; ctx.ndays + 4],
+            iv: vec![(0, 0); ctx.ncamp + 1],
+            mark: vec![0; ctx.ncamp + 1],
+            tc: vec![0; ctx.ncamp + 1],
+            gen: 0,
+            catrev: vec![0; ctx.cats.len() + 1],
+            touch: vec![0; ctx.cats.len() + 1],
         }
     }
 }
@@ -994,40 +976,60 @@ fn emit_user(ctx: &Ctx, o: &mut Out, t: &mut Tmp, name: &[u8], day: u32, ns: u64
     o.cat.push(best as u8);
 }
 
-fn process_person(ctx: &Ctx, ev: &[PRec], cl: &[CRec], t: &mut Tmp, o: &mut Out, name: &[u8]) {
-    let stride = ctx.ndays + 2;
+/// Cut `ev`, in time order, into sessions: the user's row for each day goes
+/// out, and each session's start, day and revenue stay in `t`.
+fn sessionize(ctx: &Ctx, ev: &[PRec], t: &mut Tmp, o: &mut Out, name: &[u8]) -> usize {
+    let n = ev.len();
     t.ss.clear();
     t.sd.clear();
-    t.sr.clear();
-    t.sp.clear();
-    let n = ev.len();
-    let mut i = 0usize;
+    t.sv.clear();
+    t.df.clear();
+    t.pd.clear();
+    // a person has no more sessions than events; the starts are read 8 at a time
+    t.ss.reserve(n + 8);
+    t.sd.reserve(n);
+    t.sv.reserve(n);
+    t.sx.clear();
+    t.sx.reserve(n);
+    let (ssp, sdp, svp, sxp) = (t.ss.as_mut_ptr(), t.sd.as_mut_ptr(), t.sv.as_mut_ptr(), t.sx.as_mut_ptr());
+    let mut nd = 0usize;
+    let mut ns = 0usize;
     let mut cur_day = u32::MAX;
+    // the first start that needs its day worked out again
+    let mut day_end = i64::MIN;
     let mut dsess = 0u64;
     let mut dev = 0u64;
     let mut drev = 0u64;
     let mut ntouch = 0usize;
+    let mut i = 0usize;
     while i < n {
-        let start = ev[i].ts;
-        let mut j = i + 1;
-        while j < n && ev[j].ts - ev[j - 1].ts <= GAP_MS {
-            j += 1;
-        }
-        let day = (((ctx.base + start as i64) / DAY_MS) - ctx.day0) as u32;
-        if day != cur_day {
-            if cur_day != u32::MAX {
-                emit_user(ctx, o, t, name, cur_day, dsess, dev, drev, ntouch);
+        let start = unsafe { ev.get_unchecked(i) }.ts;
+        if start as i64 >= day_end {
+            let abs = ctx.base + start as i64;
+            let q = abs / DAY_MS;
+            let day = (q - ctx.day0) as u32;
+            day_end = if abs >= 0 { (q + 1) * DAY_MS - ctx.base } else { i64::MIN };
+            if day != cur_day {
+                if cur_day != u32::MAX {
+                    emit_user(ctx, o, t, name, cur_day, dsess, dev, drev, ntouch);
+                }
+                cur_day = day;
+                dsess = 0;
+                dev = 0;
+                drev = 0;
+                ntouch = 0;
+                t.df.push(ns as u32);
+                t.pd.push(day as u8);
+                nd += 1;
             }
-            cur_day = day;
-            dsess = 0;
-            dev = 0;
-            drev = 0;
-            ntouch = 0;
         }
+        // the session runs until a gap of more than 30 minutes
         let mut srev = 0u64;
-        let mut pur = false;
-        for k in i..j {
-            let pc = ev[k].pc;
+        let mut pur = 0u64;
+        let mut prev = start;
+        let mut j = i;
+        loop {
+            let pc = unsafe { ev.get_unchecked(j) }.pc;
             if pc != 0 {
                 let price = (pc & 0x00ff_ffff) as u64;
                 let c = (pc >> 24) as usize;
@@ -1037,115 +1039,417 @@ fn process_person(ctx: &Ctx, ev: &[PRec], cl: &[CRec], t: &mut Tmp, o: &mut Out,
                 }
                 t.catrev[c] += price;
                 srev += price;
-                pur = true;
+                pur = 1;
             }
+            j += 1;
+            if j == n {
+                break;
+            }
+            let ts = unsafe { ev.get_unchecked(j) }.ts;
+            if ts.wrapping_sub(prev) > GAP_MS {
+                break;
+            }
+            prev = ts;
         }
         dsess += 1;
         dev += (j - i) as u64;
         drev += srev;
-        t.ss.push(start);
-        t.sd.push(day as u8);
-        t.sr.push(srev);
-        t.sp.push(pur);
         i = j;
+        unsafe {
+            *ssp.add(ns) = start;
+            *sdp.add(ns) = cur_day as u8;
+            *svp.add(ns) = (srev << 1) | pur;
+            // only read for a person of at most `SMALL` sessions
+            *sxp.add(ns) = (nd - 1) as u8;
+        }
+        ns += 1;
     }
     if cur_day != u32::MAX {
         emit_user(ctx, o, t, name, cur_day, dsess, dev, drev, ntouch);
     }
-
-    // sessions per day, as a prefix sum over the day index
-    for d in 0..stride + 1 {
-        t.cnt[d] = 0;
+    unsafe {
+        // the whole last group of 8 starts is readable
+        for k in 0..8 {
+            *ssp.add(ns + k) = 0;
+        }
+        t.ss.set_len(ns);
+        t.sd.set_len(ns);
+        t.sv.set_len(ns);
+        t.sx.set_len(ns);
     }
-    for &d in t.sd.iter() {
-        t.cnt[d as usize] += 1;
+    t.df.push(ns as u32);
+    ns
+}
+
+/// Among the first `hi` clicks, all at or before a start, the one a session
+/// starting then is credited to: the latest, and of several in its
+/// millisecond the one with the smallest id.
+#[inline(always)]
+fn credited(ctx: &Ctx, cl: &[CRec], hi: usize, memo: &mut (usize, usize)) -> usize {
+    let g = hi - 1;
+    if g == 0 || cl[g - 1].ts != cl[g].ts {
+        return g;
+    }
+    if memo.0 != hi {
+        *memo = (hi, smallest_id(ctx, cl, hi));
+    }
+    memo.1
+}
+
+#[cold]
+#[inline(never)]
+fn smallest_id(ctx: &Ctx, cl: &[CRec], hi: usize) -> usize {
+    let t = cl[hi - 1].ts;
+    let mut g = hi - 1;
+    while g > 0 && cl[g - 1].ts == t {
+        g -= 1;
+    }
+    let mut best = g;
+    for k in g + 1..hi {
+        if ctx.bytes(cl[k].sref) < ctx.bytes(cl[best].sref) {
+            best = k;
+        }
+    }
+    best
+}
+
+/// the low `i` bits, for `i` up to 64
+#[inline(always)]
+fn low_bits(i: usize) -> u64 {
+    if i >= 64 {
+        !0
+    } else {
+        (1u64 << i) - 1
+    }
+}
+
+/// a click as attribution reads it; `at` is what its kind needs to find the id
+trait Click: Copy {
+    fn ts(&self) -> u32;
+    fn camp(&self) -> usize;
+    fn id<'a>(&self, ctx: &'a Ctx, at: usize) -> &'a [u8];
+}
+
+impl Click for CRec {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        self.ts
+    }
+    #[inline(always)]
+    fn camp(&self) -> usize {
+        self.camp as usize
+    }
+    #[inline(always)]
+    fn id<'a>(&self, ctx: &'a Ctx, _at: usize) -> &'a [u8] {
+        ctx.bytes(self.sref)
+    }
+}
+
+const NO_CLICK: u32 = u32::MAX;
+
+/// 8 session starts, or their latest clicks, held in a register
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+type V8 = core::arch::x86_64::__m256i;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+type V8 = [u32; 8];
+
+#[inline(always)]
+unsafe fn load8(p: *const u32) -> V8 {
+    (p as *const V8).read_unaligned()
+}
+
+#[inline(always)]
+unsafe fn store8(p: *mut u32, v: V8) {
+    (p as *mut V8).write_unaligned(v)
+}
+
+/// Click `k` at time `lo` against 8 session starts. Bit i of the results:
+/// `ss[i] >= lo`, `ss[i] <= hi`, and "the latest click so far for session i
+/// is at this very time". Where the click is at or before the start and
+/// later than the latest so far, it becomes the latest.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), allow(dead_code))]
+#[inline(always)]
+fn click8_plain(ss: &[u32; 8], bkey: &mut [u32; 8], bidx: &mut [u32; 8], lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+    let (mut ge, mut le, mut tie) = (0u64, 0u64, 0u64);
+    for i in 0..8 {
+        let x = ss[i];
+        le |= ((x <= hi) as u64) << i;
+        if x >= lo {
+            ge |= 1 << i;
+            if bidx[i] == NO_CLICK || lo > bkey[i] {
+                bkey[i] = lo;
+                bidx[i] = k;
+            } else if lo == bkey[i] {
+                tie |= 1 << i;
+            }
+        }
+    }
+    (ge, le, tie)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn click8(x: V8, bkey: &mut V8, bidx: &mut V8, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let bits = |v: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 as u64;
+        let key = _mm256_set1_epi32(lo as i32);
+        let ge = _mm256_cmpeq_epi32(_mm256_max_epu32(x, key), x);
+        let le = _mm256_cmpeq_epi32(_mm256_min_epu32(x, _mm256_set1_epi32(hi as i32)), x);
+        let (bk, bi) = (*bkey, *bidx);
+        let none = _mm256_cmpeq_epi32(bi, _mm256_set1_epi32(-1));
+        // a latest click that is no earlier than this one stays
+        let stays = _mm256_andnot_si256(none, _mm256_cmpeq_epi32(_mm256_max_epu32(bk, key), bk));
+        let takes = _mm256_andnot_si256(stays, ge);
+        let tie = _mm256_and_si256(_mm256_andnot_si256(none, _mm256_cmpeq_epi32(bk, key)), ge);
+        *bkey = _mm256_blendv_epi8(bk, key, takes);
+        *bidx = _mm256_blendv_epi8(bi, _mm256_set1_epi32(k as i32), takes);
+        (bits(ge), bits(le), bits(tie))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn click8(x: V8, bkey: &mut V8, bidx: &mut V8, lo: u32, hi: u32, k: u32) -> (u64, u64, u64) {
+    click8_plain(&x, bkey, bidx, lo, hi, k)
+}
+
+/// Credit and assists for a person of at most `SMALL` sessions, the clicks
+/// in any order. Each click meets the session starts 8 at a time: it gets
+/// the set of sessions it reaches as bits, and takes over as the latest
+/// click of the sessions it precedes. Nothing here branches on how the
+/// clicks and the sessions interleave.
+fn attribute_small<C: Click>(ctx: &Ctx, cl: &[C], at: usize, t: &mut Tmp, o: &mut Out) {
+    let ns = t.ss.len();
+    let stride = ctx.ndays + 2;
+    let organic = ctx.ncamp;
+    let valid = low_bits(ns);
+    let groups = (ns + 7) / 8;
+    let ssp = t.ss.as_ptr();
+    let (bkey, bidx) = (t.bkey.as_mut_ptr(), t.bidx.as_mut_ptr());
+    // sessionize left the last group of 8 starts whole. The first group and
+    // its latest clicks stay in registers while the clicks go by: no click
+    // waits for the stores of the one before.
+    let (ss0, mut key0, mut idx0) = unsafe { (load8(ssp), load8(bkey), load8(bidx)) };
+    for (k, c) in cl.iter().enumerate() {
+        let lo = c.ts();
+        let hi = lo.saturating_add(WEEK);
+        let (mut ge, mut le, mut tie) = click8(ss0, &mut key0, &mut idx0, lo, hi, k as u32);
+        for g in 1..groups {
+            let (a, b, e) = unsafe {
+                let (mut bk, mut bi) = (load8(bkey.add(8 * g)), load8(bidx.add(8 * g)));
+                let r = click8(load8(ssp.add(8 * g)), &mut bk, &mut bi, lo, hi, k as u32);
+                store8(bkey.add(8 * g), bk);
+                store8(bidx.add(8 * g), bi);
+                r
+            };
+            ge |= a << (8 * g);
+            le |= b << (8 * g);
+            tie |= e << (8 * g);
+        }
+        t.cm[c.camp()] |= ge & le & valid;
+        tie &= valid;
+        if tie != 0 {
+            // several clicks in one millisecond: the smallest id is the latest
+            unsafe { store8(bidx, idx0) };
+            while tie != 0 {
+                let i = tie.trailing_zeros() as usize;
+                tie &= tie - 1;
+                if c.id(ctx, at) < cl[t.bidx[i] as usize].id(ctx, at) {
+                    t.bidx[i] = k as u32;
+                }
+            }
+            idx0 = unsafe { load8(bidx) };
+        }
+    }
+    unsafe {
+        store8(bkey, key0);
+        store8(bidx, idx0);
+    }
+
+    // credit: the latest click, if it is within 7 days of the start
+    let (sv, sd) = (&t.sv[..ns], &t.sd[..ns]);
+    for i in 0..ns {
+        let b = t.bidx[i];
+        let camp = if b != NO_CLICK && t.ss[i] - t.bkey[i] <= WEEK { cl[b as usize].camp() } else { organic };
+        let v = sv[i];
+        let e = &mut o.cd[camp * stride + sd[i] as usize];
+        e.sessions += 1;
+        e.purch += (v & 1) as u32;
+        e.rev += v >> 1;
+    }
+    // the next person starts with no clicks
+    for b in t.bidx[..groups * 8].iter_mut() {
+        *b = NO_CLICK;
+    }
+
+    // assists: a campaign's sessions, counted day by day
+    let nd = t.pd.len();
+    for x in 0..nd {
+        t.dmask[x] = low_bits(t.df[x + 1] as usize) & !low_bits(t.df[x] as usize);
+    }
+    let (pd, sx, dmask) = (&t.pd[..], &t.sx[..], &t.dmask[..nd]);
+    for c in cl {
+        let c = c.camp();
+        // a campaign's later clicks find nothing left
+        let reach = std::mem::take(&mut t.cm[c]);
+        if reach == 0 {
+            continue;
+        }
+        let row = &mut o.asst[c * stride..(c + 1) * stride];
+        let first = sx[reach.trailing_zeros() as usize] as usize;
+        let last = sx[63 - reach.leading_zeros() as usize] as usize;
+        for (d, m) in pd[first..last + 1].iter().zip(&dmask[first..last + 1]) {
+            row[*d as usize] += (reach & m).count_ones();
+        }
+    }
+}
+
+/// sessions before each day: `cum[d]..cum[d + 1]` are the sessions of day d
+fn day_starts(sd: &[u8], cum: &mut [u32]) {
+    for c in cum.iter_mut() {
+        *c = 0;
+    }
+    for &d in sd {
+        cum[d as usize + 1] += 1;
     }
     let mut acc = 0u32;
-    for d in 0..stride + 1 {
-        t.cum[d] = acc;
-        acc += t.cnt[d];
+    for c in cum.iter_mut() {
+        acc += *c;
+        *c = acc;
     }
+}
 
-    // credit: the latest click at or before the session start, within 7 days
+/// campaign `c` assists sessions `s..e`
+#[inline]
+fn flush_assist(sd: &[u8], cum: &mut [u32], have_cum: &mut bool, asst: &mut [u32], stride: usize, c: usize, s: usize, e: usize) {
+    if e - s <= 16 {
+        for i in s..e {
+            asst[c * stride + sd[i] as usize] += 1;
+        }
+        return;
+    }
+    if !*have_cum {
+        *have_cum = true;
+        day_starts(sd, cum);
+    }
+    let (d0, d1) = (sd[s] as usize, sd[e - 1] as usize);
+    for d in d0..=d1 {
+        let lo = (cum[d] as usize).max(s);
+        let hi = (cum[d + 1] as usize).min(e);
+        if hi > lo {
+            asst[c * stride + d] += (hi - lo) as u32;
+        }
+    }
+}
+
+/// Credit and assists for any number of sessions: two walks along the
+/// clicks, one per session and one per click.
+fn attribute_any(ctx: &Ctx, cl: &[CRec], t: &mut Tmp, o: &mut Out) {
+    let ns = t.ss.len();
     let m = cl.len();
-    let organic = ctx.ncamp as u32;
+    let stride = ctx.ndays + 2;
+    let organic = ctx.ncamp;
+    let Tmp { ss, sd, sv, cum, iv, mark, tc, gen, .. } = t;
+    let (ss, sd) = (&ss[..], &sd[..]);
+
+    // credit: the latest click at or before the start, within 7 days
     let mut hi = 0usize;
-    let mut last_hi = usize::MAX;
-    let mut last_g = 0usize;
-    let mut last_t = 0u32;
-    for si in 0..t.ss.len() {
-        let start = t.ss[si];
+    let mut memo = (usize::MAX, 0usize);
+    for i in 0..ns {
+        let start = ss[i];
         while hi < m && cl[hi].ts <= start {
             hi += 1;
         }
-        // The newest click at or before the start; ties go to the smallest
-        // click_id, which sorts first inside its timestamp group.
         let camp = if hi == 0 {
             organic
         } else {
-            if hi != last_hi {
-                last_hi = hi;
-                last_t = cl[hi - 1].ts;
-                let mut g = hi - 1;
-                while g > 0 && cl[g - 1].ts == last_t {
-                    g -= 1;
-                }
-                if hi - g > 1 {
-                    // Several clicks share this millisecond: smallest id wins.
-                    let mut best = g;
-                    for k in g + 1..hi {
-                        if ctx.bytes(cl[k].sref) < ctx.bytes(cl[best].sref) {
-                            best = k;
-                        }
-                    }
-                    g = best;
-                }
-                last_g = g;
-            }
-            if start - last_t <= WEEK {
-                cl[last_g].camp
+            let g = credited(ctx, cl, hi, &mut memo);
+            if start - cl[hi - 1].ts <= WEEK {
+                cl[g].camp as usize
             } else {
                 organic
             }
         };
-        let e = &mut o.cd[camp as usize * stride + t.sd[si] as usize];
+        let v = sv[i];
+        let e = &mut o.cd[camp * stride + sd[i] as usize];
         e.sessions += 1;
-        if t.sp[si] {
-            e.purch += 1;
-        }
-        e.rev += t.sr[si];
+        e.purch += (v & 1) as u32;
+        e.rev += v >> 1;
     }
 
-    // assists: merge each campaign's [click, click + 7 days] windows
-    if m > 0 && !t.ss.is_empty() {
-        t.gen += 1;
-        let g0 = t.gen;
-        let mut ntc = 0usize;
-        for k in 0..m {
-            let c = cl[k].camp as usize;
-            let tt = cl[k].ts;
-            if t.mark[c] != g0 {
-                t.mark[c] = g0;
-                t.iv[c] = (tt, tt.saturating_add(WEEK));
-                if ntc < t.tc.len() {
-                    t.tc[ntc] = c as u32;
-                    ntc += 1;
-                }
+    // assists: click k reaches sessions a..b, and both ends only move forward,
+    // so each campaign's reach is a few runs of sessions
+    *gen += 1;
+    let g0 = *gen;
+    let mut have_cum = false;
+    let mut ntc = 0usize;
+    let (mut a, mut b) = (0usize, 0usize);
+    for k in 0..m {
+        let tt = cl[k].ts;
+        while a < ns && ss[a] < tt {
+            a += 1;
+        }
+        if a == ns {
+            break;
+        }
+        let end = tt.saturating_add(WEEK);
+        if b < a {
+            b = a;
+        }
+        while b < ns && ss[b] <= end {
+            b += 1;
+        }
+        if a == b {
+            continue;
+        }
+        let c = cl[k].camp as usize;
+        if mark[c] != g0 {
+            mark[c] = g0;
+            iv[c] = (a as u32, b as u32);
+            tc[ntc] = c as u32;
+            ntc += 1;
+        } else {
+            let (s, e) = iv[c];
+            if a as u32 <= e {
+                iv[c] = (s, b as u32);
             } else {
-                let (s, e) = t.iv[c];
-                if tt <= e {
-                    t.iv[c] = (s, tt.saturating_add(WEEK));
-                } else {
-                    flush_assist(&t.ss, &t.sd, &t.cum, &mut o.cd, stride, c, s, e);
-                    t.iv[c] = (tt, tt.saturating_add(WEEK));
-                }
+                flush_assist(sd, cum, &mut have_cum, &mut o.asst, stride, c, s as usize, e as usize);
+                iv[c] = (a as u32, b as u32);
             }
         }
-        for x in 0..ntc {
-            let c = t.tc[x] as usize;
-            let (s, e) = t.iv[c];
-            flush_assist(&t.ss, &t.sd, &t.cum, &mut o.cd, stride, c, s, e);
-        }
+    }
+    for x in 0..ntc {
+        let c = tc[x] as usize;
+        let (s, e) = iv[c];
+        flush_assist(sd, cum, &mut have_cum, &mut o.asst, stride, c, s as usize, e as usize);
+    }
+}
+
+/// every session of a person without clicks is organic
+fn attribute_none(ctx: &Ctx, t: &mut Tmp, o: &mut Out) {
+    let row = ctx.ncamp * (ctx.ndays + 2);
+    for i in 0..t.ss.len() {
+        let v = t.sv[i];
+        let e = &mut o.cd[row + t.sd[i] as usize];
+        e.sessions += 1;
+        e.purch += (v & 1) as u32;
+        e.rev += v >> 1;
+    }
+}
+
+/// One person: `ev` and `cl` in time order.
+fn process_person(ctx: &Ctx, ev: &[PRec], cl: &[CRec], t: &mut Tmp, o: &mut Out, name: &[u8]) {
+    let ns = sessionize(ctx, ev, t, o, name);
+    if ns == 0 {
+        return;
+    }
+    if cl.is_empty() {
+        attribute_none(ctx, t, o);
+    } else if ns <= SMALL {
+        attribute_small(ctx, cl, 0, t, o);
+    } else {
+        attribute_any(ctx, cl, t, o);
     }
 }
 
@@ -2281,20 +2585,7 @@ fn main() {
                         cpos: Vec::new(),
                         cur: Vec::new(),
                         tbl: Vec::new(),
-                        t: Tmp {
-                            ss: Vec::new(),
-                            sd: Vec::new(),
-                            sr: Vec::new(),
-                            sp: Vec::new(),
-                            cum: vec![0; stride + 2],
-                            cnt: vec![0; stride + 2],
-                            iv: vec![(0, 0); ctx.ncamp + 1],
-                            mark: vec![0; ctx.ncamp + 1],
-                            tc: vec![0; ctx.ncamp + 1],
-                            gen: 0,
-                            catrev: vec![0; ctx.cats.len() + 1],
-                            touch: vec![0; ctx.cats.len() + 1],
-                        },
+                        t: Tmp::new(ctx),
                         o: fast_o.unwrap_or_else(|| Out::new(rows_per_thread, (ctx.ncamp + 1) * stride)),
                     };
                     loop {
@@ -2307,7 +2598,7 @@ fn main() {
                     }
                     // every file must use the same integer type, so agree on it
                     all_bits.fetch_or(f.o.all_bits, Ordering::Relaxed);
-                    cds.lock().unwrap().push(std::mem::take(&mut f.o.cd));
+                    cds.lock().unwrap().push(f.o.campaign_days());
                     folded.wait();
                     let n = f.o.day.len();
                     if n > 0 {
@@ -2366,4 +2657,261 @@ fn main() {
     }
     // both tables are closed: let the kernel free everything at once
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const NCAMP: usize = 6;
+    const NCAT: usize = 4;
+
+    fn rnd(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// a 14-day window whose click ids are 6 bytes each in one buffer
+    fn test_ctx(ids: &'static [u8]) -> Ctx {
+        let ws = 20_000 * DAY_MS;
+        let we = ws + 14 * DAY_MS;
+        Ctx {
+            maps: vec![Map { ptr: ids.as_ptr(), len: ids.len() }],
+            ev_lo: ws,
+            ev_hi: we,
+            cl_lo: ws - WEEK_MS,
+            cl_hi: we,
+            base: ws - WEEK_MS,
+            day0: ws / DAY_MS,
+            ndays: 14,
+            links: OnceLock::new(),
+            no_links: Links { link: Map64::with_capacity(0), lbloom: Bloom::new(0), names: Map64::with_capacity(0) },
+            links_gate: Mutex::new(()),
+            links_cv: Condvar::new(),
+            prod: Vec::new(),
+            prod_extra: None,
+            camp: Vec::new(),
+            camp_extra: None,
+            ncamp: NCAMP,
+            cats: (0..NCAT).map(|c| vec![b'a' + c as u8]).collect(),
+            unknown_cat: 0,
+            chan: vec![0; NCAMP],
+            chans: vec![b"x".to_vec()],
+            eid_bits: 0,
+            per_bits: 0,
+        }
+    }
+
+    type Cells = BTreeMap<(usize, usize), (u32, u32, u64, u32)>;
+    type Rows = Vec<(i32, i64, i64, i64, u8)>;
+
+    /// the rules, one session and one click at a time
+    fn by_the_rules(ctx: &Ctx, ev: &[PRec], cl: &[CRec]) -> (Cells, Rows) {
+        let mut cells = Cells::new();
+        let mut days: BTreeMap<i64, (i64, i64, i64, BTreeMap<u32, u64>)> = BTreeMap::new();
+        let mut i = 0;
+        while i < ev.len() {
+            let mut j = i + 1;
+            while j < ev.len() && ev[j].ts - ev[j - 1].ts <= GAP_MS {
+                j += 1;
+            }
+            let start = ev[i].ts;
+            let day = (ctx.base + start as i64).div_euclid(DAY_MS) - ctx.day0;
+            let d = days.entry(day).or_default();
+            d.0 += 1;
+            d.1 += (j - i) as i64;
+            let (mut rev, mut pur) = (0u64, 0u32);
+            for e in &ev[i..j] {
+                if e.pc != 0 {
+                    rev += (e.pc & 0xff_ffff) as u64;
+                    pur = 1;
+                    *d.3.entry(e.pc >> 24).or_default() += (e.pc & 0xff_ffff) as u64;
+                }
+            }
+            d.2 += rev as i64;
+            let ok: Vec<&CRec> = cl.iter().filter(|c| c.ts <= start && start - c.ts <= WEEK).collect();
+            let camp = match ok.iter().map(|c| c.ts).max() {
+                None => ctx.ncamp,
+                Some(t) => ok.iter().filter(|c| c.ts == t).min_by_key(|c| ctx.bytes(c.sref)).unwrap().camp as usize,
+            };
+            let e = cells.entry((camp, day as usize)).or_default();
+            e.0 += 1;
+            e.1 += pur;
+            e.2 += rev;
+            for c in ok.iter().map(|c| c.camp as usize).collect::<BTreeSet<_>>() {
+                cells.entry((c, day as usize)).or_default().3 += 1;
+            }
+            i = j;
+        }
+        let rows = days
+            .into_iter()
+            .map(|(day, (s, e, r, cats))| {
+                let top = cats.iter().map(|(&c, &v)| (v, std::cmp::Reverse(c))).max().map_or(CAT_NONE as u8, |(_, c)| c.0 as u8);
+                ((ctx.day0 + day) as i32, s, e, r, top)
+            })
+            .collect();
+        (cells, rows)
+    }
+
+    fn cells_of(ctx: &Ctx, o: &Out) -> Cells {
+        let stride = ctx.ndays + 2;
+        let mut cells = Cells::new();
+        for (i, (c, &a)) in o.cd.iter().zip(&o.asst).enumerate() {
+            if c.sessions != 0 || c.purch != 0 || c.rev != 0 || a != 0 {
+                cells.insert((i / stride, i % stride), (c.sessions, c.purch, c.rev, a));
+            }
+        }
+        cells
+    }
+
+    fn person(x: &mut u64, big: bool) -> (Vec<PRec>, Vec<CRec>) {
+        let span = (21 * DAY_MS) as u64;
+        let gap = GAP_MS as u64;
+        let n = if big { 100 + rnd(x) % 500 } else { 1 + rnd(x) % 40 };
+        let mut ev = Vec::new();
+        let mut ts = WEEK as u64 + rnd(x) % (3 * DAY_MS as u64);
+        for _ in 0..n {
+            ts += match rnd(x) % 12 {
+                0 | 1 => 0,
+                2 => 1,
+                3 | 4 => rnd(x) % 60_000,
+                5 => gap - 1,
+                6 | 7 => gap,
+                8 => gap + 1,
+                9 => 2 * gap + rnd(x) % (8 * gap),
+                10 => rnd(x) % (if big { 3 * gap } else { 3 * DAY_MS as u64 }),
+                _ => rnd(x) % (2 * gap),
+            };
+            if ts >= span {
+                break;
+            }
+            let pc = if rnd(x) % 5 == 0 { (((rnd(x) % NCAT as u64) as u32) << 24) | (1 + rnd(x) % 3) as u32 * 100 } else { 0 };
+            ev.push(PRec { person: 0, ts: ts as u32, pc });
+        }
+        let m = match rnd(x) % 8 {
+            0 => 0,
+            1 => 1,
+            7 if big => 300 + rnd(x) % 300,
+            _ => rnd(x) % 30,
+        };
+        let week = WEEK as i64;
+        let mut cl = Vec::new();
+        for _ in 0..m {
+            let at = ev[(rnd(x) % ev.len() as u64) as usize].ts as i64;
+            let t = at
+                + match rnd(x) % 12 {
+                    0 => 0,
+                    1 => 1,
+                    2 => -1,
+                    3 => -week,
+                    4 => -week - 1,
+                    5 => -week + 1,
+                    6 | 7 => -((rnd(x) % WEEK as u64) as i64),
+                    8 => -((rnd(x) % (2 * WEEK as u64)) as i64),
+                    9 => (rnd(x) % gap) as i64,
+                    _ => -((rnd(x) % DAY_MS as u64) as i64),
+                };
+            let t = t.clamp(0, span as i64 - 1) as u32;
+            // the id is 6 bytes of the buffer
+            let id = (rnd(x) % 4096) as usize;
+            cl.push(CRec { person: 0, sref: sref_of(0, id * 6, 6), ts: t, camp: (rnd(x) % NCAMP as u64) as u32 });
+        }
+        // a click id appears once
+        let mut seen = BTreeSet::new();
+        cl.retain(|c| seen.insert(c.sref));
+        cl.sort_by_key(|c| c.ts);
+        (ev, cl)
+    }
+
+    #[test]
+    fn a_person_follows_the_rules() {
+        // 4096 distinct ids in a scrambled order
+        let mut ids = Vec::new();
+        for i in 0..4096u32 {
+            ids.extend_from_slice(format!("c{:05}", (i * 2731) % 4096 * 17).as_bytes());
+        }
+        let ctx = test_ctx(Box::leak(ids.into_boxed_slice()));
+        let cd_len = (ctx.ncamp + 1) * (ctx.ndays + 2);
+        let mut t = Tmp::new(&ctx);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let (mut small, mut large, mut tied) = (0, 0, 0);
+        for round in 0..6000 {
+            let (ev, cl) = person(&mut x, round % 20 == 0);
+            if ev.is_empty() {
+                continue;
+            }
+            let (cells, rows) = by_the_rules(&ctx, &ev, &cl);
+            let mut o = Out::new(64, cd_len);
+            process_person(&ctx, &ev, &cl, &mut t, &mut o, b"u1");
+            assert_eq!(cells_of(&ctx, &o), cells, "round {}", round);
+            let got: Rows = (0..o.day.len()).map(|i| (o.day[i], o.sessions[i], o.events[i], o.rev[i], o.cat[i])).collect();
+            assert_eq!(got, rows, "round {}", round);
+            let ns = t.ss.len();
+            if ns <= SMALL {
+                small += 1;
+            } else {
+                large += 1;
+            }
+            tied += cl.windows(2).filter(|w| w[0].ts == w[1].ts).count();
+            // the general walk agrees on a person the masks took
+            if !cl.is_empty() {
+                let mut o2 = Out::new(64, cd_len);
+                assert_eq!(sessionize(&ctx, &ev, &mut t, &mut o2, b"u1"), ns);
+                attribute_any(&ctx, &cl, &mut t, &mut o2);
+                assert_eq!(cells_of(&ctx, &o2), cells, "round {} by the general walk", round);
+            }
+            // and the masks do not need the clicks in order
+            if !cl.is_empty() && ns <= SMALL {
+                let mut mixed = cl.clone();
+                for i in (1..mixed.len()).rev() {
+                    mixed.swap(i, (rnd(&mut x) % (i as u64 + 1)) as usize);
+                }
+                let mut o3 = Out::new(64, cd_len);
+                assert_eq!(sessionize(&ctx, &ev, &mut t, &mut o3, b"u1"), ns);
+                attribute_small(&ctx, &mixed, 0, &mut t, &mut o3);
+                assert_eq!(cells_of(&ctx, &o3), cells, "round {} with the clicks out of order", round);
+            }
+            assert!(t.cm.iter().all(|&m| m == 0) && t.bidx.iter().all(|&b| b == NO_CLICK), "round {} left state behind", round);
+        }
+        assert!(small > 1000 && large > 100 && tied > 1000, "{} {} {}", small, large, tied);
+    }
+
+    #[test]
+    fn click_against_eight_starts() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let pick = |x: &mut u64| match rnd(x) % 4 {
+            0 => (rnd(x) % 8) as u32,
+            1 => u32::MAX - (rnd(x) % 8) as u32,
+            2 => 0x7fff_fffcu32 + (rnd(x) % 8) as u32,
+            _ => rnd(x) as u32,
+        };
+        for _ in 0..50_000 {
+            let mut ss = [0u32; 8];
+            for e in ss.iter_mut() {
+                *e = pick(&mut x);
+            }
+            // a few clicks in a row over the same state, both ways
+            let (mut ka, mut ia) = ([0u32; 8], [NO_CLICK; 8]);
+            let (mut kb, mut ib) = (ka, ia);
+            for k in 0..6u32 {
+                let (lo, hi) = (pick(&mut x), pick(&mut x));
+                let a = unsafe {
+                    let (mut bk, mut bi) = (load8(ka.as_ptr()), load8(ia.as_ptr()));
+                    let r = click8(load8(ss.as_ptr()), &mut bk, &mut bi, lo, hi, k);
+                    store8(ka.as_mut_ptr(), bk);
+                    store8(ia.as_mut_ptr(), bi);
+                    r
+                };
+                let b = click8_plain(&ss, &mut kb, &mut ib, lo, hi, k);
+                assert_eq!(a, b, "{:?} {} {}", ss, lo, hi);
+                assert_eq!((ka, ia), (kb, ib), "{:?} {} {}", ss, lo, hi);
+                let ge: u64 = (0..8).map(|i| ((ss[i] >= lo) as u64) << i).sum();
+                let le: u64 = (0..8).map(|i| ((ss[i] <= hi) as u64) << i).sum();
+                assert_eq!((a.0, a.1), (ge, le));
+            }
+        }
+    }
 }

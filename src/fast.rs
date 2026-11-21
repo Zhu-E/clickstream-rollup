@@ -44,6 +44,24 @@ struct FC {
     b: u64,
 }
 
+impl Click for FC {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        ((self.a >> 9) & 0x7fff_ffff) as u32
+    }
+    #[inline(always)]
+    fn camp(&self) -> usize {
+        (self.b >> 48) as usize
+    }
+    /// `at`: the first click file
+    #[inline(always)]
+    fn id<'a>(&self, ctx: &'a Ctx, at: usize) -> &'a [u8] {
+        let fi = at + ((self.b >> 40) & 255) as usize;
+        let off = ((self.b >> 4) & ((1 << 36) - 1)) as usize;
+        ctx.bytes(sref_of(fi, off, (self.b & 15) as usize))
+    }
+}
+
 #[derive(Copy, Clone)]
 struct Span {
     fi: u32,
@@ -846,6 +864,22 @@ fn member(ue: u32, alias: u64) -> bool {
     ue & GENERAL == 0 && alias as u32 <= (ue & 511)
 }
 
+/// ask for `bytes` at `p` ahead of reading them
+#[inline(always)]
+fn prefetch<T>(p: *const T, bytes: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let mut at = 0;
+        while at < bytes {
+            _mm_prefetch::<_MM_HINT_T0>((p as *const i8).add(at));
+            at += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (p, bytes);
+}
+
 // ------------------------------------------------------------- click groups
 
 /// a click bucket by user: `starts[l]..starts[l + 1]` is user l's own person
@@ -867,7 +901,11 @@ fn group_clicks(
     let nu = 1usize << CSHIFT;
     cnt.clear();
     cnt.resize(nu + 1, 0);
-    for blk in blocks {
+    for (bi, blk) in blocks.iter().enumerate() {
+        // written by other threads and not read since
+        if let Some(next) = blocks.get(bi + 1) {
+            prefetch(next.ptr, next.len as usize * 16);
+        }
         for r in blk.as_slice() {
             let ui = (r.a >> 40) as usize;
             if member(u[ui], r.a & ALIAS) {
@@ -946,14 +984,7 @@ impl<'a> Sh<'a> {
     }
     #[inline]
     fn crec(&self, f: &FC, person: u64) -> CRec {
-        let fi = self.cl0 + ((f.b >> 40) & 255) as usize;
-        let off = ((f.b >> 4) & ((1 << 36) - 1)) as usize;
-        CRec {
-            person,
-            sref: sref_of(fi, off, (f.b & 15) as usize),
-            ts: ((f.a >> 9) & 0x7fff_ffff) as u32,
-            camp: (f.b >> 48) as u32,
-        }
+        crec_of(self.cl0, f, person)
     }
     /// the user's own person as the general fold keys it
     fn own_key(&self, ui: u32) -> u64 {
@@ -974,6 +1005,55 @@ impl<'a> Sh<'a> {
     }
 }
 
+#[inline(always)]
+fn crec_of(cl0: usize, f: &FC, person: u64) -> CRec {
+    let fi = cl0 + ((f.b >> 40) & 255) as usize;
+    let off = ((f.b >> 4) & ((1 << 36) - 1)) as usize;
+    CRec {
+        person,
+        sref: sref_of(fi, off, (f.b & 15) as usize),
+        ts: ((f.a >> 9) & 0x7fff_ffff) as u32,
+        camp: (f.b >> 48) as u32,
+    }
+}
+
+/// `v` in time order through `tmp`: three counting passes over the bits of
+/// the timestamp. Clicks at one time end up in any order, as from a sort.
+fn sort_clicks(v: &mut Vec<CRec>, tmp: &mut Vec<CRec>) {
+    const BITS: [u32; 3] = [11, 11, 10];
+    let n = v.len();
+    if n < 256 {
+        v.sort_unstable_by_key(|r| r.ts);
+        return;
+    }
+    let mut at = vec![0u32; 3 << 11];
+    for r in v.iter() {
+        at[(r.ts & 2047) as usize] += 1;
+        at[2048 + ((r.ts >> 11) & 2047) as usize] += 1;
+        at[4096 + (r.ts >> 22) as usize] += 1;
+    }
+    tmp.clear();
+    tmp.resize(n, CRec { person: 0, sref: 0, ts: 0, camp: 0 });
+    let mut shift = 0;
+    for (pass, bits) in BITS.into_iter().enumerate() {
+        let at = &mut at[pass << 11..(pass + 1) << 11];
+        let mut sum = 0u32;
+        for a in at.iter_mut() {
+            let c = *a;
+            *a = sum;
+            sum += c;
+        }
+        let mask = (1u32 << bits) - 1;
+        for r in v.iter() {
+            let a = &mut at[((r.ts >> shift) & mask) as usize];
+            tmp[*a as usize] = *r;
+            *a += 1;
+        }
+        std::mem::swap(v, tmp);
+        shift += bits;
+    }
+}
+
 /// part of one user's events: a run cut by a bucket edge, or odd-id events
 struct Frag {
     ui: u32,
@@ -982,7 +1062,10 @@ struct Frag {
 }
 
 struct Wk<'a> {
+    cl2: Vec<CRec>,
     slots: Blob<FRec>,
+    /// the current user's events in counter order: room for every slot of a bucket
+    ev: Blob<PRec>,
     run: Vec<PRec>,
     cl: Vec<CRec>,
     t: Tmp,
@@ -1004,32 +1087,16 @@ struct SendWk<'a>(Wk<'a>);
 unsafe impl<'a> Send for SendWk<'a> {}
 unsafe impl<'a> Sync for SendWk<'a> {}
 
-fn new_tmp(ctx: &Ctx) -> Tmp {
-    let stride = ctx.ndays + 2;
-    Tmp {
-        ss: Vec::new(),
-        sd: Vec::new(),
-        sr: Vec::new(),
-        sp: Vec::new(),
-        cum: vec![0; stride + 2],
-        cnt: vec![0; stride + 2],
-        iv: vec![(0, 0); ctx.ncamp + 1],
-        mark: vec![0; ctx.ncamp + 1],
-        tc: vec![0; ctx.ncamp + 1],
-        gen: 0,
-        catrev: vec![0; ctx.cats.len() + 1],
-        touch: vec![0; ctx.cats.len() + 1],
-    }
-}
-
 impl<'a> Wk<'a> {
     fn new(sh: &Sh, arena: &'a Arena) -> Wk<'a> {
         let nbg = 1usize << sh.gbits;
         Wk {
+            cl2: Vec::new(),
             slots: Blob::zeroed(1 << sh.k.shift),
+            ev: Blob::zeroed(1 << sh.k.shift),
             run: Vec::new(),
             cl: Vec::new(),
-            t: new_tmp(sh.ctx),
+            t: Tmp::new(sh.ctx),
             o: Out::new(sh.out_rows, (sh.ctx.ncamp + 1) * (sh.ctx.ndays + 2)),
             gp: Sink::new(arena, nbg, 64),
             gc: Sink::new(arena, nbg, 64),
@@ -1046,7 +1113,7 @@ impl<'a> Wk<'a> {
     }
 
     /// an event whose id is not part of its user's own person
-    #[inline]
+    #[inline(never)]
     fn general(&mut self, sh: &Sh, un: u64, ts: u32, pc: u32) {
         if un != self.g_un {
             let mut nb = [0u8; 9];
@@ -1070,18 +1137,18 @@ impl<'a> Wk<'a> {
         self.gp.push(sh.gb(person), PRec { person, ts, pc });
     }
 
-    /// `self.run` holds every slot event of this user's own person
-    fn finish(&mut self, sh: &Sh, ui: u32, unsorted: bool) {
-        if self.run.is_empty() {
+    /// `run` holds every slot event of this user's own person
+    fn finish(&mut self, sh: &Sh, ui: u32, run: &mut [PRec], unsorted: bool) {
+        if run.is_empty() {
             return;
         }
         if sh.forced[(ui >> 6) as usize] >> (ui & 63) & 1 != 0 {
             let person = sh.own_key(ui);
             let b = sh.gb(person);
-            for e in &self.run {
+            for e in run.iter() {
                 self.gp.push(b, PRec { person, ts: e.ts, pc: e.pc });
             }
-            self.general_ev += self.run.len();
+            self.general_ev += run.len();
             return;
         }
         let bit = 1u64 << (ui & 63);
@@ -1090,35 +1157,90 @@ impl<'a> Wk<'a> {
             return;
         }
         if unsorted {
-            self.run.sort_unstable_by_key(|r| r.ts);
-        }
-        let fcs = sh.clicks_of(ui);
-        self.cl.clear();
-        self.cl.reserve(fcs.len());
-        for f in fcs {
-            self.cl.push(sh.crec(f, 0));
-        }
-        if self.cl.len() <= 24 {
-            sort_small_c(&mut self.cl);
-        } else {
-            self.cl.sort_unstable_by_key(|r| r.ts);
+            run.sort_unstable_by_key(|r| r.ts);
         }
         let mut nb = [0u8; 9];
         let un = ((ui as u64) << 9) | ((sh.u[ui as usize] >> 9) & 511) as u64;
         let n = sh.k.user_str(un, &mut nb);
-        self.inline_ev += self.run.len();
-        process_person(sh.ctx, &self.run, &self.cl, &mut self.t, &mut self.o, &nb[..n]);
+        self.inline_ev += run.len();
+        // as `process_person`, with the clicks as they were grouped
+        let ns = sessionize(sh.ctx, run, &mut self.t, &mut self.o, &nb[..n]);
+        let fcs = sh.clicks_of(ui);
+        if fcs.is_empty() {
+            attribute_none(sh.ctx, &mut self.t, &mut self.o);
+        } else if ns <= SMALL {
+            attribute_small(sh.ctx, fcs, sh.cl0, &mut self.t, &mut self.o);
+        } else {
+            // a person of many sessions wants the clicks in time order
+            self.cl.clear();
+            self.cl.reserve(fcs.len());
+            for f in fcs {
+                self.cl.push(sh.crec(f, 0));
+            }
+            sort_clicks(&mut self.cl, &mut self.cl2);
+            attribute_any(sh.ctx, &self.cl, &mut self.t, &mut self.o);
+        }
     }
 
-    fn end_run(&mut self, sh: &Sh, ui: u32, at: u32, edge: bool, unsorted: bool) {
-        if self.run.is_empty() {
+    /// one user's events, the first `n` of the buffer
+    #[inline(never)]
+    fn end_run(&mut self, sh: &Sh, ui: u32, at: u32, edge: bool, unsorted: bool, n: usize) {
+        if n == 0 {
             return;
         }
+        // `bucket` writes the buffer and is not doing so now
+        let run = unsafe { std::slice::from_raw_parts_mut(self.ev.as_mut_ptr(), n) };
         if edge || sh.defer[(ui >> 6) as usize] >> (ui & 63) & 1 != 0 {
-            self.frags.push(Frag { ui, at, ev: std::mem::take(&mut self.run) });
+            self.frags.push(Frag { ui, at, ev: run.to_vec() });
         } else {
-            self.finish(sh, ui, unsorted);
-            self.run.clear();
+            self.finish(sh, ui, run, unsorted);
+        }
+    }
+
+    /// keep the earliest copy of each counter of one range in its slot
+    #[inline]
+    fn dedup(&mut self, sh: &Sh, blocks: &[Blk<FRec>], low: usize) {
+        let slots = self.slots.as_mut_ptr();
+        for (bi, blk) in blocks.iter().enumerate() {
+            let recs = blk.as_slice();
+            // the next block is far away and cold: ask for it a piece at a time
+            let next = blocks.get(bi + 1).map_or((std::ptr::null(), 0), |b| (b.ptr as *const u8, b.len as usize * 16));
+            let mut at = 0;
+            for part in recs.chunks(64) {
+                if at < next.1 {
+                    prefetch(unsafe { next.0.add(at) }, (next.1 - at).min(1024));
+                }
+                at += 1024;
+                for r in part {
+                    let s = unsafe { &mut *slots.add(r.b as usize & low) };
+                    if s.a == 0 || sh.ing(r) < sh.ing(s) {
+                        *s = *r;
+                    }
+                }
+            }
+        }
+    }
+
+    /// a slot that is not a plain event: nothing, or the escaped event's (ts, user, pc)
+    #[cold]
+    #[inline(never)]
+    fn escaped(&mut self, sh: &Sh, c: u64, s: FRec) -> Option<(u32, u64, u32)> {
+        if s.a & 3 == DEAD {
+            return None;
+        }
+        let e = match sh.esc.get(&((c << 32) | (s.b >> 32))) {
+            Some(e) => *e,
+            None => {
+                sh.bad.store(true, Ordering::SeqCst);
+                return None;
+            }
+        };
+        match sh.k.user(e.user.bytes(sh.ctx)) {
+            Some(un) => Some((e.ts, un, e.pc)),
+            None => {
+                self.general_str(sh, e.user, e.ts, e.pc);
+                None
+            }
         }
     }
 
@@ -1129,70 +1251,72 @@ impl<'a> Wk<'a> {
             return;
         }
         let n = 1usize << sh.k.shift;
-        let low = n - 1;
+        self.dedup(sh, blocks, n - 1);
         let slots = self.slots.as_mut_ptr();
-        for blk in blocks {
-            for r in blk.as_slice() {
-                let s = unsafe { &mut *slots.add(r.b as usize & low) };
-                if s.a == 0 || sh.ing(r) < sh.ing(s) {
-                    *s = *r;
-                }
-            }
-        }
+        let ev = self.ev.as_mut_ptr();
         const NONE: u32 = u32::MAX;
         let mut cur = NONE;
         let mut ue = 0u32;
         let mut runs = 0u32;
         let mut last = 0u32;
-        let mut unsorted = false;
+        // bit 31 set once a timestamp is below the one before it
+        let mut back = 0u32;
+        // a plain event of the current user's own person has (user:31 tag:2) in own..=own + 4 * top
+        let (mut own, mut top) = (u64::MAX, 0u64);
+        // events of the current user written so far
+        let mut to = 0usize;
         for i in 0..n {
             let s = unsafe { *slots.add(i) };
+            // one compare for: live, this user, an alias of the own person
+            if (s.a & 0x1_ffff_ffff).wrapping_sub(own).rotate_right(2) <= top {
+                let ts = (s.a >> 33) as u32;
+                back |= ts.wrapping_sub(last);
+                last = ts;
+                unsafe {
+                    (*slots.add(i)).a = 0;
+                    *ev.add(to) = PRec { person: 0, ts, pc: (s.b >> 32) as u32 };
+                }
+                to += 1;
+                continue;
+            }
             if s.a == 0 {
                 continue;
             }
             unsafe { (*slots.add(i)).a = 0 };
-            let (ts, un, pc) = match s.a & 3 {
-                DEAD => continue,
-                LIVE => ((s.a >> 33) as u32, (s.a >> 2) & 0x7fff_ffff, (s.b >> 32) as u32),
-                _ => {
-                    let c = ((b as u64) << sh.k.shift) | i as u64;
-                    let e = match sh.esc.get(&((c << 32) | (s.b >> 32))) {
-                        Some(e) => *e,
-                        None => {
-                            sh.bad.store(true, Ordering::SeqCst);
-                            continue;
-                        }
-                    };
-                    match sh.k.user(e.user.bytes(sh.ctx)) {
-                        Some(un) => (e.ts, un, e.pc),
-                        None => {
-                            self.general_str(sh, e.user, e.ts, e.pc);
-                            continue;
-                        }
-                    }
+            let (ts, un, pc) = if s.a & 3 == LIVE {
+                ((s.a >> 33) as u32, (s.a >> 2) & 0x7fff_ffff, (s.b >> 32) as u32)
+            } else {
+                match self.escaped(sh, ((b as u64) << sh.k.shift) | i as u64, s) {
+                    Some(e) => e,
+                    None => continue,
                 }
             };
             let ui = (un >> 9) as u32;
             if ui != cur {
                 if cur != NONE {
-                    self.end_run(sh, cur, (b as u32) << 1, runs == 1, unsorted);
+                    self.end_run(sh, cur, (b as u32) << 1, runs == 1, back >> 31 != 0, to);
                 }
                 cur = ui;
                 ue = sh.u[ui as usize];
                 runs += 1;
                 last = 0;
-                unsorted = false;
+                back = 0;
+                // the run is folded or copied out: the next one reuses the warm start of the buffer
+                to = 0;
+                (own, top) = if ue & GENERAL == 0 { (((ui as u64) << 11) | LIVE, (ue & 511) as u64) } else { (u64::MAX, 0) };
             }
             if member(ue, un & ALIAS) {
-                unsorted |= ts < last;
+                back |= ts.wrapping_sub(last);
                 last = ts;
-                self.run.push(PRec { person: 0, ts, pc });
+                // at most one event per slot
+                unsafe { *ev.add(to) = PRec { person: 0, ts, pc } };
+                to += 1;
             } else {
                 self.general(sh, un, ts, pc);
             }
         }
         if cur != NONE {
-            self.end_run(sh, cur, ((b as u32) << 1) | (runs > 1) as u32, true, unsorted);
+            self.end_run(sh, cur, ((b as u32) << 1) | (runs > 1) as u32, true, back >> 31 != 0, to);
         }
     }
 
@@ -1203,37 +1327,38 @@ impl<'a> Wk<'a> {
             Some((f, rest)) if f.at == u32::MAX => (rest, Some(f)),
             _ => (frags, None),
         };
-        self.run.clear();
+        let mut run = std::mem::take(&mut self.run);
+        run.clear();
         // one allocation, not a doubling chain: big ones are mapped afresh
-        self.run.reserve(frags.iter().map(|f| f.ev.len()).sum());
+        run.reserve(frags.iter().map(|f| f.ev.len()).sum());
         for f in slots {
-            self.run.extend_from_slice(&f.ev);
+            run.extend_from_slice(&f.ev);
         }
-        let unsorted = self.run.windows(2).any(|w| w[1].ts < w[0].ts);
+        let unsorted = run.windows(2).any(|w| w[1].ts < w[0].ts);
         if let Some(f) = odd {
             if unsorted {
-                self.run.extend_from_slice(&f.ev);
+                run.extend_from_slice(&f.ev);
             } else {
                 // a handful of events into a long sorted run: merge from the back
                 let mut x = f.ev.clone();
                 x.sort_unstable_by_key(|r| r.ts);
-                let (mut i, mut j) = (self.run.len(), x.len());
+                let (mut i, mut j) = (run.len(), x.len());
                 let mut w = i + j;
-                self.run.resize(w, PRec { person: 0, ts: 0, pc: 0 });
+                run.resize(w, PRec { person: 0, ts: 0, pc: 0 });
                 while j > 0 {
-                    if i > 0 && self.run[i - 1].ts > x[j - 1].ts {
-                        self.run[w - 1] = self.run[i - 1];
+                    if i > 0 && run[i - 1].ts > x[j - 1].ts {
+                        run[w - 1] = run[i - 1];
                         i -= 1;
                     } else {
-                        self.run[w - 1] = x[j - 1];
+                        run[w - 1] = x[j - 1];
                         j -= 1;
                     }
                     w -= 1;
                 }
             }
         }
-        self.finish(sh, frags[0].ui, unsorted);
-        self.run.clear();
+        self.finish(sh, frags[0].ui, &mut run, unsorted);
+        self.run = run;
     }
 }
 
@@ -1813,6 +1938,51 @@ mod tests {
                 b.push(b',');
             }
             chk(&b, ends[0], ends[1], ends[2], ends[3]);
+        }
+    }
+
+    #[test]
+    fn a_click_reads_like_its_record() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let f = FC { a: x, b: x.rotate_left(29) };
+            let c = crec_of(5, &f, 0);
+            assert_eq!((Click::ts(&f), Click::camp(&f)), (c.ts, c.camp as usize));
+            let (len, fi, off) = (c.sref >> 56, (c.sref >> 40) & 0xffff, c.sref & 0xff_ffff_ffff);
+            assert_eq!((len, fi, off), (f.b & 15, 5 + ((f.b >> 40) & 255), (f.b >> 4) & ((1 << 36) - 1)));
+        }
+    }
+
+    #[test]
+    fn clicks_sort_by_time() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let (mut v, mut tmp) = (Vec::new(), Vec::new());
+        for round in 0..300u64 {
+            let n = [0, 1, 255, 256, 257, 1000, 5000][(round % 7) as usize];
+            v.clear();
+            for i in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let ts = match round % 3 {
+                    0 => x as u32,
+                    1 => (x % 50) as u32 * 2048 + (x >> 40) as u32 % 3,
+                    _ => u32::MAX - (x % 5000) as u32,
+                };
+                v.push(CRec { person: 0, sref: i as u64, ts, camp: (x >> 33) as u32 % 7 });
+            }
+            let mut want = v.clone();
+            want.sort_by_key(|c| (c.ts, c.sref));
+            sort_clicks(&mut v, &mut tmp);
+            assert!(v.windows(2).all(|w| w[0].ts <= w[1].ts), "round {}", round);
+            // the same clicks, whatever the order inside one timestamp
+            let mut got = v.clone();
+            got.sort_by_key(|c| (c.ts, c.sref));
+            let key = |c: &CRec| (c.ts, c.sref, c.camp, c.person);
+            assert_eq!(got.iter().map(key).collect::<Vec<_>>(), want.iter().map(key).collect::<Vec<_>>(), "round {}", round);
         }
     }
 
