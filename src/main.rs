@@ -5,6 +5,8 @@
 //   dedup  -> per event-id bucket, keep the earliest ingest; emit person buckets
 //   fold   -> per person bucket: sort, sessionize, attribute, aggregate
 //   write  -> Parquet
+mod fast;
+mod genid;
 mod pq;
 mod sys;
 mod tbl;
@@ -1772,7 +1774,8 @@ fn main() {
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  pre: maps {:?} meta {:?}", t_maps, t_pre - t_maps);
     }
-    let links = build_links(&maps, i_lk.clone(), nt);
+    let fkeys = fast::probe(&maps[i_ev.clone()], nt);
+    let links = if fkeys.is_some() { fast::no_links() } else { build_links(&maps, i_lk.clone(), nt) };
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  pre {:?} links {:?}", t_pre, t0.elapsed() - t_pre);
     }
@@ -1798,7 +1801,7 @@ fn main() {
     let day_last = (we - 1).div_euclid(DAY_MS);
     let ndays = (day_last - day0 + 1) as usize;
     assert!(ndays < 250, "window too long");
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         maps,
         ev_lo: ws,
         ev_hi: we,
@@ -1886,6 +1889,13 @@ fn main() {
         return;
     }
 
+    // ---- the fast path, when the ids are the generator's; it leaves the
+    // general stages below only the persons it could not fold itself
+    let fast_out = match &fkeys {
+        Some(k) => fast::run(&mut ctx, k, &arena, i_ev.clone(), i_cl.clone(), i_lk.clone(), &outdir, nt),
+        None => None,
+    };
+
     // ---- parse
     const CHUNK: usize = 1 << 20;
     let mut chunks: Vec<(u8, u32, usize, usize)> = Vec::new();
@@ -1904,6 +1914,9 @@ fn main() {
             chunks.push((1, fi as u32, a, (a + CHUNK).min(n)));
             a += CHUNK;
         }
+    }
+    if fast_out.is_some() {
+        chunks.clear();
     }
     let next = AtomicUsize::new(0);
     let mut eparts: Vec<Vec<Vec<Blk<ERec>>>> = Vec::new();
@@ -1948,6 +1961,9 @@ fn main() {
             xraw.extend_from_slice(&x);
         }
     });
+    if let Some(f) = &fast_out {
+        xraw.extend_from_slice(&f.xn);
+    }
     // Names of ids that could not be encoded: normally none at all.
     let mut xnames = Map64::with_capacity(xraw.len() + 16);
     for &(k, v) in xraw.iter() {
@@ -2006,6 +2022,10 @@ fn main() {
     let pbuckets = merge_blocks(pparts, nb_per);
     drop(ebuckets);
     drop(arena_e);
+    let (pbuckets, cbuckets, fast_cd, fast_rows) = match fast_out {
+        Some(f) => (f.pb, f.cb, Some(f.cd), f.rows),
+        None => (pbuckets, cbuckets, None, 0),
+    };
     let porder = order_by_size(&pbuckets);
     let t_dedup = t0.elapsed();
 
@@ -2097,6 +2117,8 @@ fn main() {
             nrows_tot += n;
         }
     });
+    cds.extend(fast_cd);
+    nrows_tot += fast_rows;
     let t_fold = t0.elapsed();
 
     // ---- campaign_daily
