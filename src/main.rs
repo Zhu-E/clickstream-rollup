@@ -11,6 +11,7 @@ mod tbl;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use sys::*;
 use tbl::*;
 
@@ -33,7 +34,7 @@ struct ERec {
     klo: u64,
     khi: u32,
     ing: u32,
-    person: u64, // the user id itself when it fits in 63 bits, else a hash
+    user: u64, // the user id itself when it fits in 63 bits, else a hash
     tsf: u32,    // ts offset from base, bit 31 = valid
     pc: u32,     // (cat << 24) | price, 0 when not a purchase
 }
@@ -69,9 +70,9 @@ struct Ctx {
     base: i64, // window_start - 7 days, the zero point for ts offsets
     day0: i64,
     ndays: usize,
-    link: Map64,
-    lbloom: Bloom,
-    names: Map64,
+    links: OnceLock<Links>,
+    links_gate: Mutex<()>,
+    links_cv: Condvar,
     prod: Vec<u8>, // product number -> cat + 1
     prod_extra: Option<Map64>,
     camp: Vec<u32>, // campaign number -> index + 1
@@ -95,6 +96,25 @@ impl Ctx {
         let off = (s & 0xff_ffff_ffff) as usize;
         let m = &self.maps[fi];
         unsafe { std::slice::from_raw_parts(m.ptr.add(off), len) }
+    }
+    #[inline(always)]
+    fn links(&self) -> &Links {
+        self.links.get().expect("links not built yet")
+    }
+    fn set_links(&self, l: Links) {
+        let _ = self.links.set(l);
+        let _g = self.links_gate.lock().unwrap();
+        self.links_cv.notify_all();
+    }
+    /// Blocks until the link thread has published the link map.
+    fn wait_links(&self) {
+        if self.links.get().is_some() {
+            return;
+        }
+        let mut g = self.links_gate.lock().unwrap();
+        while self.links.get().is_none() {
+            g = self.links_cv.wait(g).unwrap();
+        }
     }
 }
 
@@ -408,11 +428,12 @@ impl Ctx {
     }
     #[inline(always)]
     fn person_of(&self, user: &[u8], hits: &mut usize) -> u64 {
+        let lk = self.links();
         let k = person_key(user);
-        if !self.lbloom.maybe(k) {
+        if !lk.lbloom.maybe(k) {
             return k;
         }
-        match self.link.get(k) {
+        match lk.link.get(k) {
             Some(r) => {
                 *hits += 1;
                 r
@@ -449,6 +470,7 @@ fn first_line_start(d: &[u8], start: usize) -> usize {
 static SIMD_OK: AtomicBool = AtomicBool::new(true);
 
 static LKH: AtomicUsize = AtomicUsize::new(0);
+static LKH_EV: AtomicUsize = AtomicUsize::new(0);
 static NROW: AtomicUsize = AtomicUsize::new(0);
 static NVAL: AtomicUsize = AtomicUsize::new(0);
 static NS_EV: AtomicUsize = AtomicUsize::new(0);
@@ -471,7 +493,6 @@ fn parse_events<const ABL: u32>(
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
     let mut acc = 0usize;
-    let mut lkh = 0usize;
     let mut nrow = 0usize;
     let mut nval = 0usize;
     while p < to {
@@ -504,24 +525,12 @@ fn parse_events<const ABL: u32>(
         let ing_ms = parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc).unwrap_or(0);
         let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
 
-        // Resolving a user to a person ends in a line of a link map far too
-        // big to cache. The probe is started here and read after validation,
-        // so the event timestamp covers the miss instead of waiting on it.
         let user = &line[f[1].0 as usize..f[1].1 as usize];
         let has_user = !user.is_empty();
-        let mut pk = 0u64;
-        let mut linked = false;
-        if has_user && (ABL == 0 || ABL >= 6) {
-            pk = person_key(user);
-            linked = ctx.lbloom.maybe(pk);
-            if linked {
-                ctx.link.prefetch(pk);
-            }
-        }
 
         let mut tsf = 0u32;
         let mut pc = 0u32;
-        let mut person = 0u64;
+        let mut ukey = 0u64;
         loop {
             if !has_user {
                 break;
@@ -571,21 +580,12 @@ fn parse_events<const ABL: u32>(
                 acc += pid.len() ^ pc as usize;
                 break;
             }
-            person = if linked {
-                match ctx.link.get(pk) {
-                    Some(r) => {
-                        lkh += 1;
-                        r
-                    }
-                    None => pk,
-                }
-            } else {
-                pk
-            };
-            if person & PTAG != 0 && ctx.names.get(person).is_none() {
-                // An id too long or too odd to encode, and in no link: keep
-                // track of where its bytes are so the name can be written out.
-                xn.push((person, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
+            // dedup resolves the user to a person once links are built
+            ukey = person_key(user);
+            if ukey & PTAG != 0 {
+                // An id too long or too odd to encode: keep track of where
+                // its bytes are in case it turns out to name a person.
+                xn.push((ukey, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
             }
             tsf = (ts - ctx.base) as u32 | 0x8000_0000;
             nval += 1;
@@ -593,15 +593,14 @@ fn parse_events<const ABL: u32>(
         }
         let b = (mix(klo ^ (khi as u64), 0x9e37_79b9_7f4a_7c15) >> (64 - ctx.eid_bits)) as usize;
         if ABL == 6 {
-            acc += b ^ tsf as usize ^ pc as usize ^ person as usize ^ ing as usize;
+            acc += b ^ tsf as usize ^ pc as usize ^ ukey as usize ^ ing as usize;
             continue;
         }
-        sink.push(b, ERec { klo, khi, ing, person, tsf, pc });
+        sink.push(b, ERec { klo, khi, ing, user: ukey, tsf, pc });
     }
     if ABL != 0 {
         ACC.fetch_add(acc, Ordering::Relaxed);
     }
-    LKH.fetch_add(lkh, Ordering::Relaxed);
     NROW.fetch_add(nrow, Ordering::Relaxed);
     NVAL.fetch_add(nval, Ordering::Relaxed);
 }
@@ -662,10 +661,18 @@ struct DEnt {
     ptr: *const ERec,
 }
 
-fn dedup_bucket(blocks: &[Blk<ERec>], tbl: &mut Vec<DEnt>, sink: &mut Sink<PRec>, per_bits: u32) {
+/// Keeps one copy per event id, then resolves each valid survivor's user to
+/// its person and scatters it by person. Returns how many were linked.
+fn dedup_bucket(
+    blocks: &[Blk<ERec>],
+    tbl: &mut Vec<DEnt>,
+    sink: &mut Sink<PRec>,
+    per_bits: u32,
+    lk: &Links,
+) -> usize {
     let n: usize = blocks.iter().map(|b| b.len as usize).sum();
     if n == 0 {
-        return;
+        return 0;
     }
     let cap = (n * 2).next_power_of_two().max(32);
     tbl.clear();
@@ -691,17 +698,47 @@ fn dedup_bucket(blocks: &[Blk<ERec>], tbl: &mut Vec<DEnt>, sink: &mut Sink<PRec>
             }
         }
     }
+    // Survivors wait in a short ring while their link-map line is fetched.
+    let mut ring = [(PRec { person: 0, ts: 0, pc: 0 }, false); RESOLVE_LAG];
+    let mut at = 0usize;
+    let mut hits = 0usize;
     for e in tbl.iter() {
         if e.khi != 0 {
             let r = unsafe { &*e.ptr };
             if r.tsf & 0x8000_0000 != 0 {
-                sink.push(
-                    person_bucket(r.person, per_bits),
-                    PRec { person: r.person, ts: r.tsf & 0x7fff_ffff, pc: r.pc },
-                );
+                let linked = lk.lbloom.maybe(r.user);
+                if linked {
+                    lk.link.prefetch(r.user);
+                }
+                let fresh = (PRec { person: r.user, ts: r.tsf & 0x7fff_ffff, pc: r.pc }, linked);
+                let due = std::mem::replace(&mut ring[at], fresh);
+                at = (at + 1) & (RESOLVE_LAG - 1);
+                emit_resolved(lk, sink, per_bits, due, &mut hits);
             }
         }
     }
+    for due in ring {
+        emit_resolved(lk, sink, per_bits, due, &mut hits);
+    }
+    hits
+}
+
+const RESOLVE_LAG: usize = 16;
+
+/// Pushes one surviving event under its person; a zero key is an empty ring slot.
+#[inline(always)]
+fn emit_resolved(lk: &Links, sink: &mut Sink<PRec>, per_bits: u32, due: (PRec, bool), hits: &mut usize) {
+    let (mut rec, linked) = due;
+    if rec.person == 0 {
+        return;
+    }
+    if linked {
+        if let Some(p) = lk.link.get(rec.person) {
+            *hits += 1;
+            rec.person = p;
+        }
+    }
+    sink.push(person_bucket(rec.person, per_bits), rec);
 }
 
 // ---------------------------------------------------------------- fold stage
@@ -1223,7 +1260,7 @@ fn fold_bucket(ctx: &Ctx, xn: &Map64, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Bl
             &nbuf[..n]
         } else {
             // Hashed key: the bytes are in the link names or the side table.
-            match ctx.names.get(pkey).or_else(|| xn.get(pkey)) {
+            match ctx.links().names.get(pkey).or_else(|| xn.get(pkey)) {
                 Some(x) => ctx.bytes(x),
                 None => b"",
             }
@@ -1767,14 +1804,9 @@ fn main() {
         Some(m)
     };
 
-    // ---- links
     let t_pre = t0.elapsed();
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  pre: maps {:?} meta {:?}", t_maps, t_pre - t_maps);
-    }
-    let links = build_links(&maps, i_lk.clone(), nt);
-    if std::env::var("SS_TIMING").is_ok() {
-        eprintln!("  pre {:?} links {:?}", t_pre, t0.elapsed() - t_pre);
     }
 
     let ev_bytes: usize = i_ev.clone().map(|i| maps[i].len).sum();
@@ -1807,9 +1839,9 @@ fn main() {
         base: ws - WEEK_MS,
         day0,
         ndays,
-        link: links.link,
-        lbloom: links.lbloom,
-        names: links.names,
+        links: OnceLock::new(),
+        links_gate: Mutex::new(()),
+        links_cv: Condvar::new(),
         prod,
         prod_extra,
         camp,
@@ -1886,7 +1918,9 @@ fn main() {
         return;
     }
 
-    // ---- parse
+    // ---- links + parse. The first worker joins the links while the others
+    // already parse events, which do not need a person until dedup. Click
+    // chunks come last and wait for the link map.
     const CHUNK: usize = 1 << 20;
     let mut chunks: Vec<(u8, u32, usize, usize)> = Vec::new();
     for fi in i_ev.clone() {
@@ -1911,13 +1945,21 @@ fn main() {
     let mut xraw: Vec<(u64, u64)> = Vec::new();
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
-            .map(|_| {
+            .map(|t| {
                 let next = &next;
                 let chunks = &chunks;
                 let ctx = &ctx;
                 let arena = &arena;
                 let arena_e = &arena_e;
+                let i_lk = i_lk.clone();
                 s.spawn(move || {
+                    if t == 0 {
+                        let links = build_links(&ctx.maps, i_lk, 1);
+                        ctx.set_links(links);
+                        if std::env::var("SS_TIMING").is_ok() {
+                            eprintln!("  pre {:?} links {:?} (overlapped)", t_pre, t0.elapsed() - t_pre);
+                        }
+                    }
                     let mut es = Sink::<ERec>::new(arena_e, nb_eid, BLK_E);
                     let mut cs = Sink::<CRec>::new(arena, nb_per, BLK_P);
                     let mut dc = DateCache::new();
@@ -1933,6 +1975,8 @@ fn main() {
                             parse_events::<0>(ctx, fi as usize, a, b, &mut es, &mut dc, &mut xn);
                             NS_EV.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         } else {
+                            ctx.wait_links();
+                            let tc = std::time::Instant::now();
                             parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc);
                             NS_CL.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         }
@@ -1960,7 +2004,7 @@ fn main() {
     let t_parse = t0.elapsed();
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!(
-            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {} rows {} valid {} linkhits {}",
+            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {} rows {} valid {} click-linkhits {}",
             t_pp,
             t_parse - t_pp,
             NS_EV.load(Ordering::Relaxed) / 1_000_000,
@@ -1984,17 +2028,20 @@ fn main() {
                 let ebuckets = &ebuckets;
                 let eorder = &eorder;
                 let arena = &arena;
+                let lk = ctx.links();
                 s.spawn(move || {
                     let mut sink = Sink::<PRec>::new(arena, nb_per, BLK_P);
                     let mut tbl: Vec<DEnt> = Vec::new();
                     let pb = per_bits;
+                    let mut hits = 0usize;
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         if k >= nb_eid {
                             break;
                         }
-                        dedup_bucket(&ebuckets[eorder[k]], &mut tbl, &mut sink, pb);
+                        hits += dedup_bucket(&ebuckets[eorder[k]], &mut tbl, &mut sink, pb, lk);
                     }
+                    LKH_EV.fetch_add(hits, Ordering::Relaxed);
                     sink.finish()
                 })
             })
@@ -2008,6 +2055,9 @@ fn main() {
     drop(arena_e);
     let porder = order_by_size(&pbuckets);
     let t_dedup = t0.elapsed();
+    if std::env::var("SS_TIMING").is_ok() {
+        eprintln!("  dedup: event-linkhits {}", LKH_EV.load(Ordering::Relaxed));
+    }
 
     // ---- fold + write user_daily
     let ud = outdir.join("user_daily");
