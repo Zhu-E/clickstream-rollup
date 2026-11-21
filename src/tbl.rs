@@ -618,9 +618,57 @@ const fn enc_tbl() -> [u8; 256] {
 
 static ENC: [u8; 256] = enc_tbl();
 
+/// Eight to ten bytes at once. The two nibbles of each byte pick one bit set
+/// each, which meet only on a byte outside the alphabet; the high nibble
+/// also picks what to add to get the code, and two multiply-adds pack the
+/// codes six bits apiece.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn enc_wide(b: &[u8]) -> Option<u64> {
+    use core::arch::x86_64::*;
+    let n = b.len();
+    debug_assert!(n >= 8 && n <= MAXENC);
+    let sh = 4 * (16 - n) as u32;
+    let lo = rd8(b, 0);
+    let hi = (rd8(b, n - 8) >> sh) >> sh;
+    unsafe {
+        let v = _mm_set_epi64x(hi as i64, lo as i64);
+        let nib = _mm_set1_epi8(0x0f);
+        let ln = _mm_and_si128(v, nib);
+        let hn = _mm_and_si128(_mm_srli_epi16(v, 4), nib);
+        // classes by high nibble: 3 digits, 4 and 6 letters from 1, 5 P-Z and _, 7 p-z
+        let hcls = _mm_setr_epi8(16, 16, 16, 1, 2, 4, 2, 8, 16, 16, 16, 16, 16, 16, 16, 16);
+        // low nibbles each class does not have
+        let lcls = _mm_setr_epi8(18, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 29, 29, 29, 29, 25);
+        let bad = _mm_and_si128(_mm_shuffle_epi8(hcls, hn), _mm_shuffle_epi8(lcls, ln));
+        let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(bad, _mm_setzero_si128())) as u32;
+        if !ok & ((1u32 << n) - 1) != 0 {
+            return None;
+        }
+        let add = _mm_setr_epi8(0, 0, 0, -0x2f, -0x36, -0x36, -0x3b, -0x3b, 0, 0, 0, 0, 0, 0, 0, 0);
+        let us = _mm_and_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(0x5f)), _mm_set1_epi8(-4));
+        let code = _mm_add_epi8(_mm_add_epi8(v, _mm_shuffle_epi8(add, hn)), us);
+        let pair = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
+        let four = _mm_madd_epi16(pair, _mm_set1_epi32(0x0001_1000));
+        let r = _mm_cvtsi128_si64(four) as u64;
+        let tail = _mm_extract_epi32(four, 2) as u32 as u64;
+        Some((((r & 0xffff_ffff) << 36) | ((r >> 32) << 12) | (tail >> 12)) + 1)
+    }
+}
+
 /// The id itself as a u64, or None if it does not fit the alphabet.
 #[inline(always)]
 pub fn enc_name(b: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    if b.len().wrapping_sub(8) <= MAXENC - 8 {
+        return enc_wide(b);
+    }
+    enc_bytes(b)
+}
+
+/// Any length, a byte at a time.
+#[inline(always)]
+fn enc_bytes(b: &[u8]) -> Option<u64> {
     if b.len() > MAXENC {
         return None;
     }
@@ -722,6 +770,37 @@ mod tests {
             for (b, kb) in &enc {
                 assert_eq!(ka.cmp(kb), a.cmp(b), "order: {:?} vs {:?}", a, b);
             }
+        }
+    }
+
+    #[test]
+    fn name_encoding_agrees_with_the_byte_loop() {
+        let mut x = 0x6a09_e667_f3bc_c909u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for n in 0..=12usize {
+            // every byte value at every position of a valid name
+            let mut v: Vec<u8> = (0..n).map(|i| ALPHA[(i * 7 + n) % 63]).collect();
+            assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
+            for i in 0..n {
+                let keep = v[i];
+                for c in 0..=255u8 {
+                    v[i] = c;
+                    assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
+                }
+                v[i] = keep;
+            }
+        }
+        for it in 0..2_000_000u32 {
+            let n = (next() % 13) as usize;
+            let v: Vec<u8> = (0..n)
+                .map(|_| if it % 5 == 0 && next() % 6 == 0 { next() as u8 } else { ALPHA[(next() % 63) as usize] })
+                .collect();
+            assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
         }
     }
 

@@ -17,6 +17,7 @@ const NBLK: usize = 128;
 const NPOS: usize = NBLK * 64 + 24;
 const NBIT: usize = NBLK + 4;
 
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), allow(dead_code))]
 pub struct Index {
     pos: [u32; NPOS],     // pos[0] is a sentinel; delimiter k is at pos[k + 1]
     qs: [u64; NBIT],      // bit k: the field after delimiter k - 1 opens with a quote
