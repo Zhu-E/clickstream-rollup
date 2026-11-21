@@ -30,9 +30,14 @@ backed by transparent huge pages.
    Timestamps go through a 64-entry cache keyed on `YYYY-MM-DD`, so the
    calendar arithmetic runs about twenty times per thread instead of 120
    million; the rest is SWAR digit checking. Resolving a user to a person
-   would be a miss in a 30-60 MB link map, so a blocked Bloom filter at 16
+   would be a miss in a 30-130 MB link map, so a blocked Bloom filter at 16
    bits per linked id answers "no link" from one cache line and keeps the
    half of all events whose user appears in no link out of the map entirely.
+   For the half that does need the map, the person key is computed and the
+   slot prefetched before the event timestamp is parsed, so that miss is in
+   flight during the timestamp, the window checks and the price. Map and
+   filter are mapped 2 MB-aligned and `MADV_HUGEPAGE`, because at that size a
+   probe misses the TLB as well as the cache.
    Each event is scattered into one of up to 8192 buckets by its `event_id`,
    each click into a bucket by person.
 3. **Dedup.** An event-id bucket is sized to dedup in cache: one
@@ -94,17 +99,53 @@ disagreement switches the run to the scalar path and says so on stderr, so a
 mistake in a path I cannot run here costs speed, not correctness. Deliberately
 breaking the vector path is part of how that was checked.
 
-`SS_TIMING=1` prints a per-stage breakdown on stderr. `SS_BENCH=<0..6>` runs
+`SS_TIMING=1` prints a per-stage breakdown on stderr, including the share of
+rows that pass validation (97.8% on the dev set, which is why the person key
+is computed before validation rather than after). `SS_BENCH=<0..6>` runs
 only the parse with that many steps enabled, which is how the per-step costs
 were measured; `tools/perf.sh` reports instructions retired and cycles, which
 unlike wall time do not move when a laptop throttles.
+
+### Measured and rejected
+
+- **Non-temporal stores for the shuffle.** Holding records back per bucket and
+  writing whole 64-byte lines with `vmovntdq` (`stnp` on aarch64) should save
+  the read-for-ownership on 3.6 GB of record writes. Interleaved, min of six,
+  parse only: 27.88 Gcycles storing each record straight into its bucket,
+  28.86 with the staging and ordinary stores, 28.60 with the staging and the
+  non-temporal store. The staging costs 3.5% and the instruction gives 0.9%
+  of it back, so it is a 2.6% loss. The reason is fanout: one line per bucket
+  is 128-512 KB of staging, which fits L1 on neither machine, so every record
+  is written and read again a level further out. And the saving it chases is
+  small -- the whole pipeline moves about 12 GB in a few seconds, nowhere near
+  either machine's memory bandwidth, so read-for-ownership traffic is not
+  where the time goes. Kept behind `SS_WC=1`, with `SS_NONT=1` to separate the
+  two effects, because a machine that *is* bandwidth bound would flip it.
+- **A wider hoist for the prefetch.** Prefetching the Bloom block as well, and
+  computing the person key before the ingest timestamp, cost three times the
+  instructions for the same cycles as prefetching the map alone. The filter is
+  L2-resident; only the map probe is worth covering.
+- **Merging the two shuffles.** Duplicate events may name different users, so
+  dedup has to be global by `event_id` before anything is grouped by person.
+- **28-byte packed event records.** The bytes saved come straight back as
+  records that straddle cache lines.
+- **64-bit hashed dedup keys.** A one-in-ten-thousand chance of silently
+  dropping an event is not worth 8 bytes a row.
 
 ## Numbers
 
 Best of five on an M3 MacBook Air (8 threads), which is not the scorer:
 1.12 s for 20M events / 5M clicks (1.8 GB), of which about 0.2 s is startup
 and link building, 0.6 s parse, 0.15 s dedup, 0.2 s fold. The same code and
-machine took 2.3 s before this round of work. Peak RSS is about
+machine took 2.3 s before this round of work.
+
+Wall time on a laptop swings by a factor of two under thermal throttling, and
+at 40M the input stops fitting in the page cache, so none of these numbers
+came off a stopwatch. Builds were compared interleaved, min of five or six, on
+instructions retired and cycles elapsed, mostly with `SS_BENCH` running the
+parse alone; a 2% difference is invisible without that. Work per row is flat
+with scale -- 1074 instructions per event row at 20M against 1102 at 40M --
+which is the reason to expect 60M to scale. Peak RSS is about
 2.3× the input size and the 60M-event case fits in well under the scorer's
 24 GB. Work per row is flat with scale: 1074 instructions per event row at
 20M, 1102 at 40M.

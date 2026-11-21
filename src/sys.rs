@@ -240,37 +240,137 @@ impl<T> Blk<T> {
 }
 
 /// Scatters records into `nb` buckets as linked lists of fixed-size blocks.
+/// Write a full cache line, bypassing the cache where the target has an
+/// instruction for it. A line written whole needs no read-for-ownership, so
+/// the shuffle stops reading the memory it is about to overwrite, and the
+/// record stream stops evicting the link map and the Bloom filter.
+///
+/// `dst` must be 64-byte aligned and `bytes` a multiple of 64.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+#[inline(always)]
+unsafe fn stream(dst: *mut u8, src: *const u8, bytes: usize) {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    while i < bytes {
+        let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+        _mm256_stream_si256(dst.add(i) as *mut __m256i, v);
+        i += 32;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn stream(dst: *mut u8, src: *const u8, bytes: usize) {
+    use core::arch::aarch64::*;
+    if !NT {
+        std::ptr::copy_nonoverlapping(src, dst, bytes);
+        return;
+    }
+    let mut i = 0;
+    while i < bytes {
+        let a = vld1q_u8(src.add(i));
+        let b = vld1q_u8(src.add(i + 16));
+        core::arch::asm!(
+            "stnp {a:q}, {b:q}, [{p}]",
+            a = in(vreg) a,
+            b = in(vreg) b,
+            p = in(reg) dst.add(i),
+            options(nostack, preserves_flags),
+        );
+        i += 32;
+    }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx"), target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn stream(dst: *mut u8, src: *const u8, bytes: usize) {
+    std::ptr::copy_nonoverlapping(src, dst, bytes);
+}
+
+/// Order the non-temporal stores before whatever the reader synchronises on.
+#[inline(always)]
+pub fn stream_fence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_sfence()
+    }
+}
+
+/// Hold records back per bucket and write whole cache lines non-temporally.
+/// Off, because it measured slower: see README. `SS_WC=1` at build time turns
+/// it on, `SS_WC=1 SS_NONT=1` keeps the staging but stores the line normally,
+/// which is how the staging cost and the instruction's effect were separated.
+const WC: bool = option_env!("SS_WC").is_some();
+const NT: bool = option_env!("SS_NONT").is_none();
+
 pub struct Sink<'a, T: Copy> {
     bump: Bump<'a>,
     nb: usize,
     blk_items: usize,
     cur: Vec<*mut T>,
     rem: Vec<u32>,
+    /// One cache line's worth of records per bucket, held back so each bucket
+    /// is written a whole line at a time instead of a record at a time.
+    stg: Blob<u8>,
+    sn: Vec<u8>,
     pub blocks: Vec<Vec<Blk<T>>>,
 }
 
 impl<'a, T: Copy> Sink<'a, T> {
+    const SZ: usize = std::mem::size_of::<T>();
+    /// The smallest run of records that is a whole number of cache lines.
+    const LINE: usize = {
+        let mut l = 64;
+        while l % Self::SZ != 0 {
+            l += 64;
+        }
+        l
+    };
+    const SREC: usize = Self::LINE / Self::SZ;
+
     pub fn new(arena: &'a Arena, nb: usize, blk_items: usize) -> Sink<'a, T> {
+        // A staged line must never straddle two blocks.
+        assert!(blk_items % Self::SREC == 0, "block size must hold whole lines");
         Sink {
             bump: Bump::new(arena),
             nb,
             blk_items,
             cur: vec![std::ptr::null_mut(); nb],
             rem: vec![0u32; nb],
+            stg: Blob::zeroed(if WC { nb * Self::LINE } else { 1 }),
+            sn: vec![0u8; nb],
             blocks: (0..nb).map(|_| Vec::new()).collect(),
         }
     }
     #[inline(always)]
     pub fn push(&mut self, b: usize, v: T) {
         unsafe {
-            let r = *self.rem.get_unchecked(b);
-            if r == 0 {
+            if !WC {
+                let r = *self.rem.get_unchecked(b);
+                if r == 0 {
+                    self.grow(b);
+                }
+                let c = self.cur.get_unchecked_mut(b);
+                **c = v;
+                *c = c.add(1);
+                *self.rem.get_unchecked_mut(b) -= 1;
+                return;
+            }
+            let n = *self.sn.get_unchecked(b) as usize;
+            let s = self.stg.as_mut_ptr().add(b * Self::LINE + n * Self::SZ);
+            std::ptr::write_unaligned(s as *mut T, v);
+            if n + 1 < Self::SREC {
+                *self.sn.get_unchecked_mut(b) = (n + 1) as u8;
+                return;
+            }
+            *self.sn.get_unchecked_mut(b) = 0;
+            if *self.rem.get_unchecked(b) == 0 {
                 self.grow(b);
             }
-            let c = self.cur.get_unchecked_mut(b);
-            **c = v;
-            *c = c.add(1);
-            *self.rem.get_unchecked_mut(b) -= 1;
+            let dst = *self.cur.get_unchecked(b);
+            stream(dst as *mut u8, s.sub(n * Self::SZ), Self::LINE);
+            *self.cur.get_unchecked_mut(b) = dst.add(Self::SREC);
+            *self.rem.get_unchecked_mut(b) -= Self::SREC as u32;
         }
     }
     #[cold]
@@ -285,6 +385,28 @@ impl<'a, T: Copy> Sink<'a, T> {
     }
     /// Close out the partially filled blocks.
     pub fn finish(mut self) -> Vec<Vec<Blk<T>>> {
+        // Records still staged go out with ordinary stores: a part of a line
+        // is exactly what a non-temporal store is bad at.
+        if WC {
+            for b in 0..self.nb {
+                let n = self.sn[b] as usize;
+                if n == 0 {
+                    continue;
+                }
+                unsafe {
+                    if *self.rem.get_unchecked(b) == 0 {
+                        self.grow(b);
+                    }
+                    let dst = *self.cur.get_unchecked(b);
+                    let src = self.stg.as_ptr().add(b * Self::LINE) as *const T;
+                    std::ptr::copy_nonoverlapping(src, dst, n);
+                    *self.cur.get_unchecked_mut(b) = dst.add(n);
+                    *self.rem.get_unchecked_mut(b) -= n as u32;
+                }
+                self.sn[b] = 0;
+            }
+            stream_fence();
+        }
         for b in 0..self.nb {
             if !self.cur[b].is_null() {
                 let used = self.blk_items - self.rem[b] as usize;

@@ -19,3 +19,4 @@ for d in "$FIX"/*/; do
 done
 echo "passed $pass, failed $fail:$failed"
 echo "tmp=$TMP"
+exit $([ "$fail" -eq 0 ] && echo 0 || echo 1)
