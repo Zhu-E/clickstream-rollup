@@ -663,7 +663,6 @@ struct PSt<'a> {
     ix: Box<split::Index>,
     lloc: Vec<Vec<LocalLink>>,
     lglob: Vec<GlobalLink>,
-    rows: usize,
 }
 
 struct Parsed {
@@ -686,113 +685,157 @@ struct Env<'a> {
     d: &'a [u8],
     fi: usize,
     simd: bool,
+    /// the window a timestamp must fall in, as a start and a length
+    lo: i64,
+    span: u64,
 }
 
-/// an event row by the rules of `parse_events`: fields 0..3 from `p0`, the rest from `p1`
+impl<'a> Env<'a> {
+    fn new(ctx: &'a Ctx, k: &'a Keys, fi: usize, simd: bool, lo: i64, hi: i64) -> Env<'a> {
+        let span = if hi > lo { hi.wrapping_sub(lo) as u64 } else { 0 };
+        Env { ctx, k, d: ctx.maps[fi].as_slice(), fi, simd, lo, span }
+    }
+}
+
+const VIEW: u32 = u32::from_le_bytes(*b"view");
+const CART: u32 = u32::from_le_bytes(*b"cart");
+const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+
+/// an event whose id is not the generator's goes by its bytes; `live` is `tsf` with the top bit, or 0
+#[cold]
+#[inline(never)]
+unsafe fn ev_odd(d: *const u8, fi: usize, p0: *const u8, s0: usize, e0: usize, s1: usize, e1: usize, ing: u32, live: u32, pc: u32, odd: &mut Vec<OddEv>) {
+    let (klo, khi) = key96(std::slice::from_raw_parts(p0.add(s0), e0 - s0));
+    let user = Span { fi: fi as u32, len: (e1 - s1) as u32, off: (p0 as usize - d as usize + s1) as u64 };
+    odd.push(OddEv { klo, khi, ing, tsf: live, pc, user });
+}
+
+/// a record off the usual path
+#[cold]
+#[inline(never)]
+unsafe fn ev_put(tab: *mut *mut FRec, es: &mut EvBins, b: usize, r: FRec) {
+    es.put(tab, b, r)
+}
+
+/// a valid event that a live record cannot hold
+#[cold]
+#[inline(never)]
+unsafe fn ev_esc(d: *const u8, fi: usize, p0: *const u8, s1: usize, e1: usize, c: u64, b: usize, r: FRec, tsf: u32, pc: u32, tab: *mut *mut FRec, es: &mut EvBins, esc: &mut Vec<(u64, Esc)>) {
+    let user = Span { fi: fi as u32, len: (e1 - s1) as u32, off: (p0 as usize - d as usize + s1) as u64 };
+    esc.push(((c << 32) | (r.b >> 32), Esc { ts: tsf, pc, user }));
+    es.put(tab, b, r);
+}
+
+/// an event row by the rules of `parse_events`: `h` spans from `p0`, `tail` yields the rest from `p1`
 #[inline(always)]
 unsafe fn ev_row<const WIDE: bool>(
     x: Env,
     p0: *const u8,
+    h: &[(usize, usize); 3],
     p1: *const u8,
-    s: &[usize; 7],
-    e: &[usize; 7],
+    mut tail: impl FnMut() -> (usize, usize),
     tab: *mut *mut FRec,
     es: &mut EvBins,
     odd: &mut Vec<OddEv>,
     esc: &mut Vec<(u64, Esc)>,
     dc: &mut DateCache,
-    rows: &mut usize,
 ) {
-    let fld = |k: usize| -> &[u8] { unsafe { std::slice::from_raw_parts(if k < 3 { p0 } else { p1 }.add(s[k]), e[k] - s[k]) } };
-    let (ne, nu) = (e[0] - s[0], e[1] - s[1]);
+    let ((s0, e0), (s1, e1), (s2, e2)) = (h[0], h[1], h[2]);
+    let (ne, nu) = (e0 - s0, e1 - s1);
     if ne == 0 {
         return;
     }
-    *rows += 1;
     let (ctx, k) = (x.ctx, x.k);
-    let g = ingest(fld(3), dc);
-    let mut ts = 0i64;
-    let mut pc = 0u32;
-    let valid = 'v: {
-        if nu == 0 {
-            break 'v false;
-        }
-        ts = match parse_ts_c(fld(2), dc) {
-            Some(t) => t,
-            None => break 'v false,
-        };
-        if ts < ctx.ev_lo || ts >= ctx.ev_hi {
-            break 'v false;
-        }
-        if g.ms > ts.saturating_add(LATE_MS) {
-            break 'v false;
-        }
-        let is_pur = match fld(4) {
-            b"view" | b"cart" => false,
-            b"purchase" => true,
-            _ => break 'v false,
-        };
-        let pid = fld(5);
-        if pid.is_empty() {
-            break 'v false;
-        }
-        if is_pur {
-            let price = match digits_u32(fld(6)) {
-                Some(v) if v >= 1 && v <= 10_000_000 => v,
-                _ => break 'v false,
-            };
-            pc = (ctx.cat_of(pid) << 24) | price;
-        }
-        true
-    };
-    let at = p0 as usize - x.d.as_ptr() as usize;
     let (c, un) = if WIDE {
-        k.ids_wide(p0.add(s[0]), ne, p0.add(s[1]), nu)
+        k.ids_wide(p0.add(s0), ne, p0.add(s1), nu)
     } else {
-        k.event_at(x.d, at + s[0], at + e[0], at + s[1], at + e[1], x.simd)
+        let at = p0 as usize - x.d.as_ptr() as usize;
+        k.event_at(x.d, at + s0, at + e0, at + s1, at + e1, x.simd)
     };
-    let user = Span { fi: x.fi as u32, len: nu as u32, off: (at + s[1]) as u64 };
+    let (s3, e3) = tail();
+    let g = ingest(std::slice::from_raw_parts(p1.add(s3), e3 - s3), dc);
+    'dead: {
+        if nu == 0 {
+            break 'dead;
+        }
+        let ts = match parse_ts_c(std::slice::from_raw_parts(p0.add(s2), e2 - s2), dc) {
+            Some(t) => t,
+            None => break 'dead,
+        };
+        if ts.wrapping_sub(x.lo) as u64 >= x.span {
+            break 'dead;
+        }
+        // more than a day late; no ingest time is near enough the ends to wrap
+        if g.ms - LATE_MS > ts {
+            break 'dead;
+        }
+        let (s4, e4) = tail();
+        let tp = p1.add(s4);
+        let is_pur = match e4 - s4 {
+            4 => {
+                let w = (tp as *const u32).read_unaligned();
+                if w != VIEW && w != CART {
+                    break 'dead;
+                }
+                false
+            }
+            8 => {
+                if (tp as *const u64).read_unaligned() != PURCHASE {
+                    break 'dead;
+                }
+                true
+            }
+            _ => break 'dead,
+        };
+        let (s5, e5) = tail();
+        if s5 == e5 {
+            break 'dead;
+        }
+        let mut pc = 0u32;
+        if is_pur {
+            let (s6, e6) = tail();
+            let price = match digits_u32(std::slice::from_raw_parts(p1.add(s6), e6 - s6)) {
+                Some(v) if v >= 1 && v <= 10_000_000 => v,
+                _ => break 'dead,
+            };
+            pc = (ctx.cat_of(std::slice::from_raw_parts(p1.add(s5), e5 - s5)) << 24) | price;
+        }
+        let tsf = (ts - ctx.base) as u32;
+        if c == NONE {
+            ev_odd(x.d.as_ptr(), x.fi, p0, s0, e0, s1, e1, g.sec, tsf | 0x8000_0000, pc, odd);
+            return;
+        }
+        // a valid ts is inside the window, which starts at or after the epoch
+        let delta = (g.sec as i64 - (ts as u64 / 1000) as i64 + BIAS) as u64;
+        let b = (c >> k.shift) as usize;
+        let cl = c & ((1u64 << k.shift) - 1);
+        if un != NONE && delta <= DELTA_MASK {
+            es.put(tab, b, FRec { a: ((tsf as u64) << 33) | (un << 2) | LIVE, b: ((pc as u64) << 32) | (delta << MAX_SHIFT) | cl });
+        } else {
+            ev_esc(x.d.as_ptr(), x.fi, p0, s1, e1, c, b, FRec { a: ESC, b: ((g.sec as u64) << 32) | cl }, tsf, pc, tab, es, esc);
+        }
+        return;
+    }
     if c == NONE {
-        let (klo, khi) = key96(fld(0));
-        odd.push(OddEv {
-            klo,
-            khi,
-            ing: g.sec,
-            tsf: if valid { (ts - ctx.base) as u32 | 0x8000_0000 } else { 0 },
-            pc: if valid { pc } else { 0 },
-            user,
-        });
-        return;
-    }
-    let b = (c >> k.shift) as usize;
-    let cl = c & ((1u64 << k.shift) - 1);
-    if !valid {
-        es.put(tab, b, FRec { a: DEAD, b: ((g.sec as u64) << 32) | cl });
-        return;
-    }
-    let tsf = (ts - ctx.base) as u32;
-    // a valid ts is inside the window, which starts at or after the epoch
-    let delta = (g.sec as i64 - (ts as u64 / 1000) as i64 + BIAS) as u64;
-    if un != NONE && delta <= DELTA_MASK {
-        es.put(tab, b, FRec { a: ((tsf as u64) << 33) | (un << 2) | LIVE, b: ((pc as u64) << 32) | (delta << MAX_SHIFT) | cl });
+        ev_odd(x.d.as_ptr(), x.fi, p0, s0, e0, s1, e1, g.sec, 0, 0, odd);
     } else {
-        esc.push(((c << 32) | g.sec as u64, Esc { ts: tsf, pc, user }));
-        es.put(tab, b, FRec { a: ESC, b: ((g.sec as u64) << 32) | cl });
+        ev_put(tab, es, (c >> k.shift) as usize, FRec { a: DEAD, b: ((g.sec as u64) << 32) | (c & ((1u64 << k.shift) - 1)) });
     }
 }
 
 /// the line at `p` through the reference splitter; returns where the next starts
 #[inline(never)]
-fn ev_line(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache, rows: &mut usize) -> usize {
+fn ev_line(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache) -> usize {
     let tab = es.cur.as_mut_ptr();
     split::line::<7, _>(x.d, p, x.simd, &mut |lp, s, e| {
-        let (mut st, mut en) = ([0usize; 7], [0usize; 7]);
-        for k in 0..7 {
-            st[k] = s[k] as usize;
-            en[k] = e[k] as usize;
-        }
+        let f = |k: usize| (s[k] as usize, e[k] as usize);
         let at = unsafe { x.d.as_ptr().add(lp) };
-        unsafe { ev_row::<false>(x, at, at, &st, &en, tab, es, odd, esc, dc, rows) }
+        let mut k = 2;
+        let tail = || {
+            k += 1;
+            f(k)
+        };
+        unsafe { ev_row::<false>(x, at, &[f(0), f(1), f(2)], at, tail, tab, es, odd, esc, dc) }
     })
 }
 
@@ -800,45 +843,43 @@ fn ev_line(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Ve
 #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2")), allow(dead_code))]
 #[cold]
 #[inline(never)]
-fn ev_rare(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache, rows: &mut usize) -> usize {
-    ev_line(x, p, es, odd, esc, dc, rows)
+fn ev_rare(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache) -> usize {
+    ev_line(x, p, es, odd, esc, dc)
 }
 
 fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
-    let d = ctx.maps[fi].as_slice();
+    let x = Env::new(ctx, k, fi, simd, ctx.ev_lo, ctx.ev_hi);
+    let d = x.d;
     let mut p = first_line_start(d, from);
-    let PSt { es, odd, esc, dc, rows: total, .. } = st;
-    let x = Env { ctx, k, d, fi, simd };
-    // rows the windows take, and the rest
-    #[allow(unused_mut)]
-    let (mut rows, mut rare) = (0usize, 0usize);
+    let PSt { es, odd, esc, dc, .. } = st;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
     if simd {
+        let cut = split::Cut::new();
         let tab = es.cur.as_mut_ptr();
-        while p < to && p + split::REACH <= d.len() {
+        // rows that start before `to` and have a whole window to read
+        let stop = to.min((d.len() + 1).saturating_sub(split::REACH));
+        while p < stop {
             unsafe {
                 let p0 = d.as_ptr().add(p);
-                if let Some((mut a, mut b, at, nl)) = split::row7(split::masks(p0), |o| split::masks(p0.add(o))) {
-                    let (mut s, mut e) = ([0usize; 7], [0usize; 7]);
-                    for k in 0..3 {
-                        (s[k], e[k]) = a.next();
+                let w = split::masks_any(p0, &cut);
+                if let Some((mut a, p3)) = split::head::<3>(w.0, w.1, w.2) {
+                    let p1 = p0.add(p3 + 1);
+                    let w = split::masks(p1, &cut);
+                    if let Some((mut b, nl)) = split::tail::<3>(w.0, w.1, w.2) {
+                        p += p3 + nl + 2;
+                        let h = [a.next(), a.next(), a.next()];
+                        ev_row::<true>(x, p0, &h, p1, || b.next(), tab, es, odd, esc, dc);
+                        continue;
                     }
-                    for k in 3..7 {
-                        (s[k], e[k]) = b.next();
-                    }
-                    ev_row::<true>(x, p0, p0.add(at), &s, &e, tab, es, odd, esc, dc, &mut rows);
-                    p += at + nl + 1;
-                    continue;
                 }
             }
-            p = ev_rare(x, p, es, odd, esc, dc, &mut rare);
+            p = ev_rare(x, p, es, odd, esc, dc);
         }
     }
     while p < to {
-        p = ev_line(x, p, es, odd, esc, dc, &mut rare);
+        p = ev_line(x, p, es, odd, esc, dc);
     }
-    *total += rows + rare;
 }
 
 /// a click row by the rules of `parse_clicks`; the person is resolved later
@@ -847,34 +888,35 @@ unsafe fn cl_row<const WIDE: bool>(
     x: Env,
     fr: u64,
     p0: *const u8,
-    s: &[usize; 4],
-    e: &[usize; 4],
+    mut next: impl FnMut() -> (usize, usize),
     tab: *mut *mut FC,
     cs: &mut ClBins,
     oddc: &mut Vec<OddCl>,
     dc: &mut DateCache,
 ) {
-    let fld = |k: usize| -> &[u8] { unsafe { std::slice::from_raw_parts(p0.add(s[k]), e[k] - s[k]) } };
-    let (len, nu) = (e[0] - s[0], e[1] - s[1]);
+    let ((s0, e0), (s1, e1)) = (next(), next());
+    let (len, nu) = (e0 - s0, e1 - s1);
     if len == 0 || nu == 0 {
         return;
     }
     let (ctx, k) = (x.ctx, x.k);
-    let ts = match parse_ts_c(fld(3), dc) {
-        Some(t) => t,
-        None => return,
-    };
-    if ts < ctx.cl_lo || ts >= ctx.cl_hi {
-        return;
-    }
-    let camp = match ctx.camp_of(fld(2)) {
+    let at = p0 as usize - x.d.as_ptr() as usize;
+    let un = if WIDE { k.user_wide(p0.add(s1), nu) } else { k.user_at(x.d, at + s1, at + e1, x.simd) };
+    let (s2, e2) = next();
+    let camp = match ctx.camp_of(std::slice::from_raw_parts(p0.add(s2), e2 - s2)) {
         Some(c) => c,
         None => return,
     };
+    let (s3, e3) = next();
+    let ts = match parse_ts_c(std::slice::from_raw_parts(p0.add(s3), e3 - s3), dc) {
+        Some(t) => t,
+        None => return,
+    };
+    if ts.wrapping_sub(x.lo) as u64 >= x.span {
+        return;
+    }
     let ts = (ts - ctx.base) as u32;
-    let at = p0 as usize - x.d.as_ptr() as usize;
-    let off = (at + s[0]) as u64;
-    let un = if WIDE { k.user_wide(p0.add(s[1]), nu) } else { k.user_at(x.d, at + s[1], at + e[1], x.simd) };
+    let off = (at + s0) as u64;
     if un != NONE && len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) {
         let ui = un >> 9;
         cs.put(
@@ -883,20 +925,27 @@ unsafe fn cl_row<const WIDE: bool>(
             FC { a: (ui << 40) | ((ts as u64) << 9) | (un & ALIAS), b: ((camp as u64) << 48) | (fr << 40) | (off << 4) | len as u64 },
         );
     } else {
-        oddc.push(OddCl { user: Span { fi: x.fi as u32, len: nu as u32, off: (at + s[1]) as u64 }, sref: sref_of(x.fi, off as usize, len), ts, camp });
+        cl_odd(x.fi, off, len, at + s1, nu, ts, camp, oddc);
     }
+}
+
+/// a click the buckets cannot hold
+#[cold]
+#[inline(never)]
+fn cl_odd(fi: usize, off: u64, len: usize, uoff: usize, nu: usize, ts: u32, camp: u32, oddc: &mut Vec<OddCl>) {
+    oddc.push(OddCl { user: Span { fi: fi as u32, len: nu as u32, off: uoff as u64 }, sref: sref_of(fi, off as usize, len), ts, camp });
 }
 
 #[inline(never)]
 fn cl_line(x: Env, fr: u64, p: usize, cs: &mut ClBins, oddc: &mut Vec<OddCl>, dc: &mut DateCache) -> usize {
     let tab = cs.cur.as_mut_ptr();
     split::line::<4, _>(x.d, p, x.simd, &mut |lp, s, e| {
-        let (mut st, mut en) = ([0usize; 4], [0usize; 4]);
-        for k in 0..4 {
-            st[k] = s[k] as usize;
-            en[k] = e[k] as usize;
-        }
-        unsafe { cl_row::<false>(x, fr, x.d.as_ptr().add(lp), &st, &en, tab, cs, oddc, dc) }
+        let mut k = 0;
+        let next = || {
+            k += 1;
+            (s[k - 1] as usize, e[k - 1] as usize)
+        };
+        unsafe { cl_row::<false>(x, fr, x.d.as_ptr().add(lp), next, tab, cs, oddc, dc) }
     })
 }
 
@@ -909,25 +958,24 @@ fn cl_rare(x: Env, fr: u64, p: usize, cs: &mut ClBins, oddc: &mut Vec<OddCl>, dc
 
 fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
-    let d = ctx.maps[fi].as_slice();
+    let x = Env::new(ctx, k, fi, simd, ctx.cl_lo, ctx.cl_hi);
+    let d = x.d;
     let mut p = first_line_start(d, from);
     let PSt { cs, oddc, dc, .. } = st;
-    let x = Env { ctx, k, d, fi, simd };
     let fr = (fi - cl0) as u64;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
     if simd {
+        let cut = split::Cut::new();
         let tab = cs.cur.as_mut_ptr();
-        while p < to && p + split::REACH <= d.len() {
+        // rows that start before `to` and have a whole window to read
+        let stop = to.min((d.len() + 1).saturating_sub(split::REACH));
+        while p < stop {
             unsafe {
                 let p0 = d.as_ptr().add(p);
-                let m = split::masks(p0);
+                let m = split::masks(p0, &cut);
                 if let Some((mut a, nl)) = split::tail::<3>(m.0, m.1, m.2) {
-                    let (mut s, mut e) = ([0usize; 4], [0usize; 4]);
-                    for k in 0..4 {
-                        (s[k], e[k]) = a.next();
-                    }
-                    cl_row::<true>(x, fr, p0, &s, &e, tab, cs, oddc, dc);
                     p += nl + 1;
+                    cl_row::<true>(x, fr, p0, || a.next(), tab, cs, oddc, dc);
                     continue;
                 }
             }
@@ -1538,7 +1586,6 @@ pub(crate) fn run(
                 ix: Box::new(split::Index::new()),
                 lloc: (0..nb_l).map(|_| Vec::new()).collect(),
                 lglob: Vec::new(),
-                rows: 0,
             };
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -1552,16 +1599,20 @@ pub(crate) fn run(
                     _ => parse_lk(cx, k, shared, fi, a, b, &mut st),
                 }
             }
+            let maxc = st.es.top().map_or(0, |b| (b as u64) << k.shift);
+            let es = st.es.finish();
+            // every row with an event id left one record
+            let rows = st.odd.len() + es.iter().flatten().map(|b| b.len as usize).sum::<usize>();
             Parsed {
-                maxc: st.es.top().map_or(0, |b| (b as u64) << k.shift),
-                es: st.es.finish(),
+                maxc,
+                es,
                 cs: st.cs.finish(),
                 odd: st.odd,
                 esc: st.esc,
                 oddc: st.oddc,
                 lloc: st.lloc,
                 lglob: st.lglob,
-                rows: st.rows,
+                rows,
             }
         };
         std::thread::scope(|s| {

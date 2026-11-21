@@ -405,9 +405,8 @@ unsafe fn join(lo: u32, hi: u32) -> u64 {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
 #[inline(always)]
-unsafe fn eq2(a: core::arch::x86_64::__m256i, b: core::arch::x86_64::__m256i, c: u8) -> (u32, u32) {
+unsafe fn eq2(a: core::arch::x86_64::__m256i, b: core::arch::x86_64::__m256i, k: core::arch::x86_64::__m256i) -> (u32, u32) {
     use core::arch::x86_64::*;
-    let k = _mm256_set1_epi8(c as i8);
     #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vl"))]
     return (_mm256_cmpeq_epi8_mask(a, k), _mm256_cmpeq_epi8_mask(b, k));
     #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vl")))]
@@ -420,33 +419,53 @@ unsafe fn join(lo: u32, hi: u32) -> u64 {
     lo as u64 | ((hi as u64) << 32)
 }
 
+/// comma, quote and newline, each spread over a vector
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[derive(Clone, Copy)]
+pub struct Cut(core::arch::x86_64::__m256i, core::arch::x86_64::__m256i, core::arch::x86_64::__m256i);
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+impl Cut {
+    /// hidden from the compiler, which would rebuild a known constant at every use
+    #[inline(always)]
+    pub fn new() -> Cut {
+        use core::arch::x86_64::*;
+        let f = |c: u8| std::hint::black_box(unsafe { _mm256_set1_epi8(c as i8) });
+        Cut(f(b','), f(b'"'), f(b'\n'))
+    }
+}
+
 /// commas, quotes and newlines of 64 bytes, a bit each
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
 #[inline(always)]
-pub unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+pub unsafe fn masks(p: *const u8, k: &Cut) -> (u64, u64, u64) {
     use core::arch::x86_64::*;
     let a = _mm256_loadu_si256(p as *const __m256i);
     let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let m = |c: u8| -> u64 {
-        let (lo, hi) = eq2(a, b, c);
+    let m = |k: __m256i| -> u64 {
+        let (lo, hi) = eq2(a, b, k);
         join(lo, hi)
     };
-    (m(b','), m(b'"'), m(b'\n'))
+    (m(k.0), m(k.1), m(k.2))
 }
 
 /// the same, but every bit of the last is set when any byte is a newline
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
 #[inline(always)]
-pub unsafe fn masks_any(p: *const u8) -> (u64, u64, u64) {
+pub unsafe fn masks_any(p: *const u8, k: &Cut) -> (u64, u64, u64) {
     use core::arch::x86_64::*;
     let a = _mm256_loadu_si256(p as *const __m256i);
     let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let m = |c: u8| -> u64 {
-        let (lo, hi) = eq2(a, b, c);
+    let m = |k: __m256i| -> u64 {
+        let (lo, hi) = eq2(a, b, k);
         join(lo, hi)
     };
-    let (lo, hi) = eq2(a, b, b'\n');
-    (m(b','), m(b'"'), if lo | hi != 0 { !0 } else { 0 })
+    let (lo, hi) = eq2(a, b, k.2);
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vl"))]
+    let none = _kortestz_mask32_u8(lo, hi) != 0;
+    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vl")))]
+    let none = lo | hi == 0;
+    (m(k.0), m(k.1), if none { 0 } else { !0 })
 }
 
 /// the same masks a byte at a time, for checking the vector ones
@@ -475,10 +494,12 @@ pub fn row7(w0: (u64, u64, u64), w1: impl FnOnce(usize) -> (u64, u64, u64)) -> O
 #[allow(dead_code)]
 fn collect_win<const N: usize>(d: &[u8], cuts: &[usize], vector: bool) -> Vec<[usize; 16]> {
     let mut out = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    let cut = Cut::new();
     let mk = |at: usize| -> (u64, u64, u64) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
         if vector {
-            return unsafe { masks(d.as_ptr().add(at)) };
+            return unsafe { masks(d.as_ptr().add(at), &cut) };
         }
         let _ = vector;
         masks_sw(&d[at..])
@@ -487,7 +508,7 @@ fn collect_win<const N: usize>(d: &[u8], cuts: &[usize], vector: bool) -> Vec<[u
     let mk0 = |at: usize| -> (u64, u64, u64) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
         if vector {
-            return unsafe { masks_any(d.as_ptr().add(at)) };
+            return unsafe { masks_any(d.as_ptr().add(at), &cut) };
         }
         let m = masks_sw(&d[at..]);
         (m.0, m.1, if m.2 != 0 { !0 } else { 0 })
@@ -975,12 +996,13 @@ mod tests {
         let (mut rows, mut acc, mut slow) = (0usize, 0usize, 0usize);
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
         for _ in 0..n {
+            let cut = Cut::new();
             for d in &files {
                 let mut p = crate::first_line_start(d, 0);
                 while p + REACH <= d.len() {
                     let at = unsafe { d.as_ptr().add(p) };
                     if kind == "events" {
-                        if let Some((mut a, mut b, o, nl)) = row7(unsafe { masks_any(at) }, |o| unsafe { masks(at.add(o)) }) {
+                        if let Some((mut a, mut b, o, nl)) = row7(unsafe { masks_any(at, &cut) }, |o| unsafe { masks(at.add(o), &cut) }) {
                             for _ in 0..3 {
                                 let (s, e) = a.next();
                                 acc += s ^ e;
@@ -994,7 +1016,7 @@ mod tests {
                             continue;
                         }
                     } else {
-                        let m = unsafe { masks(at) };
+                        let m = unsafe { masks(at, &cut) };
                         if let Some((mut a, nl)) = tail::<3>(m.0, m.1, m.2) {
                             for _ in 0..4 {
                                 let (s, e) = a.next();
