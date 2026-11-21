@@ -10,7 +10,7 @@ mod sys;
 mod tbl;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use sys::*;
 use tbl::*;
 
@@ -113,91 +113,155 @@ fn hits(w: u64, c: u8) -> u64 {
     !(((x & SL7).wrapping_add(SL7)) | x) & SHI
 }
 
+/// Where a line ends, which of its bytes are commas, and which are quotes.
+/// The masks are relative to the start of the line and only cover the first
+/// `QLIM` bytes; a longer line sets `long` and is taken apart byte by byte,
+/// which keeps the common case to one 128-bit mask per delimiter.
+#[derive(Clone, Copy)]
 struct Scan {
     nl: usize,
-    nc: usize,
-    c: [u32; 8],
+    nc: u32,
+    cm: u128,
     qm: u128,
     long: bool,
 }
 
-/// Find the end of the line at `p`, the comma positions and the quote bitmap.
-#[inline]
-fn scan_line(d: &[u8], p: usize) -> Scan {
-    let n = d.len();
-    let mut s = Scan { nl: n, nc: 0, c: [0u32; 8], qm: 0, long: false };
-    let mut i = p;
-    while i + 8 <= n {
-        let w = u64::from_le_bytes(unsafe { *(d.as_ptr().add(i) as *const [u8; 8]) });
-        let mnl = hits(w, b'\n');
-        let mut mc = hits(w, b',');
-        let mut mq = hits(w, b'"');
-        if mnl != 0 {
-            let stop = (mnl.trailing_zeros() >> 3) as usize;
-            if stop < 7 {
-                let keep = (1u64 << ((stop + 1) * 8)) - 1;
-                mc &= keep;
-                mq &= keep;
-            }
-            s.nl = i + stop;
-            emit(&mut s, mc, mq, i - p);
-            return s;
-        }
-        emit(&mut s, mc, mq, i - p);
-        i += 8;
+const QLIM: usize = 128;
+
+/// Commas, quotes and newlines in 16 bytes, one bit per byte. One definition
+/// per architecture, so a target that has neither still compiles.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn blk(p: *const u8) -> (u16, u16, u16) {
+    use core::arch::x86_64::*;
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let m = |c: u8| -> u16 { _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(c as i8))) as u16 };
+    (m(b','), m(b'"'), m(b'\n'))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn blk(p: *const u8) -> (u16, u16, u16) {
+    use core::arch::aarch64::*;
+    const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let v = vld1q_u8(p);
+    let bits = vld1q_u8(BITS.as_ptr());
+    let m = |c: u8| -> u16 {
+        let e = vandq_u8(vceqq_u8(v, vdupq_n_u8(c)), bits);
+        vaddv_u8(vget_low_u8(e)) as u16 | ((vaddv_u8(vget_high_u8(e)) as u16) << 8)
+    };
+    (m(b','), m(b'"'), m(b'\n'))
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn blk(p: *const u8) -> (u16, u16, u16) {
+    blk_sw(p)
+}
+
+/// The same, without vector instructions: eight bits are gathered out of a
+/// SWAR byte match by one multiply.
+#[inline(always)]
+unsafe fn blk_sw(p: *const u8) -> (u16, u16, u16) {
+    let lo = u64::from_le_bytes(*(p as *const [u8; 8]));
+    let hi = u64::from_le_bytes(*(p.add(8) as *const [u8; 8]));
+    #[inline(always)]
+    fn gather(h: u64) -> u16 {
+        // h has 0x80 set in matching bytes; fold those into the top byte.
+        ((h >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u16
     }
-    while i < n {
-        let b = d[i];
-        if b == b'\n' {
-            s.nl = i;
-            return s;
-        }
-        if b == b',' {
-            if s.nc < 8 {
-                s.c[s.nc] = (i - p) as u32;
-            }
-            s.nc += 1;
-        } else if b == b'"' {
-            let r = i - p;
-            if r < 128 {
-                s.qm |= 1u128 << r;
+    let m = |c: u8| -> u16 { gather(hits(lo, c)) | (gather(hits(hi, c)) << 8) };
+    (m(b','), m(b'"'), m(b'\n'))
+}
+
+/// Find the end of the line at `p` and its delimiter masks.
+#[inline(always)]
+fn scan_line_g<const SIMD: bool>(d: &[u8], p: usize) -> Scan {
+    let n = d.len();
+    // Two 64-bit halves rather than a u128: a variable 128-bit shift costs
+    // about ten instructions, and this loop runs five times per line.
+    let mut c0 = 0u64;
+    let mut c1 = 0u64;
+    let mut q0 = 0u64;
+    let mut q1 = 0u64;
+    let mut off = 0usize;
+    macro_rules! put {
+        ($c:expr, $q:expr) => {{
+            let sh = off & 63;
+            if off < 64 {
+                c0 |= ($c as u64) << sh;
+                q0 |= ($q as u64) << sh;
             } else {
-                s.long = true;
+                c1 |= ($c as u64) << sh;
+                q1 |= ($q as u64) << sh;
             }
+        }};
+    }
+    macro_rules! done {
+        ($nl:expr, $long:expr) => {{
+            let cm = (c0 as u128) | ((c1 as u128) << 64);
+            let qm = (q0 as u128) | ((q1 as u128) << 64);
+            return Scan {
+                nl: $nl,
+                nc: (c0.count_ones() + c1.count_ones()),
+                cm,
+                qm,
+                long: $long,
+            };
+        }};
+    }
+    while off + 16 <= QLIM && p + off + 16 <= n {
+        let (c, q, nm) = unsafe {
+            let at = d.as_ptr().add(p + off);
+            if SIMD {
+                blk(at)
+            } else {
+                blk_sw(at)
+            }
+        };
+        if nm != 0 {
+            let stop = nm.trailing_zeros() as usize;
+            let keep = (((1u32 << stop) - 1) & 0xffff) as u16;
+            put!(c & keep, q & keep);
+            done!(p + off + stop, false);
+        }
+        put!(c, q);
+        off += 16;
+    }
+    // A short tail at the end of the file, or the start of an over-long line.
+    let mut i = p + off;
+    while i < n && i - p < QLIM {
+        let b = unsafe { *d.get_unchecked(i) };
+        if b == b'\n' {
+            done!(i, false);
+        }
+        off = i - p;
+        if b == b',' {
+            put!(1u16, 0u16);
+        } else if b == b'"' {
+            put!(0u16, 1u16);
         }
         i += 1;
     }
-    s
+    if i >= n {
+        done!(n, false);
+    }
+    while i < n && unsafe { *d.get_unchecked(i) } != b'\n' {
+        i += 1;
+    }
+    Scan { nl: i, nc: 0, cm: 0, qm: 0, long: true }
 }
 
 #[inline(always)]
-fn emit(s: &mut Scan, mut mc: u64, mut mq: u64, off: usize) {
-    while mc != 0 {
-        let b = (mc.trailing_zeros() >> 3) as usize;
-        if s.nc < 8 {
-            s.c[s.nc] = (off + b) as u32;
-        }
-        s.nc += 1;
-        mc &= mc - 1;
-    }
-    while mq != 0 {
-        let b = (mq.trailing_zeros() >> 3) as usize;
-        let r = off + b;
-        if r < 128 {
-            s.qm |= 1u128 << r;
-        } else {
-            s.long = true;
-        }
-        mq &= mq - 1;
+fn scan_line(d: &[u8], p: usize, simd: bool) -> Scan {
+    if simd {
+        scan_line_g::<true>(d, p)
+    } else {
+        scan_line_g::<false>(d, p)
     }
 }
 
-/// Strip the wrapping quotes of one field, or reject the line.
-#[inline(always)]
-fn unq(line: &[u8], s: usize, e: usize, qm: u128, long: bool) -> Option<(u32, u32)> {
-    if long {
-        return unq_slow(line, s, e);
-    }
+fn unq(s: usize, e: usize, qm: u128) -> Option<(u32, u32)> {
     let w = e - s;
     let fm = (qm >> s) & ((1u128 << w) - 1);
     if fm == 0 {
@@ -209,7 +273,6 @@ fn unq(line: &[u8], s: usize, e: usize, qm: u128, long: bool) -> Option<(u32, u3
     }
 }
 
-#[inline(never)]
 fn unq_slow(line: &[u8], s: usize, e: usize) -> Option<(u32, u32)> {
     let f = &line[s..e];
     let q = f.iter().filter(|&&c| c == b'"').count();
@@ -222,17 +285,58 @@ fn unq_slow(line: &[u8], s: usize, e: usize) -> Option<(u32, u32)> {
     }
 }
 
-/// Split a line into exactly N fields, unquoting each one.
+/// Field spans, with the quotes taken off. A field count that is not exactly
+/// `N` makes the line malformed, as does a quote anywhere but around a whole
+/// field.
 #[inline(always)]
 fn fields<const N: usize>(line: &[u8], sc: &Scan) -> Option<[(u32, u32); N]> {
-    if sc.nc != N - 1 {
+    if sc.long {
+        return fields_slow::<N>(line);
+    }
+    if sc.nc as usize != N - 1 {
+        return None;
+    }
+    let mut out = [(0u32, 0u32); N];
+    let mut m = sc.cm;
+    let mut s = 0usize;
+    for k in 0..N {
+        let e = if k + 1 == N {
+            line.len()
+        } else {
+            let b = m.trailing_zeros() as usize;
+            m &= m - 1;
+            b
+        };
+        out[k] = unq(s, e, sc.qm)?;
+        s = e + 1;
+    }
+    Some(out)
+}
+
+/// Lines longer than `QLIM`: rare enough to walk byte by byte.
+#[cold]
+fn fields_slow<const N: usize>(line: &[u8]) -> Option<[(u32, u32); N]> {
+    let mut pos = [0usize; N];
+    let mut nc = 0usize;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b',' {
+            if nc < N - 1 {
+                pos[nc] = i;
+            }
+            nc += 1;
+            if nc >= N {
+                return None;
+            }
+        }
+    }
+    if nc != N - 1 {
         return None;
     }
     let mut out = [(0u32, 0u32); N];
     let mut s = 0usize;
     for k in 0..N {
-        let e = if k + 1 == N { line.len() } else { sc.c[k] as usize };
-        out[k] = unq(line, s, e, sc.qm, sc.long)?;
+        let e = if k + 1 == N { line.len() } else { pos[k] };
+        out[k] = unq_slow(line, s, e)?;
         s = e + 1;
     }
     Some(out)
@@ -340,6 +444,10 @@ fn first_line_start(d: &[u8], start: usize) -> usize {
     (i + 1).min(d.len())
 }
 
+/// Cleared when the vector scanner disagrees with the scalar one, which
+/// should never happen; see `check_simd`.
+static SIMD_OK: AtomicBool = AtomicBool::new(true);
+
 static LKH: AtomicUsize = AtomicUsize::new(0);
 static NROW: AtomicUsize = AtomicUsize::new(0);
 static NS_EV: AtomicUsize = AtomicUsize::new(0);
@@ -358,19 +466,20 @@ fn parse_events<const ABL: u32>(
     dc: &mut DateCache,
     xn: &mut Vec<(u64, u64)>,
 ) {
+    let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
     let mut acc = 0usize;
     let mut lkh = 0usize;
     let mut nrow = 0usize;
     while p < to {
-        let sc = scan_line(d, p);
+        let sc = scan_line(d, p, simd);
         let line = &d[p..sc.nl];
         let lp = p;
         p = sc.nl + 1;
         nrow += 1;
         if ABL == 1 {
-            acc += sc.nc ^ sc.nl ^ (sc.qm as usize);
+            acc += sc.nc as usize ^ sc.nl ^ (sc.qm as usize);
             continue;
         }
         let f = match fields::<7>(line, &sc) {
@@ -470,11 +579,12 @@ fn parse_events<const ABL: u32>(
 }
 
 fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CRec>, dc: &mut DateCache) {
+    let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
     let mut lkh = 0usize;
     while p < to {
-        let sc = scan_line(d, p);
+        let sc = scan_line(d, p, simd);
         let line = &d[p..sc.nl];
         let lp = p;
         p = sc.nl + 1;
@@ -1160,9 +1270,10 @@ fn json_ts(s: &[u8], key: &str) -> i64 {
 
 /// Iterate the data lines of a small CSV, applying the dialect rules.
 fn each_line<const N: usize, F: FnMut(&[u8], [(u32, u32); N])>(d: &[u8], mut f: F) {
+    let simd = SIMD_OK.load(Ordering::Relaxed);
     let mut p = first_line_start(d, 0);
     while p < d.len() {
-        let sc = scan_line(d, p);
+        let sc = scan_line(d, p, simd);
         let line = &d[p..sc.nl];
         p = sc.nl + 1;
         if let Some(fs) = fields::<N>(line, &sc) {
@@ -1202,6 +1313,7 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
                 let chunks = &chunks;
                 s.spawn(move || {
                     let mut out: Vec<(u64, u64, u64, u64)> = Vec::new();
+                    let simd = SIMD_OK.load(Ordering::Relaxed);
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         if k >= chunks.len() {
@@ -1211,7 +1323,7 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
                         let d = maps[fi].as_slice();
                         let mut p = first_line_start(d, a);
                         while p < b {
-                            let sc = scan_line(d, p);
+                            let sc = scan_line(d, p, simd);
                             let line = &d[p..sc.nl];
                             let lp = p;
                             p = sc.nl + 1;
@@ -1344,8 +1456,49 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
     Links { link, lbloom, names }
 }
 
+/// The vector scanner must agree with the scalar one on every byte pattern
+/// that matters: delimiters at every offset, runs of them, lines shorter than
+/// a block and lines longer than the mask. If it ever does not, the run falls
+/// back to the scalar path rather than writing a wrong answer, and says so.
+fn check_simd() -> bool {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut x = 0x243f_6a88_85a3_08d3u64;
+    let pool = [b'a', b',', b'"', b'\n', b'0', b'\r', 0xffu8, b' '];
+    for _ in 0..3600 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        buf.push(pool[(x & 7) as usize]);
+    }
+    // Every delimiter at every offset of a long run of plain bytes.
+    for i in 0..200usize {
+        buf.extend_from_slice(&[b'x'; 40]);
+        let at = buf.len() - 1 - (i % 40);
+        buf[at] = [b',', b'"', b'\n'][i % 3];
+    }
+    buf.extend_from_slice(b"\n");
+    buf.extend_from_slice(&vec![b'z'; 300]);
+    buf.extend_from_slice(b",a,b\n");
+    let mut p = 0usize;
+    while p < buf.len() {
+        let a = scan_line_g::<true>(&buf, p);
+        let b = scan_line_g::<false>(&buf, p);
+        if (a.nl, a.nc, a.cm, a.qm, a.long) != (b.nl, b.nc, b.cm, b.qm, b.long) {
+            return false;
+        }
+        p = a.nl + 1;
+    }
+    true
+}
+
 fn main() {
     let t0 = std::time::Instant::now();
+    if std::env::var_os("SS_NOSIMD").is_some() {
+        SIMD_OK.store(false, Ordering::Relaxed);
+    } else if !check_simd() {
+        SIMD_OK.store(false, Ordering::Relaxed);
+        eprintln!("shopsess: vector scanner disagrees with the scalar one; using scalar");
+    }
     let args: Vec<String> = std::env::args().collect();
     let data: PathBuf = args
         .get(1)
@@ -1606,8 +1759,11 @@ fn main() {
         }
         b
     };
-    let eid_bits = bits;
-    let per_bits = bits.min(12);
+    let envbits = |k: &str, d: u32| -> u32 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let eid_bits = envbits("SS_EBITS", bits);
+    let per_bits = envbits("SS_PBITS", bits.min(12));
     let nb_eid = 1usize << eid_bits;
     let nb_per = 1usize << per_bits;
     let day0 = ws.div_euclid(DAY_MS);
