@@ -30,6 +30,22 @@ const MREMAP_MAYMOVE: i32 = 1;
 #[cfg(target_os = "linux")]
 const MREMAP_FIXED: i32 = 2;
 
+// glibc: never hand heap back or map blocks one by one, and open a thread's heap whole
+pub fn tune_malloc() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_TRIM_THRESHOLD: i32 = -1;
+        const M_TOP_PAD: i32 = -2;
+        const M_MMAP_THRESHOLD: i32 = -3;
+        mallopt(M_MMAP_THRESHOLD, 32 << 20);
+        mallopt(M_TRIM_THRESHOLD, 1 << 30);
+        mallopt(M_TOP_PAD, 64 << 20);
+    }
+}
+
 // SS_TIMING: wall, user, kernel and page faults since the last call
 pub fn stage(name: &str) {
     extern "C" {
