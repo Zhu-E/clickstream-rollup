@@ -25,7 +25,8 @@ const ROWS_PER_BUCKET: usize = 24_000;
 const BLK_E: usize = 512;
 const BLK_P: usize = 512;
 
-const CAT_NONE: u32 = 31;
+// one past the last category index: there are at most 255
+const CAT_NONE: u32 = 255;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
