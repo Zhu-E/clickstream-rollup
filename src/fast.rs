@@ -755,6 +755,22 @@ fn member(ue: u32, alias: u64) -> bool {
     ue & GENERAL == 0 && alias as u32 <= (ue & 511)
 }
 
+/// ask for `bytes` at `p` ahead of reading them
+#[inline(always)]
+fn prefetch<T>(p: *const T, bytes: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let mut at = 0;
+        while at < bytes {
+            _mm_prefetch::<_MM_HINT_T0>((p as *const i8).add(at));
+            at += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (p, bytes);
+}
+
 // ------------------------------------------------------------- click groups
 
 /// a click bucket by user: `starts[l]..starts[l + 1]` is user l's own person
@@ -776,7 +792,11 @@ fn group_clicks(
     let nu = 1usize << CSHIFT;
     cnt.clear();
     cnt.resize(nu + 1, 0);
-    for blk in blocks {
+    for (bi, blk) in blocks.iter().enumerate() {
+        // written by other threads and not read since
+        if let Some(next) = blocks.get(bi + 1) {
+            prefetch(next.ptr, next.len as usize * 16);
+        }
         for r in blk.as_slice() {
             let ui = (r.a >> 40) as usize;
             if member(u[ui], r.a & ALIAS) {
@@ -890,6 +910,8 @@ struct Frag {
 
 struct Wk<'a> {
     slots: Blob<FRec>,
+    /// a bucket's events in counter order: room for every slot
+    ev: Blob<PRec>,
     run: Vec<PRec>,
     cl: Vec<CRec>,
     t: Tmp,
@@ -916,6 +938,7 @@ impl<'a> Wk<'a> {
         let nbg = 1usize << sh.gbits;
         Wk {
             slots: Blob::zeroed(1 << sh.k.shift),
+            ev: Blob::zeroed(1 << sh.k.shift),
             run: Vec::new(),
             cl: Vec::new(),
             t: Tmp::new(sh.ctx),
@@ -935,7 +958,7 @@ impl<'a> Wk<'a> {
     }
 
     /// an event whose id is not part of its user's own person
-    #[inline]
+    #[inline(never)]
     fn general(&mut self, sh: &Sh, un: u64, ts: u32, pc: u32) {
         if un != self.g_un {
             let mut nb = [0u8; 9];
@@ -959,18 +982,18 @@ impl<'a> Wk<'a> {
         self.gp.push(sh.gb(person), PRec { person, ts, pc });
     }
 
-    /// `self.run` holds every slot event of this user's own person
-    fn finish(&mut self, sh: &Sh, ui: u32, unsorted: bool) {
-        if self.run.is_empty() {
+    /// `run` holds every slot event of this user's own person
+    fn finish(&mut self, sh: &Sh, ui: u32, run: &mut [PRec], unsorted: bool) {
+        if run.is_empty() {
             return;
         }
         if sh.forced[(ui >> 6) as usize] >> (ui & 63) & 1 != 0 {
             let person = sh.own_key(ui);
             let b = sh.gb(person);
-            for e in &self.run {
+            for e in run.iter() {
                 self.gp.push(b, PRec { person, ts: e.ts, pc: e.pc });
             }
-            self.general_ev += self.run.len();
+            self.general_ev += run.len();
             return;
         }
         let bit = 1u64 << (ui & 63);
@@ -979,7 +1002,7 @@ impl<'a> Wk<'a> {
             return;
         }
         if unsorted {
-            self.run.sort_unstable_by_key(|r| r.ts);
+            run.sort_unstable_by_key(|r| r.ts);
         }
         let fcs = sh.clicks_of(ui);
         self.cl.clear();
@@ -995,19 +1018,69 @@ impl<'a> Wk<'a> {
         let mut nb = [0u8; 9];
         let un = ((ui as u64) << 9) | ((sh.u[ui as usize] >> 9) & 511) as u64;
         let n = sh.k.user_str(un, &mut nb);
-        self.inline_ev += self.run.len();
-        process_person(sh.ctx, &self.run, &self.cl, &mut self.t, &mut self.o, &nb[..n]);
+        self.inline_ev += run.len();
+        process_person(sh.ctx, run, &self.cl, &mut self.t, &mut self.o, &nb[..n]);
     }
 
-    fn end_run(&mut self, sh: &Sh, ui: u32, at: u32, edge: bool, unsorted: bool) {
-        if self.run.is_empty() {
+    /// one user's events `from..to` of the bucket's buffer
+    #[inline(never)]
+    fn end_run(&mut self, sh: &Sh, ui: u32, at: u32, edge: bool, unsorted: bool, from: usize, to: usize) {
+        if from == to {
             return;
         }
+        // the buffer is only written by `bucket`, which is not using this part
+        let run = unsafe { std::slice::from_raw_parts_mut(self.ev.as_mut_ptr().add(from), to - from) };
         if edge || sh.defer[(ui >> 6) as usize] >> (ui & 63) & 1 != 0 {
-            self.frags.push(Frag { ui, at, ev: std::mem::take(&mut self.run) });
+            self.frags.push(Frag { ui, at, ev: run.to_vec() });
         } else {
-            self.finish(sh, ui, unsorted);
-            self.run.clear();
+            self.finish(sh, ui, run, unsorted);
+        }
+    }
+
+    /// keep the earliest copy of each counter of one range in its slot
+    #[inline]
+    fn dedup(&mut self, sh: &Sh, blocks: &[Blk<FRec>], low: usize) {
+        let slots = self.slots.as_mut_ptr();
+        for (bi, blk) in blocks.iter().enumerate() {
+            let recs = blk.as_slice();
+            // the next block is far away and cold: ask for it a piece at a time
+            let next = blocks.get(bi + 1).map_or((std::ptr::null(), 0), |b| (b.ptr as *const u8, b.len as usize * 16));
+            let mut at = 0;
+            for part in recs.chunks(64) {
+                if at < next.1 {
+                    prefetch(unsafe { next.0.add(at) }, (next.1 - at).min(1024));
+                }
+                at += 1024;
+                for r in part {
+                    let s = unsafe { &mut *slots.add(r.b as usize & low) };
+                    if s.a == 0 || sh.ing(r) < sh.ing(s) {
+                        *s = *r;
+                    }
+                }
+            }
+        }
+    }
+
+    /// a slot that is not a plain event: nothing, or the escaped event's (ts, user, pc)
+    #[cold]
+    #[inline(never)]
+    fn escaped(&mut self, sh: &Sh, c: u64, s: FRec) -> Option<(u32, u64, u32)> {
+        if s.a & 3 == DEAD {
+            return None;
+        }
+        let e = match sh.esc.get(&((c << 32) | (s.b >> 32))) {
+            Some(e) => *e,
+            None => {
+                sh.bad.store(true, Ordering::SeqCst);
+                return None;
+            }
+        };
+        match sh.k.user(e.user.bytes(sh.ctx)) {
+            Some(un) => Some((e.ts, un, e.pc)),
+            None => {
+                self.general_str(sh, e.user, e.ts, e.pc);
+                None
+            }
         }
     }
 
@@ -1018,70 +1091,71 @@ impl<'a> Wk<'a> {
             return;
         }
         let n = 1usize << sh.k.shift;
-        let low = n - 1;
+        self.dedup(sh, blocks, n - 1);
         let slots = self.slots.as_mut_ptr();
-        for blk in blocks {
-            for r in blk.as_slice() {
-                let s = unsafe { &mut *slots.add(r.b as usize & low) };
-                if s.a == 0 || sh.ing(r) < sh.ing(s) {
-                    *s = *r;
-                }
-            }
-        }
+        let ev = self.ev.as_mut_ptr();
         const NONE: u32 = u32::MAX;
         let mut cur = NONE;
         let mut ue = 0u32;
         let mut runs = 0u32;
         let mut last = 0u32;
-        let mut unsorted = false;
+        // bit 31 set once a timestamp is below the one before it
+        let mut back = 0u32;
+        // a plain event of the current user's own person has (user:31 tag:2) in own..=own + 4 * top
+        let (mut own, mut top) = (u64::MAX, 0u64);
+        // events written, and where the current user's begin
+        let (mut to, mut from) = (0usize, 0usize);
         for i in 0..n {
             let s = unsafe { *slots.add(i) };
+            // one compare for: live, this user, an alias of the own person
+            if (s.a & 0x1_ffff_ffff).wrapping_sub(own).rotate_right(2) <= top {
+                let ts = (s.a >> 33) as u32;
+                back |= ts.wrapping_sub(last);
+                last = ts;
+                unsafe {
+                    (*slots.add(i)).a = 0;
+                    *ev.add(to) = PRec { person: 0, ts, pc: (s.b >> 32) as u32 };
+                }
+                to += 1;
+                continue;
+            }
             if s.a == 0 {
                 continue;
             }
             unsafe { (*slots.add(i)).a = 0 };
-            let (ts, un, pc) = match s.a & 3 {
-                DEAD => continue,
-                LIVE => ((s.a >> 33) as u32, (s.a >> 2) & 0x7fff_ffff, (s.b >> 32) as u32),
-                _ => {
-                    let c = ((b as u64) << sh.k.shift) | i as u64;
-                    let e = match sh.esc.get(&((c << 32) | (s.b >> 32))) {
-                        Some(e) => *e,
-                        None => {
-                            sh.bad.store(true, Ordering::SeqCst);
-                            continue;
-                        }
-                    };
-                    match sh.k.user(e.user.bytes(sh.ctx)) {
-                        Some(un) => (e.ts, un, e.pc),
-                        None => {
-                            self.general_str(sh, e.user, e.ts, e.pc);
-                            continue;
-                        }
-                    }
+            let (ts, un, pc) = if s.a & 3 == LIVE {
+                ((s.a >> 33) as u32, (s.a >> 2) & 0x7fff_ffff, (s.b >> 32) as u32)
+            } else {
+                match self.escaped(sh, ((b as u64) << sh.k.shift) | i as u64, s) {
+                    Some(e) => e,
+                    None => continue,
                 }
             };
             let ui = (un >> 9) as u32;
             if ui != cur {
                 if cur != NONE {
-                    self.end_run(sh, cur, (b as u32) << 1, runs == 1, unsorted);
+                    self.end_run(sh, cur, (b as u32) << 1, runs == 1, back >> 31 != 0, from, to);
                 }
                 cur = ui;
                 ue = sh.u[ui as usize];
                 runs += 1;
                 last = 0;
-                unsorted = false;
+                back = 0;
+                from = to;
+                (own, top) = if ue & GENERAL == 0 { (((ui as u64) << 11) | LIVE, (ue & 511) as u64) } else { (u64::MAX, 0) };
             }
             if member(ue, un & ALIAS) {
-                unsorted |= ts < last;
+                back |= ts.wrapping_sub(last);
                 last = ts;
-                self.run.push(PRec { person: 0, ts, pc });
+                // at most one event per slot
+                unsafe { *ev.add(to) = PRec { person: 0, ts, pc } };
+                to += 1;
             } else {
                 self.general(sh, un, ts, pc);
             }
         }
         if cur != NONE {
-            self.end_run(sh, cur, ((b as u32) << 1) | (runs > 1) as u32, true, unsorted);
+            self.end_run(sh, cur, ((b as u32) << 1) | (runs > 1) as u32, true, back >> 31 != 0, from, to);
         }
     }
 
@@ -1092,37 +1166,38 @@ impl<'a> Wk<'a> {
             Some((f, rest)) if f.at == u32::MAX => (rest, Some(f)),
             _ => (frags, None),
         };
-        self.run.clear();
+        let mut run = std::mem::take(&mut self.run);
+        run.clear();
         // one allocation, not a doubling chain: big ones are mapped afresh
-        self.run.reserve(frags.iter().map(|f| f.ev.len()).sum());
+        run.reserve(frags.iter().map(|f| f.ev.len()).sum());
         for f in slots {
-            self.run.extend_from_slice(&f.ev);
+            run.extend_from_slice(&f.ev);
         }
-        let unsorted = self.run.windows(2).any(|w| w[1].ts < w[0].ts);
+        let unsorted = run.windows(2).any(|w| w[1].ts < w[0].ts);
         if let Some(f) = odd {
             if unsorted {
-                self.run.extend_from_slice(&f.ev);
+                run.extend_from_slice(&f.ev);
             } else {
                 // a handful of events into a long sorted run: merge from the back
                 let mut x = f.ev.clone();
                 x.sort_unstable_by_key(|r| r.ts);
-                let (mut i, mut j) = (self.run.len(), x.len());
+                let (mut i, mut j) = (run.len(), x.len());
                 let mut w = i + j;
-                self.run.resize(w, PRec { person: 0, ts: 0, pc: 0 });
+                run.resize(w, PRec { person: 0, ts: 0, pc: 0 });
                 while j > 0 {
-                    if i > 0 && self.run[i - 1].ts > x[j - 1].ts {
-                        self.run[w - 1] = self.run[i - 1];
+                    if i > 0 && run[i - 1].ts > x[j - 1].ts {
+                        run[w - 1] = run[i - 1];
                         i -= 1;
                     } else {
-                        self.run[w - 1] = x[j - 1];
+                        run[w - 1] = x[j - 1];
                         j -= 1;
                     }
                     w -= 1;
                 }
             }
         }
-        self.finish(sh, frags[0].ui, unsorted);
-        self.run.clear();
+        self.finish(sh, frags[0].ui, &mut run, unsorted);
+        self.run = run;
     }
 }
 
