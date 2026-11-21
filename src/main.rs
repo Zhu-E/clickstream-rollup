@@ -486,7 +486,7 @@ fn first_line_start(d: &[u8], start: usize) -> usize {
 }
 
 /// Cleared when the vector scanner disagrees with the scalar one, which
-/// should never happen; see `check_simd`.
+/// should never happen; see `check_scan`.
 static SIMD_OK: AtomicBool = AtomicBool::new(true);
 
 static LKH: AtomicUsize = AtomicUsize::new(0);
@@ -1976,7 +1976,7 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>) -> Links {
 /// that matters: delimiters at every offset, runs of them, lines shorter than
 /// a block and lines longer than the mask. If it ever does not, the run falls
 /// back to the scalar path rather than writing a wrong answer, and says so.
-fn check_simd() -> bool {
+fn check_scan() -> bool {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut x = 0x243f_6a88_85a3_08d3u64;
     let pool = [b'a', b',', b'"', b'\n', b'0', b'\r', 0xffu8, b' '];
@@ -2004,17 +2004,20 @@ fn check_simd() -> bool {
         }
         p = a.nl + 1;
     }
-    split::agrees() && fast::wide_ok()
+    true
 }
 
 fn main() {
     let t0 = std::time::Instant::now();
-    if std::env::var_os("SS_NOSIMD").is_some() {
+    sys::stage("start");
+    // the scanner check gates the small files; the rest runs beside them
+    let nosimd = std::env::var_os("SS_NOSIMD").is_some();
+    let scan_ok = !nosimd && check_scan();
+    if !scan_ok {
         SIMD_OK.store(false, Ordering::Relaxed);
-    } else if !check_simd() {
-        SIMD_OK.store(false, Ordering::Relaxed);
-        eprintln!("shopsess: vector scanner disagrees with the scalar one; using scalar");
     }
+    let wide_check = std::thread::spawn(move || !scan_ok || (split::agrees() && fast::wide_ok()));
+    sys::stage("simd");
     let args: Vec<String> = std::env::args().collect();
     let data: PathBuf = args
         .get(1)
@@ -2037,6 +2040,7 @@ fn main() {
     let ev_files = list_csv(&data.join("events"));
     let cl_files = list_csv(&data.join("clicks"));
     let lk_files = list_csv(&data.join("links"));
+    sys::stage("list");
     let mut paths: Vec<PathBuf> = Vec::new();
     paths.extend(ev_files.iter().cloned());
     let ev_n = ev_files.len();
@@ -2046,56 +2050,12 @@ fn main() {
     let lk_n = lk_files.len();
     paths.push(data.join("products.csv"));
     paths.push(data.join("campaigns.csv"));
-    // Opening and advising 80-odd files is slow enough to be worth threads:
-    // MADV_WILLNEED starts the readahead for a couple of gigabytes.
-    let maps: Vec<Map> = {
-        let next = AtomicUsize::new(0);
-        let raw: Vec<(usize, usize)> = {
-            let mut got: Vec<Vec<(usize, usize, usize)>> = Vec::new();
-            std::thread::scope(|s| {
-                let hs: Vec<_> = (0..nt.min(paths.len().max(1)))
-                    .map(|_| {
-                        let next = &next;
-                        let paths = &paths;
-                        s.spawn(move || {
-                            let mut out: Vec<(usize, usize, usize)> = Vec::new();
-                            loop {
-                                let k = next.fetch_add(1, Ordering::Relaxed);
-                                if k >= paths.len() {
-                                    break;
-                                }
-                                match Map::open(&paths[k]) {
-                                    Ok(m) => out.push((k, m.ptr as usize, m.len)),
-                                    Err(_) => out.push((k, 0, 0)),
-                                }
-                            }
-                            out
-                        })
-                    })
-                    .collect();
-                for h in hs {
-                    got.push(h.join().unwrap());
-                }
-            });
-            let mut v = vec![(0usize, 0usize); paths.len()];
-            for g in got {
-                for (k, p, l) in g {
-                    v[k] = (p, l);
-                }
-            }
-            v
-        };
-        raw.into_iter()
-            .map(|(p, l)| {
-                if l == 0 {
-                    Map { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 }
-                } else {
-                    Map { ptr: p as *mut u8, len: l }
-                }
-            })
-            .collect()
-    };
+    let maps: Vec<Map> = paths
+        .iter()
+        .map(|p| Map::open(p).unwrap_or(Map { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 }))
+        .collect();
     let t_maps = t0.elapsed();
+    sys::stage("maps");
     let i_ev = 0..ev_n;
     let i_cl = ev_n..ev_n + cl_n;
     let i_lk = ev_n + cl_n..ev_n + cl_n + lk_n;
@@ -2259,7 +2219,15 @@ fn main() {
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  pre: maps {:?} meta {:?}", t_maps, t_pre - t_maps);
     }
+    sys::stage("meta");
+    if !wide_check.join().unwrap() {
+        SIMD_OK.store(false, Ordering::Relaxed);
+    }
+    if !nosimd && !SIMD_OK.load(Ordering::Relaxed) {
+        eprintln!("shopsess: vector scanner disagrees with the scalar one; using scalar");
+    }
     let fkeys = fast::probe(&maps[i_ev.clone()], nt);
+    sys::stage("probe");
 
     let ev_bytes: usize = i_ev.clone().map(|i| maps[i].len).sum();
     let cl_bytes: usize = i_cl.clone().map(|i| maps[i].len).sum();
@@ -2383,6 +2351,7 @@ fn main() {
         Some(k) => fast::run(&ctx, k, &arena, i_ev.clone(), i_cl.clone(), i_lk.clone(), nt),
         None => None,
     };
+    sys::stage("ret");
     // no general parse or dedup workers when the fast path did the work
     let nt_gen = if fast_out.is_some() { 0 } else { nt };
 
@@ -2542,6 +2511,7 @@ fn main() {
     };
     let porder = order_by_size(&pbuckets);
     let t_dedup = t0.elapsed();
+    sys::stage("tail");
 
     // ---- fold + write user_daily
     let ud = outdir.join("user_daily");
@@ -2618,6 +2588,7 @@ fn main() {
             nrows_tot += h.join().unwrap();
         }
     });
+    sys::stage("write");
     if nrows_tot == 0 {
         Out::new(0, 0).write(&ud.join("part-00.parquet"), &ctx.cats, true).unwrap();
     }

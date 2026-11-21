@@ -30,6 +30,40 @@ const MREMAP_MAYMOVE: i32 = 1;
 #[cfg(target_os = "linux")]
 const MREMAP_FIXED: i32 = 2;
 
+// SS_TIMING: wall, user, kernel and page faults since the last call
+pub fn stage(name: &str) {
+    extern "C" {
+        fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, [i64; 18])>> = std::sync::Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("SS_TIMING").is_some()) {
+        return;
+    }
+    let mut r = [0i64; 18];
+    unsafe { getrusage(0, &mut r) };
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap();
+    if let Some((t, p)) = *last {
+        let ms = |i: usize| ((r[i] - p[i]) * 1_000_000 + r[i + 1] - p[i + 1]) / 1000;
+        eprintln!(
+            "  stage {:<8} wall {:>8.2} ms  user {:>5}  sys {:>4}  faults {:>6}  csw {:>4}  anon {} MB",
+            name,
+            (now - t).as_secs_f64() * 1e3,
+            ms(0),
+            ms(2),
+            r[8] - p[8],
+            r[16] + r[17] - p[16] - p[17],
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with("RssAnon"))?.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .unwrap_or(0)
+                >> 10
+        );
+    }
+    *last = Some((now, r));
+}
+
 /// Zeroed anonymous memory for the big hash tables. The pages arrive zeroed
 /// without a memset, and on Linux they can be huge pages, which matters
 /// because a 64 MB table otherwise takes a TLB miss on most probes. All-zero
@@ -253,7 +287,6 @@ impl Map {
         if p as isize == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        unsafe { madvise(p, len, MADV_WILLNEED) };
         Ok(Map { ptr: p, len })
     }
     #[inline]
