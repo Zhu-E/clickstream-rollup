@@ -1012,9 +1012,9 @@ unsafe fn ev_second(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc
             let (s3, e3) = ing.next();
             days.learn(std::slice::from_raw_parts(p0.add(h[2].0), h[2].1 - h[2].0));
             days.learn(std::slice::from_raw_parts(p1.add(s3), e3 - s3));
-            if ev_row::<true>(x, p0, &h, p1, || b.next(), tab, es, odd, esc, dc) {
-                return p + p3 + nl + 2;
-            }
+            // any ids: the byte loop where the words do not read them
+            ev_row::<false>(x, p0, &h, p1, || b.next(), tab, es, odd, esc, dc);
+            return p + p3 + nl + 2;
         }
     }
     ev_line(x, p, es, odd, esc, dc)
@@ -1036,26 +1036,31 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
         }
         let kern = rowk::Kern::new(k, days.as_ptr());
         let tab = es.cur.as_mut_ptr();
-        let low = (1u64 << k.shift) - 1;
-        while p < stop {
-            unsafe {
-                let p0 = d.as_ptr().add(p);
-                if let Some(e) = rowk::ev(p0, &kern) {
-                    let early = (e.ts - e.ing_ms + LATE_MS) as u64;
-                    // bit 35: a purchase
-                    if ((e.ts.wrapping_sub(x.lo) as u64) < x.span) & (early <= ROOM) & (e.tail & (8 << 32) == 0) {
-                        let tsf = (e.ts - ctx.base) as u32;
-                        es.put(tab, (e.c >> k.shift) as usize, FRec { a: ((tsf as u64) << 33) | (e.un << 2) | LIVE, b: ((e.ing_sec as u64 & DELTA_MASK) << MAX_SHIFT) | (e.c & low) });
-                        p += e.next;
-                        continue;
+        let (shift, low) = (k.shift, (1u64 << k.shift) - 1);
+        let (lo, span, base) = (x.lo, x.span, ctx.base);
+        // by address from here: one register for the row
+        let d0 = d.as_ptr();
+        let (mut q, end) = unsafe { (d0.add(p.min(stop)), d0.add(stop)) };
+        if p < stop {
+            while q < end {
+                unsafe {
+                    if let Some(e) = rowk::ev(q, &kern) {
+                        let early = (e.ts - e.ing_ms + LATE_MS) as u64;
+                        if ((e.ts.wrapping_sub(lo) as u64) < span) & (early <= ROOM) & !e.pur {
+                            let tsf = (e.ts - base) as u32;
+                            es.put(tab, (e.c >> shift) as usize, FRec { a: ((tsf as u64) << 33) | (e.un << 2) | LIVE, b: ((e.ing_sec as u64 & DELTA_MASK) << MAX_SHIFT) | (e.c & low) });
+                            q = q.add(e.next);
+                            continue;
+                        }
+                        if ev_other(&x, q, e.c, e.un, e.ts, e.ing_sec, e.ing_ms, e.tail, tab, es) {
+                            q = q.add(e.next);
+                            continue;
+                        }
                     }
-                    if ev_other(&x, p0, e.c, e.un, e.ts, e.ing_sec, e.ing_ms, e.tail, tab, es) {
-                        p += e.next;
-                        continue;
-                    }
+                    q = d0.add(ev_second(x, q as usize - d0 as usize, es, odd, esc, dc, days));
                 }
             }
-            p = unsafe { ev_second(x, p, es, odd, esc, dc, days) };
+            p = q as usize - d0 as usize;
         }
     }
     let PSt { es, odd, esc, dc, .. } = st;
