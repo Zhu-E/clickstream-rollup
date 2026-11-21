@@ -29,20 +29,41 @@ pub(crate) fn day_of(ts: u32, rem: u32) -> u32 {
 
 /// a column with one entry before index 0 and `PAD` after the last
 pub(crate) struct Col<T: Copy> {
+    /// its own memory, unless it is a piece of a block
     v: Vec<T>,
+    at: *mut T,
 }
 
 impl<T: Copy> Col<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(cap: usize, zero: T) -> Col<T> {
-        Col { v: vec![zero; cap + 1 + PAD] }
+        let mut v = vec![zero; cap + 1 + PAD];
+        let at = unsafe { v.as_mut_ptr().add(1) };
+        Col { v, at }
+    }
+    /// the next piece of `block`, from word `*used` on, a multiple of 64 bytes
+    fn carve(block: &mut [u64], used: &mut usize, cap: usize) -> Col<T> {
+        let words = ((cap + 1 + PAD) * std::mem::size_of::<T>() + 63) / 64 * 8;
+        let at = unsafe { (block[*used..*used + words].as_mut_ptr() as *mut T).add(1) };
+        *used += words;
+        Col { v: Vec::new(), at }
+    }
+    fn words(cap: usize) -> usize {
+        ((cap + 1 + PAD) * std::mem::size_of::<T>() + 63) / 64 * 8
     }
     #[inline(always)]
     pub(crate) fn p(&mut self) -> *mut T {
-        unsafe { self.v.as_mut_ptr().add(1) }
+        debug_assert!(self.v.is_empty() || self.at == unsafe { self.v.as_mut_ptr().add(1) });
+        self.at
     }
 }
 
 pub(crate) struct Cols {
+    /// One block for the slots and every column: at 2 MB or more it is on
+    /// huge pages, where 4K pages would miss the TLB on every slot.
+    _block: Vec<u64>,
+    /// `cap` slots of two words, zeroed
+    pub(crate) slots: *mut u64,
     /// user and time of each kept event, in counter order
     pub(crate) cu: Col<u32>,
     pub(crate) ct: Col<u32>,
@@ -67,20 +88,29 @@ pub(crate) struct Cols {
 
 impl Cols {
     pub(crate) fn new(cap: usize) -> Cols {
+        let words = 2 * cap + 8 + 7 * Col::<u32>::words(cap) + 2 * Col::<u8>::words(cap) + 2 * Col::<u64>::words(cap);
+        const HUGE: usize = (2 << 20) / 8;
+        let mut block = vec![0u64; (words + HUGE - 1) / HUGE * HUGE];
+        let slots = block.as_mut_ptr();
+        let mut used = 2 * cap + 8;
+        let b = &mut block[..];
+        let u = &mut used;
         Cols {
-            cu: Col::new(cap, 0),
-            ct: Col::new(cap, 0),
+            slots,
+            cu: Col::carve(b, u, cap),
+            ct: Col::carve(b, u, cap),
             pl: Vec::new(),
             dis: Vec::new(),
-            si: Col::new(cap, 0),
-            st: Col::new(cap, 0),
-            su: Col::new(cap, 0),
-            sd: Col::new(cap, 0),
-            sv: Col::new(cap, 0),
-            rs: Col::new(cap, 0),
-            rrev: Col::new(cap, 0),
-            rcat: Col::new(cap, 0),
-            ps: Col::new(cap, 0),
+            si: Col::carve(b, u, cap),
+            st: Col::carve(b, u, cap),
+            su: Col::carve(b, u, cap),
+            sd: Col::carve(b, u, cap),
+            sv: Col::carve(b, u, cap),
+            rs: Col::carve(b, u, cap),
+            rrev: Col::carve(b, u, cap),
+            rcat: Col::carve(b, u, cap),
+            ps: Col::carve(b, u, cap),
+            _block: block,
         }
     }
 }
@@ -297,10 +327,9 @@ pub(crate) struct Light {
     scamp: Vec<u32>,
     scell: Vec<u32>,
     conf: Vec<u32>,
-    /// more clicks than that: time and campaign as listed, and the place in the list of each sorted one
-    mts: Vec<u32>,
-    mcamp: Vec<u32>,
+    /// the place in the person's list of each click in time order
     sidx: Vec<u32>,
+    keys: Vec<u64>,
     /// per campaign, its latest click so far; zero between persons
     last: Vec<u32>,
     /// (campaign, day) cells with one more assisted session each
@@ -320,9 +349,8 @@ impl Light {
             scamp: vec![0; MID + 16],
             scell: vec![0; MID + 16],
             conf: vec![0; MID + 16],
-            mts: vec![0; MID + 16],
-            mcamp: vec![0; MID + 16],
             sidx: vec![0; MID + 16],
+            keys: Vec::with_capacity(MID),
             last: vec![0; ncamp + 1],
             cells: vec![0; CELLS],
             nl: 0,
@@ -358,6 +386,19 @@ pub(crate) mod va {
     use super::*;
     use crate::{Click, WEEK};
     use core::arch::x86_64::*;
+
+    /// -1 in the first 32 places: read from 32 - i, the lanes before lane i
+    #[repr(C, align(64))]
+    struct Step([i32; 72]);
+    static STEP: Step = Step({
+        let mut t = [0i32; 72];
+        let mut i = 0;
+        while i < 32 {
+            t[i] = -1;
+            i += 1;
+        }
+        t
+    });
 
     /// The lanes of `a` that are `P` to those of `b`, unsigned (0 equal, 1
     /// below, 2 at most). Spelled out: given the compare itself, the compiler
@@ -404,10 +445,14 @@ pub(crate) mod va {
     /// | purchased) `sv`. `cd` and `asst` are indexed campaign * stride + day;
     /// assists may stay in `lt` until its next flush. Of two clicks at one
     /// time, `before(j, i)` says whether j is the earlier: the later is credited.
+    /// That question reads the ids, far away and cold. With `hold`, a person
+    /// who needs it asked is left alone: `hold` is told the clicks concerned,
+    /// to ask for their ids, and false comes back.
     #[inline]
     pub(crate) unsafe fn attribute<C: Click>(
         lt: &mut Light,
         before: &dyn Fn(usize, usize) -> bool,
+        hold: Option<&dyn Fn(usize)>,
         cl: &[C],
         ss: *const u32,
         sd: *const u8,
@@ -417,13 +462,13 @@ pub(crate) mod va {
         organic: usize,
         cd: Cells,
         asst: &mut [u32],
-    ) {
+    ) -> bool {
         match (cl.len() + 7) / 8 {
-            1 => light::<C, 1>(lt, before, cl, ss, sd, sv, ns, stride, organic, cd, asst),
-            2 => light::<C, 2>(lt, before, cl, ss, sd, sv, ns, stride, organic, cd, asst),
-            3 => light::<C, 3>(lt, before, cl, ss, sd, sv, ns, stride, organic, cd, asst),
-            4 => light::<C, 4>(lt, before, cl, ss, sd, sv, ns, stride, organic, cd, asst),
-            _ => mid(lt, before, cl, ss, sd, sv, ns, stride, organic, cd, asst),
+            1 => light::<C, 1>(lt, before, hold, cl, ss, sd, sv, ns, stride, organic, cd, asst),
+            2 => light::<C, 2>(lt, before, hold, cl, ss, sd, sv, ns, stride, organic, cd, asst),
+            3 => light::<C, 3>(lt, before, hold, cl, ss, sd, sv, ns, stride, organic, cd, asst),
+            4 => light::<C, 4>(lt, before, hold, cl, ss, sd, sv, ns, stride, organic, cd, asst),
+            _ => mid(lt, before, hold, cl, ss, sd, sv, ns, stride, organic, cd, asst),
         }
     }
 
@@ -432,6 +477,7 @@ pub(crate) mod va {
     unsafe fn light<C: Click, const NV: usize>(
         lt: &mut Light,
         before: &dyn Fn(usize, usize) -> bool,
+        hold: Option<&dyn Fn(usize)>,
         cl: &[C],
         ss: *const u32,
         sd: *const u8,
@@ -441,7 +487,7 @@ pub(crate) mod va {
         organic: usize,
         cd: Cells,
         asst: &mut [u32],
-    ) {
+    ) -> bool {
         let n = cl.len();
         debug_assert!(n >= 1 && n <= 8 * NV && NV <= 4);
         let tp = lt.ts.as_mut_ptr();
@@ -459,23 +505,35 @@ pub(crate) mod va {
         for v in 0..NV {
             t[v] = _mm256_load_si256(tp.add(8 * v) as *const __m256i);
         }
-        let (sts, scamp, conf) = (lt.sts.as_mut_ptr(), lt.scamp.as_mut_ptr(), lt.conf.as_mut_ptr());
-        // a click's place in time order is the number of clicks before it
+        let (sts, scamp, conf, sidx) = (lt.sts.as_mut_ptr(), lt.scamp.as_mut_ptr(), lt.conf.as_mut_ptr(), lt.sidx.as_mut_ptr());
+        // A click's place in time order is the number of clicks before it:
+        // those earlier, and of those at its time the ones listed before it,
+        // which is "below its time plus one" for the lanes before its own.
         for i in 0..n {
-            let x = *tp.add(i);
-            let b = _mm256_set1_epi32(x as i32);
-            let (mut less, mut same) = (0u32, 0u32);
+            let b = _mm256_set1_epi32(*tp.add(i) as i32);
+            let mut r = 0u32;
             for v in 0..NV {
-                less |= cmp8::<1>(t[v], b) << (8 * v);
-                same |= cmp8::<0>(t[v], b) << (8 * v);
+                let step = _mm256_loadu_si256(STEP.0.as_ptr().add(32 - i + 8 * v) as *const __m256i);
+                r += cmp8::<1>(t[v], _mm256_sub_epi32(b, step)).count_ones();
             }
-            let mut r = less.count_ones() as usize;
-            same &= !(1 << i);
-            if same != 0 {
-                r += tie_rank(&lt.camp, same, i, before);
+            *sts.add(r as usize) = *tp.add(i);
+            *scamp.add(r as usize) = *lt.camp.get_unchecked(i);
+            *sidx.add(r as usize) = i as u32;
+        }
+        let mut tied = false;
+        for r in 1..n {
+            tied |= *sts.add(r) == *sts.add(r - 1) && *scamp.add(r) != *scamp.add(r - 1);
+        }
+        if tied {
+            if let Some(hold) = hold {
+                for r in 0..n {
+                    if (r > 0 && *sts.add(r) == *sts.add(r - 1)) || (r + 1 < n && *sts.add(r) == *sts.add(r + 1)) {
+                        hold(*sidx.add(r) as usize);
+                    }
+                }
+                return false;
             }
-            *sts.add(r) = x;
-            *scamp.add(r) = *lt.camp.get_unchecked(i);
+            order_ties(std::slice::from_raw_parts(sts, n), std::slice::from_raw_parts_mut(scamp, n), std::slice::from_raw_parts_mut(sidx, n), before);
         }
         // the bit of the click before of the same campaign, or none
         let last = lt.last.as_mut_ptr();
@@ -531,6 +589,7 @@ pub(crate) mod va {
             }
         }
         (lt.nl, lt.nc) = (nl, nc);
+        true
     }
 
     /// 33 to `MID` clicks: sorted, and a window that slides along them
@@ -538,6 +597,7 @@ pub(crate) mod va {
     unsafe fn mid<C: Click>(
         lt: &mut Light,
         before: &dyn Fn(usize, usize) -> bool,
+        hold: Option<&dyn Fn(usize)>,
         cl: &[C],
         ss: *const u32,
         sd: *const u8,
@@ -547,44 +607,38 @@ pub(crate) mod va {
         organic: usize,
         cd: Cells,
         asst: &mut [u32],
-    ) {
+    ) -> bool {
         let n = cl.len();
         debug_assert!(n <= MID);
-        let nv = (n + 7) / 8;
-        let (mts, mcamp, sidx) = (lt.mts.as_mut_ptr(), lt.mcamp.as_mut_ptr(), lt.sidx.as_mut_ptr());
+        let sidx = lt.sidx.as_mut_ptr();
         let (sts, scamp, scell, conf) = (lt.sts.as_mut_ptr(), lt.scamp.as_mut_ptr(), lt.scell.as_mut_ptr(), lt.conf.as_mut_ptr());
-        // no click is at a time with the top bit: it ends both lists
-        let ones = _mm256_set1_epi32(-1);
-        _mm256_storeu_si256(mts.add(8 * nv - 8) as *mut __m256i, ones);
-        _mm256_storeu_si256(sts.add(n) as *mut __m256i, ones);
+        // by time, and at one time as listed; too many to rank each against all
+        lt.keys.clear();
         for (i, c) in cl.iter().enumerate() {
-            std::ptr::write_volatile(mts.add(i), c.ts());
-            *mcamp.add(i) = c.camp() as u32;
+            lt.keys.push(((c.ts() as u64) << 32) | i as u64);
         }
-        // a click's place in time order: the clicks before it, and of those at
-        // its own time the ones that come before it in the list
-        for i in 0..n {
-            let x = *mts.add(i);
-            let b = _mm256_set1_epi32(x as i32);
-            let own = i / 8;
-            let mut r = 0u32;
-            for v in 0..own {
-                r += cmp8::<2>(_mm256_loadu_si256(mts.add(8 * v) as *const __m256i), b).count_ones();
-            }
-            let t = _mm256_loadu_si256(mts.add(8 * own) as *const __m256i);
-            r += cmp8::<1>(t, b).count_ones() + (cmp8::<0>(t, b) & ((1 << (i & 7)) - 1)).count_ones();
-            for v in own + 1..nv {
-                r += cmp8::<1>(_mm256_loadu_si256(mts.add(8 * v) as *const __m256i), b).count_ones();
-            }
-            *sts.add(r as usize) = x;
-            *scamp.add(r as usize) = *mcamp.add(i);
-            *sidx.add(r as usize) = i as u32;
+        lt.keys.sort_unstable();
+        for (r, &key) in lt.keys.iter().enumerate() {
+            let i = key as u32;
+            *sts.add(r) = (key >> 32) as u32;
+            *scamp.add(r) = cl.get_unchecked(i as usize).camp() as u32;
+            *sidx.add(r) = i;
         }
+        // no click is at a time with the top bit: it ends the list
+        _mm256_storeu_si256(sts.add(n) as *mut __m256i, _mm256_set1_epi32(-1));
         let mut tied = false;
         for r in 1..n {
             tied |= *sts.add(r) == *sts.add(r - 1) && *scamp.add(r) != *scamp.add(r - 1);
         }
         if tied {
+            if let Some(hold) = hold {
+                for r in 0..n {
+                    if (r > 0 && *sts.add(r) == *sts.add(r - 1)) || (r + 1 < n && *sts.add(r) == *sts.add(r + 1)) {
+                        hold(*sidx.add(r) as usize);
+                    }
+                }
+                return false;
+            }
             order_ties(std::slice::from_raw_parts(sts, n), std::slice::from_raw_parts_mut(scamp, n), std::slice::from_raw_parts_mut(sidx, n), before);
         }
         let last = lt.last.as_mut_ptr();
@@ -644,28 +698,7 @@ pub(crate) mod va {
             }
         }
         (lt.nl, lt.nc) = (nl, nc);
-    }
-
-    /// how many of the clicks `same`, all at the time of click `i`, sort before it
-    #[cold]
-    #[inline(never)]
-    fn tie_rank(camp: &[u32; 32], same: u32, i: usize, before: &dyn Fn(usize, usize) -> bool) -> usize {
-        // of one campaign, as copies of a click are, their order changes nothing
-        let mut all = true;
-        let mut m = same;
-        while m != 0 {
-            all &= camp[m.trailing_zeros() as usize] == camp[i];
-            m &= m - 1;
-        }
-        if all {
-            return (same & ((1u32 << i) - 1)).count_ones() as usize;
-        }
-        let (mut m, mut r) = (same, 0);
-        while m != 0 {
-            r += before(m.trailing_zeros() as usize, i) as usize;
-            m &= m - 1;
-        }
-        r
+        true
     }
 
     /// Clicks of one time and several campaigns in the order `before` gives;
@@ -673,7 +706,6 @@ pub(crate) mod va {
     #[cold]
     #[inline(never)]
     fn order_ties(ts: &[u32], camp: &mut [u32], idx: &mut [u32], before: &dyn Fn(usize, usize) -> bool) {
-        let mut pairs: Vec<(u32, u32)> = Vec::new();
         let mut i = 0;
         while i < ts.len() {
             let mut j = i + 1;
@@ -682,12 +714,17 @@ pub(crate) mod va {
             }
             // of one campaign, as copies of a click are, their order changes nothing
             if camp[i..j].iter().any(|&c| c != camp[i]) {
-                pairs.clear();
-                pairs.extend(idx[i..j].iter().copied().zip(camp[i..j].iter().copied()));
-                pairs.sort_by(|a, b| if before(a.0 as usize, b.0 as usize) { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater });
-                for (k, &(x, c)) in pairs.iter().enumerate() {
-                    idx[i + k] = x;
-                    camp[i + k] = c;
+                // a handful: by insertion, one click at a time
+                for a in i + 1..j {
+                    let (x, c) = (idx[a], camp[a]);
+                    let mut b = a;
+                    while b > i && before(x as usize, idx[b - 1] as usize) {
+                        idx[b] = idx[b - 1];
+                        camp[b] = camp[b - 1];
+                        b -= 1;
+                    }
+                    idx[b] = x;
+                    camp[b] = c;
                 }
             }
             i = j;
@@ -903,7 +940,16 @@ mod tests {
                 let (a, b) = (IDS[cl[j].2 as usize], IDS[cl[i].2 as usize]);
                 a > b || (a == b && j < i)
             };
-            unsafe { va::attribute(&mut lt, &before, &cl, ssp.as_ptr(), sd.as_ptr(), sv.as_ptr(), ns, stride, ncamp, (cs.as_mut_ptr(), cp.as_mut_ptr(), cr.as_mut_ptr()), &mut asst) };
+            let held = std::cell::Cell::new(0usize);
+            let hold = |_i: usize| held.set(held.get() + 1);
+            let done = unsafe { va::attribute(&mut lt, &before, if round % 2 == 1 { Some(&hold) } else { None }, &cl, ssp.as_ptr(), sd.as_ptr(), sv.as_ptr(), ns, stride, ncamp, (cs.as_mut_ptr(), cp.as_mut_ptr(), cr.as_mut_ptr()), &mut asst) };
+            assert_eq!(done, held.get() == 0);
+            if !done {
+                assert!(held.get() >= 2 && cs.iter().all(|&x| x == 0));
+                lt.flush(&mut asst, &mut cs);
+                assert!(cs.iter().all(|&x| x == 0));
+            }
+            if !done { unsafe { va::attribute(&mut lt, &before, None, &cl, ssp.as_ptr(), sd.as_ptr(), sv.as_ptr(), ns, stride, ncamp, (cs.as_mut_ptr(), cp.as_mut_ptr(), cr.as_mut_ptr()), &mut asst) }; }
             // credits wait for a flush too
             lt.flush(&mut asst, &mut cs);
             let mut cd2 = vec![(0u32, 0u32, 0u64); (ncamp + 1) * stride];

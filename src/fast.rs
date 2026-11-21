@@ -1584,12 +1584,13 @@ struct Frag {
 
 struct Wk<'a> {
     cl2: Vec<CRec>,
-    slots: Blob<FRec>,
     /// the current user's events in counter order: room for every slot of a bucket
     ev: Blob<PRec>,
     run: Vec<PRec>,
     c: cols::Cols,
     lt: cols::Light,
+    /// persons of this range whose attribution waits for click ids: user, sessions
+    late: Vec<(u32, u32, u32)>,
     /// the vector kernels are in the build and agree with the plain ones
     simd: bool,
     /// nanoseconds in dedup, compact, cut and the fold of the persons
@@ -1621,11 +1622,11 @@ impl<'a> Wk<'a> {
         let nbg = 1usize << sh.gbits;
         Wk {
             cl2: Vec::new(),
-            slots: Blob::zeroed(1 << sh.k.shift),
             ev: Blob::zeroed(1 << sh.k.shift),
             run: Vec::new(),
             c: cols::Cols::new(1 << sh.k.shift),
             lt: cols::Light::new(sh.ctx.ncamp),
+            late: Vec::new(),
             simd: cols::VEC && SIMD_OK.load(Ordering::Relaxed),
             seen: (0, 0),
             ns: [0; 4],
@@ -1734,7 +1735,7 @@ impl<'a> Wk<'a> {
     /// keep the earliest copy of each counter of one range in its slot
     #[inline]
     fn dedup(&mut self, sh: &Sh, blocks: &[Blk<FRec>], low: usize) {
-        let slots = self.slots.as_mut_ptr();
+        let slots = self.c.slots as *mut FRec;
         for (bi, blk) in blocks.iter().enumerate() {
             let recs = blk.as_slice();
             // the next block is far away and cold: ask for it a piece at a time
@@ -1781,7 +1782,7 @@ impl<'a> Wk<'a> {
     /// one slot the plain way: its event, if it holds one, joins the columns at `m`
     #[inline(never)]
     fn slot_one(&mut self, sh: &Sh, b: usize, i: usize, m: usize) -> usize {
-        let slot = unsafe { &mut *self.slots.as_mut_ptr().add(i) };
+        let slot = unsafe { &mut *(self.c.slots as *mut FRec).add(i) };
         let s = *slot;
         if s.a == 0 {
             return m;
@@ -1812,7 +1813,7 @@ impl<'a> Wk<'a> {
         let mut m = 0usize;
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl", target_feature = "avx2", target_feature = "popcnt", target_feature = "bmi2"))]
         if self.simd {
-            let slots = self.slots.as_mut_ptr() as *mut u64;
+            let slots = self.c.slots;
             let (cu, ct) = (self.c.cu.p(), self.c.ct.p());
             let mut i = 0usize;
             while i < n {
@@ -1962,7 +1963,19 @@ impl<'a> Wk<'a> {
             if !own || edge || unsorted || (sh.defer[w] | sh.forced[w]) >> (ui & 63) & 1 != 0 {
                 // the run as events, for the pieces that take them
                 let (mut n, mut p) = (0usize, pp);
-                for e in e0..e1 {
+                if own {
+                    // a whale's range is one such run: no test per event
+                    unsafe {
+                        for e in e0..e1 {
+                            *ev.add(e - e0) = PRec { person: 0, ts: *ct.add(e), pc: 0 };
+                        }
+                        for x in &self.c.pl[pp..pq] {
+                            (*ev.add((x >> 32) as usize - e0)).pc = *x as u32;
+                        }
+                    }
+                    n = e1 - e0;
+                }
+                for e in if own { e1..e1 } else { e0..e1 } {
                     let (un, ts) = unsafe { (*cu.add(e) as u64, *ct.add(e)) };
                     let mut pc = 0u32;
                     if p < pq && (self.c.pl[p] >> 32) as usize == e {
@@ -1983,6 +1996,11 @@ impl<'a> Wk<'a> {
             }
             pp = pq;
         }
+        for x in 0..self.late.len() {
+            let (ui, k0, k1) = self.late[x];
+            self.attribute(sh, ui, 0, 0, k0 as usize, k1 as usize, true);
+        }
+        self.late.clear();
         self.lt.flush(&mut self.o.asst, &mut self.o.cs);
         self.note_seen(sh);
         self.ns[3] += t3.elapsed().as_nanos() as u64;
@@ -2057,7 +2075,6 @@ impl<'a> Wk<'a> {
         let ctx = sh.ctx;
         let (si, sd, sv, rs, rrev, rcat) = (self.c.si.p(), self.c.sd.p(), self.c.sv.p(), self.c.rs.p(), self.c.rrev.p(), self.c.rcat.p());
         let (k0, k1) = unsafe { (*rs.add(r0) as usize, *rs.add(r1) as usize) };
-        let ns = k1 - k0;
         let t = &mut self.t;
         unsafe {
             self.inline_ev += (*si.add(k1) - *si.add(k0)) as usize;
@@ -2130,6 +2147,16 @@ impl<'a> Wk<'a> {
             o.cat.set_len(rows);
 
         }
+        self.attribute(sh, ui, r0, r1, k0, k1, false);
+    }
+
+    /// credit and assists for sessions `k0..k1`, one user's own person
+    #[inline]
+    fn attribute(&mut self, sh: &Sh, ui: u32, r0: usize, r1: usize, k0: usize, k1: usize, late: bool) {
+        let ctx = sh.ctx;
+        let (sd, sv) = (self.c.sd.p(), self.c.sv.p());
+        let ns = k1 - k0;
+        let _ = late;
         let fcs = sh.clicks_of(ui);
         let stride = ctx.ndays + 2;
         if fcs.is_empty() {
@@ -2147,8 +2174,17 @@ impl<'a> Wk<'a> {
                 let (a, b) = (fcs[j].id(ctx, sh.cl0), fcs[i].id(ctx, sh.cl0));
                 a > b || (a == b && j < i)
             };
+            // ids to compare are asked for now and read when the range is done
+            let hold = |i: usize| {
+                let id = fcs[i].id(ctx, sh.cl0);
+                sys::prefetch(id.as_ptr());
+                sys::prefetch(unsafe { id.as_ptr().add(id.len().max(1) - 1) });
+            };
             let st = self.c.st.p();
-            unsafe { cols::va::attribute(&mut self.lt, &before, fcs, st.add(k0), sd.add(k0), sv.add(k0), ns, stride, ctx.ncamp, (self.o.cs.as_mut_ptr(), self.o.cp.as_mut_ptr(), self.o.cr.as_mut_ptr()), &mut self.o.asst) };
+            let cd = (self.o.cs.as_mut_ptr(), self.o.cp.as_mut_ptr(), self.o.cr.as_mut_ptr());
+            if !unsafe { cols::va::attribute(&mut self.lt, &before, if late { None } else { Some(&hold) }, fcs, st.add(k0), sd.add(k0), sv.add(k0), ns, stride, ctx.ncamp, cd, &mut self.o.asst) } {
+                self.late.push((ui, k0 as u32, k1 as u32));
+            }
             return;
         }
         self.fill_tmp(r0, r1, k0, k1);
