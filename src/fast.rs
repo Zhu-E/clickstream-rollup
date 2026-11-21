@@ -671,11 +671,34 @@ pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
 
 // ------------------------------------------------------------------- parsing
 
+/// one cache line of records on its way to a bucket
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u8; 64]);
+
+/// whole lines go to their block without being read first; `SS_NOWC=1` at build time writes records one by one
+const GATHER: bool = option_env!("SS_NOWC").is_none();
+
+/// a full line to its place in a block, which is aligned like it
+#[inline(always)]
+unsafe fn line_out(from: *const Line, to: *mut u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    {
+        use core::arch::x86_64::*;
+        _mm256_stream_si256(to as *mut __m256i, _mm256_load_si256(from as *const __m256i));
+        _mm256_stream_si256(to.add(32) as *mut __m256i, _mm256_load_si256((from as *const __m256i).add(1)));
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+    std::ptr::copy_nonoverlapping(from as *const u8, to, 64);
+}
+
 /// records scattered into buckets, in blocks of `BYTES` aligned to their size
 struct Bins<'a, T: Copy, const BYTES: usize> {
     arena: &'a Arena,
     /// where each bucket writes next; an aligned address has no room
     cur: Vec<*mut T>,
+    /// the line each bucket is filling: the records from the last line boundary up to `cur`
+    stage: Vec<Line>,
     full: Vec<Vec<Blk<T>>>,
     slab: usize,
     left: usize,
@@ -685,8 +708,15 @@ impl<'a, T: Copy, const BYTES: usize> Bins<'a, T, BYTES> {
     const PER: usize = BYTES / std::mem::size_of::<T>();
 
     fn new(arena: &'a Arena, nb: usize) -> Self {
-        assert!(BYTES.is_power_of_two() && BYTES >= 64 && BYTES % std::mem::size_of::<T>() == 0);
-        Bins { arena, cur: vec![std::ptr::null_mut(); nb], full: (0..nb).map(|_| Vec::new()).collect(), slab: 0, left: 0 }
+        assert!(BYTES.is_power_of_two() && BYTES >= 64 && BYTES % std::mem::size_of::<T>() == 0 && 64 % std::mem::size_of::<T>() == 0);
+        Bins {
+            arena,
+            cur: vec![std::ptr::null_mut(); nb],
+            stage: vec![Line([0; 64]); if GATHER { nb } else { 0 }],
+            full: (0..nb).map(|_| Vec::new()).collect(),
+            slab: 0,
+            left: 0,
+        }
     }
     /// a fresh block for bucket `b`; `old` is null or one past its full block
     #[cold]
@@ -713,8 +743,18 @@ impl<'a, T: Copy, const BYTES: usize> Bins<'a, T, BYTES> {
         if p as usize & (BYTES - 1) == 0 {
             p = self.grow(b, p);
         }
-        p.write(v);
-        *slot = p.add(1);
+        if GATHER {
+            let line = self.stage.as_mut_ptr().add(b);
+            ((line as *mut u8).add(p as usize & 63) as *mut T).write(v);
+            let next = p.add(1);
+            *slot = next;
+            if next as usize & 63 == 0 {
+                line_out(line, (next as *mut u8).sub(64));
+            }
+        } else {
+            p.write(v);
+            *slot = p.add(1);
+        }
     }
     /// the last bucket that holds a record
     fn top(&self) -> Option<usize> {
@@ -726,10 +766,20 @@ impl<'a, T: Copy, const BYTES: usize> Bins<'a, T, BYTES> {
             if p.is_null() {
                 continue;
             }
+            if GATHER {
+                // the records of a line not yet full
+                let part = p as usize & 63;
+                unsafe { std::ptr::copy_nonoverlapping(self.stage[b].0.as_ptr(), (p as *mut u8).sub(part), part) };
+            }
             let used = (p as usize & (BYTES - 1)) / std::mem::size_of::<T>();
             let len = if used == 0 { Self::PER } else { used };
             self.full[b].push(Blk { ptr: unsafe { p.sub(len) }, len: len as u32 });
         }
+        // lines written past the cache are in place before anyone reads them
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_mm_sfence()
+        };
         std::mem::take(&mut self.full)
     }
 }
