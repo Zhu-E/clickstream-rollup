@@ -1072,7 +1072,6 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
 struct CampTab {
     keys: Vec<u64>,
     vals: Vec<u32>,
-    sum: u64,
 }
 
 // a fixed size keeps the shift a constant; more campaigns than half of it get no table
@@ -1089,7 +1088,7 @@ impl CampTab {
         if n > cap / 2 {
             return None;
         }
-        let mut t = CampTab { keys: vec![0; cap], vals: vec![0; cap], sum: CampTab::sum(camp) };
+        let mut t = CampTab { keys: vec![0; cap], vals: vec![0; cap] };
         let mut digits = [0u8; 20];
         for (v, &x) in camp.iter().enumerate() {
             if x == 0 {
@@ -1298,37 +1297,78 @@ type LocalLink = u64;
 /// any other link, as `build_links` reads one: key and bytes of each side
 type GlobalLink = (u64, u64, u64, u64);
 
-/// row rules as in `build_links`; a row is local, global or (a self-link) nothing
-fn parse_lk(ctx: &Ctx, k: &Keys, shared: &[AtomicU64], fi: usize, from: usize, to: usize, st: &mut PSt) {
-    let simd = SIMD_OK.load(Ordering::Relaxed);
-    let d = ctx.maps[fi].as_slice();
-    let p = first_line_start(d, from);
-    let PSt { lloc, lglob, ix, .. } = st;
-    split::each_row::<2, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
+/// one link row once its two ids are decoded (`NONE` where one does not decode)
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn lk_body(d: &[u8], fi: usize, (a0, a1): (usize, usize), (b0, b1): (usize, usize), ua: u64, ub: u64, shared: &[AtomicU64], lloc: &mut [Vec<LocalLink>], lglob: &mut Vec<GlobalLink>) {
+    if ua != NONE && ub != NONE && ua >> 9 == ub >> 9 {
+        if ua != ub {
+            lloc[(ua >> (9 + LSHIFT)) as usize].push((ua << 9) | (ub & ALIAS));
+        }
+        return;
+    }
+    let (a, b) = (&d[a0..a1], &d[b0..b1]);
+    if a == b {
+        return;
+    }
+    // a user that a global link touches is resolved through the link map
+    for v in [ua, ub] {
+        if v != NONE {
+            shared[(v >> 15) as usize].fetch_or(1 << ((v >> 9) & 63), Ordering::Relaxed);
+        }
+    }
+    lglob.push((person_key(a), sref_of(fi, a0, a.len()), person_key(b), sref_of(fi, b0, b.len())));
+}
+
+/// one link row by the reference splitter; returns where the next starts
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn lk_line(d: &[u8], k: &Keys, fi: usize, p: usize, simd: bool, shared: &[AtomicU64], lloc: &mut [Vec<LocalLink>], lglob: &mut Vec<GlobalLink>) -> usize {
+    split::line::<2, _>(d, p, simd, &mut |lp, s, e| {
         let (a0, a1) = (lp + s[0] as usize, lp + e[0] as usize);
         let (b0, b1) = (lp + s[1] as usize, lp + e[1] as usize);
         if a0 == a1 || b0 == b1 {
             return;
         }
         let (ua, ub) = (k.user_at(d, a0, a1, simd), k.user_at(d, b0, b1, simd));
-        if ua != NONE && ub != NONE && ua >> 9 == ub >> 9 {
-            if ua != ub {
-                lloc[(ua >> (9 + LSHIFT)) as usize].push((ua << 9) | (ub & ALIAS));
+        lk_body(d, fi, (a0, a1), (b0, b1), ua, ub, shared, lloc, lglob);
+    })
+}
+
+/// row rules as in `build_links`; a row is local, global or (a self-link) nothing
+fn parse_lk(ctx: &Ctx, k: &Keys, shared: &[AtomicU64], fi: usize, from: usize, to: usize, st: &mut PSt) {
+    let simd = SIMD_OK.load(Ordering::Relaxed);
+    let d = ctx.maps[fi].as_slice();
+    let mut p = first_line_start(d, from);
+    let PSt { lloc, lglob, .. } = st;
+    // the click loop's shape: one window per row, both ids in vectors, anything else row by row
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    if simd {
+        let cut = split::Cut::new();
+        let stop = to.min((d.len() + 1).saturating_sub(split::REACH));
+        while p < stop {
+            unsafe {
+                let p0 = d.as_ptr().add(p);
+                let m = split::masks(p0, &cut);
+                if let Some((mut w, nl)) = split::tail::<1>(m.0, m.1, m.2) {
+                    let ((sa, ea), (sb, eb)) = (w.next(), w.next());
+                    if sa == ea || sb == eb {
+                        p += nl + 1;
+                        continue;
+                    }
+                    if let (Some(ua), Some(ub)) = (k.user_fast(p0.add(sa), ea - sa), k.user_fast(p0.add(sb), eb - sb)) {
+                        lk_body(d, fi, (p + sa, p + ea), (p + sb, p + eb), ua, ub, shared, lloc, lglob);
+                        p += nl + 1;
+                        continue;
+                    }
+                }
             }
-            return;
+            p = lk_line(d, k, fi, p, simd, shared, lloc, lglob);
         }
-        let (a, b) = (&d[a0..a1], &d[b0..b1]);
-        if a == b {
-            return;
-        }
-        // a user that a global link touches is resolved through the link map
-        for v in [ua, ub] {
-            if v != NONE {
-                shared[(v >> 15) as usize].fetch_or(1 << ((v >> 9) & 63), Ordering::Relaxed);
-            }
-        }
-        lglob.push((person_key(a), sref_of(fi, a0, a.len()), person_key(b), sref_of(fi, b0, b.len())));
-    });
+    }
+    while p < to {
+        p = lk_line(d, k, fi, p, simd, shared, lloc, lglob);
+    }
 }
 
 /// One range of users from their local links: a table entry each, and the
