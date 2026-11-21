@@ -1067,6 +1067,92 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
     }
 }
 
+/// `c_<number>` campaign ids of up to 8 bytes, keyed by their bytes; a miss goes to `camp_of`
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2")), allow(dead_code))]
+struct CampTab {
+    keys: Vec<u64>,
+    vals: Vec<u32>,
+    sum: u64,
+}
+
+// a fixed size keeps the shift a constant; more campaigns than half of it get no table
+const CAMP_BITS: u32 = 13;
+
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2")), allow(dead_code))]
+impl CampTab {
+    fn sum(camp: &[u32]) -> u64 {
+        camp.iter().fold(camp.len() as u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3))
+    }
+    fn new(camp: &[u32]) -> Option<CampTab> {
+        let n = camp.iter().filter(|&&x| x != 0).count();
+        let cap = 1usize << CAMP_BITS;
+        if n > cap / 2 {
+            return None;
+        }
+        let mut t = CampTab { keys: vec![0; cap], vals: vec![0; cap], sum: CampTab::sum(camp) };
+        let mut digits = [0u8; 20];
+        for (v, &x) in camp.iter().enumerate() {
+            if x == 0 {
+                continue;
+            }
+            // "c_" and the number with no leading zero, as camp_of reads it
+            let (mut m, mut nd) = (v, 0);
+            loop {
+                digits[nd] = b'0' + (m % 10) as u8;
+                nd += 1;
+                m /= 10;
+                if m == 0 {
+                    break;
+                }
+            }
+            if nd + 2 > 8 {
+                continue;
+            }
+            let mut key = u64::from(b'c') | (u64::from(b'_') << 8);
+            for j in 0..nd {
+                key |= u64::from(digits[nd - 1 - j]) << (8 * (2 + j));
+            }
+            let mut i = t.slot(key);
+            while t.keys[i] != 0 {
+                i = (i + 1) & (cap - 1);
+            }
+            t.keys[i] = key;
+            t.vals[i] = x - 1;
+        }
+        Some(t)
+    }
+    #[inline(always)]
+    fn slot(&self, key: u64) -> usize {
+        (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - CAMP_BITS)) as usize
+    }
+    /// the campaign of the `n` bytes at `p`, 1 to 8 of them; eight bytes from `p` must be readable
+    #[inline(always)]
+    unsafe fn get(&self, p: *const u8, n: usize) -> Option<u32> {
+        let w = (p as *const u64).read_unaligned().to_le();
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let key = core::arch::x86_64::_bzhi_u64(w, 8 * n as u32);
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        let key = w & (!0u64 >> (64 - 8 * n as u32));
+        let mask = (1usize << CAMP_BITS) - 1;
+        let mut i = self.slot(key);
+        loop {
+            let k = *self.keys.get_unchecked(i);
+            if k == key {
+                return Some(*self.vals.get_unchecked(i));
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+thread_local! {
+    // the campaign table's checksum, and the table if one was built
+    static CAMPS: std::cell::RefCell<Option<(u64, Option<CampTab>)>> = const { std::cell::RefCell::new(None) };
+}
+
 /// a click row by the rules of `parse_clicks`; the person is resolved later
 #[inline(always)]
 unsafe fn cl_row<const WIDE: bool>(
@@ -1078,6 +1164,8 @@ unsafe fn cl_row<const WIDE: bool>(
     cs: &mut ClBins,
     oddc: &mut Vec<OddCl>,
     dc: &mut DateCache,
+    camps: Option<&CampTab>,
+    fine: bool,
 ) -> bool {
     let ((s0, e0), (s1, e1)) = (next(), next());
     let (len, nu) = (e0 - s0, e1 - s1);
@@ -1095,9 +1183,17 @@ unsafe fn cl_row<const WIDE: bool>(
         k.user_at(x.d, at + s1, at + e1, x.simd)
     };
     let (s2, e2) = next();
-    let camp = match ctx.camp_of(std::slice::from_raw_parts(p0.add(s2), e2 - s2)) {
+    let nc = e2 - s2;
+    let hit = match camps {
+        Some(t) if WIDE && nc.wrapping_sub(1) < 8 => t.get(p0.add(s2), nc),
+        _ => None,
+    };
+    let camp = match hit {
         Some(c) => c,
-        None => return true,
+        None => match ctx.camp_of(std::slice::from_raw_parts(p0.add(s2), nc)) {
+            Some(c) => c,
+            None => return true,
+        },
     };
     let (s3, e3) = next();
     let ts = match parse_ts_c(std::slice::from_raw_parts(p0.add(s3), e3 - s3), dc) {
@@ -1109,7 +1205,8 @@ unsafe fn cl_row<const WIDE: bool>(
     }
     let ts = (ts - ctx.base) as u32;
     let off = (at + s0) as u64;
-    if un != NONE && len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) {
+    // `fine`: the file number, every offset in the file and every campaign fit their fields
+    if un != NONE && len <= 15 && (fine || (fr < 256 && off < (1 << 36) && camp < (1 << 16))) {
         let ui = un >> 9;
         cs.put(
             tab,
@@ -1138,7 +1235,7 @@ fn cl_line(x: Env, fr: u64, p: usize, cs: &mut ClBins, oddc: &mut Vec<OddCl>, dc
             k += 1;
             (s[k - 1] as usize, e[k - 1] as usize)
         };
-        unsafe { cl_row::<false>(x, fr, x.d.as_ptr().add(lp), next, tab, cs, oddc, dc) };
+        unsafe { cl_row::<false>(x, fr, x.d.as_ptr().add(lp), next, tab, cs, oddc, dc, None, false) };
     })
 }
 
@@ -1162,19 +1259,30 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
         let tab = cs.cur.as_mut_ptr();
         // rows that start before `to` and have a whole window to read
         let stop = to.min((d.len() + 1).saturating_sub(split::REACH));
-        while p < stop {
-            unsafe {
-                let p0 = d.as_ptr().add(p);
-                let m = split::masks(p0, &cut);
-                if let Some((mut a, nl)) = split::tail::<3>(m.0, m.1, m.2) {
-                    if cl_row::<true>(x, fr, p0, || a.next(), tab, cs, oddc, dc) {
-                        p += nl + 1;
-                        continue;
+        // every campaign index is below ncamp, from either lookup
+        let fine = fr < 256 && (d.len() as u64) < (1 << 36) && ctx.ncamp <= 1 << 16;
+        // one table per thread, rebuilt only when the campaigns change
+        let sum = CampTab::sum(&ctx.camp);
+        CAMPS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.as_ref().map_or(true, |t| t.0 != sum) {
+                *c = Some((sum, CampTab::new(&ctx.camp)));
+            }
+            let camps = c.as_ref().and_then(|t| t.1.as_ref());
+            while p < stop {
+                unsafe {
+                    let p0 = d.as_ptr().add(p);
+                    let m = split::masks(p0, &cut);
+                    if let Some((mut a, nl)) = split::tail::<3>(m.0, m.1, m.2) {
+                        if cl_row::<true>(x, fr, p0, || a.next(), tab, cs, oddc, dc, camps, fine) {
+                            p += nl + 1;
+                            continue;
+                        }
                     }
                 }
+                p = cl_rare(x, fr, p, cs, oddc, dc);
             }
-            p = cl_rare(x, fr, p, cs, oddc, dc);
-        }
+        });
     }
     while p < to {
         p = cl_line(x, fr, p, cs, oddc, dc);
@@ -2701,6 +2809,53 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn camp_table_agrees_with_the_campaign_rule() {
+        // campaign numbers 0..3000 with gaps, as campaigns.csv might list them
+        let mut camp = vec![0u32; 3000];
+        let mut idx = 0;
+        for v in 0..camp.len() {
+            if v % 7 != 3 {
+                idx += 1;
+                camp[v] = idx;
+            }
+        }
+        let t = CampTab::new(&camp).unwrap();
+        // what camp_of gives for "c_" ids, without its fallback map
+        let rule = |b: &[u8]| -> Option<u32> {
+            if b.len() < 3 || &b[..2] != b"c_" || (b.len() > 3 && b[2] == b'0') || !b[2..].iter().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let v: usize = std::str::from_utf8(&b[2..]).ok()?.parse().ok()?;
+            camp.get(v).copied().filter(|&x| x != 0).map(|x| x - 1)
+        };
+        let look = |b: &[u8]| -> Option<u32> {
+            let mut buf = [0xffu8; 16];
+            buf[..b.len()].copy_from_slice(b);
+            unsafe { t.get(buf.as_ptr(), b.len()) }
+        };
+        let mut checked = 0;
+        for v in 0..4000 {
+            for s in [format!("c_{v}"), format!("c_0{v}"), format!("c_{v}0"), format!("d_{v}"), format!("c{v}")] {
+                let b = s.as_bytes();
+                if b.is_empty() || b.len() > 8 {
+                    continue;
+                }
+                // a hit must equal the rule; a miss is allowed (camp_of then decides)
+                if let Some(got) = look(b) {
+                    assert_eq!(Some(got), rule(b), "{s}");
+                } else {
+                    assert!(rule(b).is_none() || b.len() > 8, "{s} missed but the rule finds it");
+                }
+                checked += 1;
+            }
+        }
+        for s in ["c_", "c", "c_00", "c_-1", "C_12", "c_12 ", " c_12", "c_1\r"] {
+            assert_eq!(look(s.as_bytes()), None, "{s}");
+        }
+        assert!(checked > 15_000);
+    }
+
     use super::*;
 
     #[test]
