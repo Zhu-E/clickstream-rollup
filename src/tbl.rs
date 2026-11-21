@@ -510,6 +510,18 @@ fn date_days(b: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, mo, d))
 }
 
+/// days since the epoch of the `YYYY-MM-DDT` that `b` opens with, for the dates a cache may hold
+#[allow(dead_code)]
+pub fn cache_day(b: &[u8]) -> Option<i64> {
+    if b.len() < 11 || b[10] != b'T' {
+        return None;
+    }
+    match date_days(b) {
+        Some(d) if d >= 1 && d <= 49_000 => Some(d),
+        _ => None,
+    }
+}
+
 const POW10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
 
 /// For sixteen bytes read as `b[..8]` then `b[k..k + 8]`: all of the first

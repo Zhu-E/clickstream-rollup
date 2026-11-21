@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[path = "rowk.rs"]
+mod rowk;
+
 const ALIAS: u64 = 511;
 const DELTA_BITS: u32 = 17;
 const DELTA_MASK: u64 = (1 << DELTA_BITS) - 1;
@@ -457,6 +461,10 @@ impl Keys {
 
 /// the vector id decoders against the byte loop, on ids good and damaged; run at startup
 pub(crate) fn wide_ok() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    if !rowk::agrees() {
+        return false;
+    }
     let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 39, ucap: 1 << 30, shift: 12 };
     let pool = b"0123456789abcdefghijklmnopqrstuvwxyzEU\",-";
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
@@ -736,6 +744,8 @@ struct PSt<'a> {
     esc: Vec<(u64, Esc)>,
     oddc: Vec<OddCl>,
     dc: DateCache,
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    days: Box<rowk::Days>,
     ix: Box<split::Index>,
     lloc: Vec<Vec<LocalLink>>,
     lglob: Vec<GlobalLink>,
@@ -932,11 +942,84 @@ fn ev_line(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Ve
     })
 }
 
-/// `ev_line` for the rows the windows leave
-#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2")), allow(dead_code))]
+/// from a day late to as early as a record can say
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+const ROOM: u64 = (LATE_MS + BIAS * 1000) as u64;
+
+/// `cat_of` for a product inside a row; the usual `p` and a number without the digit loop
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn cat_fast(ctx: &Ctx, p: *const u8, n: usize) -> u32 {
+    if n >= 2 && *p == b'p' && (n == 2 || *p.add(1) != b'0') {
+        if let Some(v) = rowk::dec8(p.add(n), n - 1) {
+            if (v as usize) < ctx.prod.len() {
+                let x = *ctx.prod.get_unchecked(v as usize);
+                if x != 0 {
+                    return (x - 1) as u32;
+                }
+            }
+        }
+    }
+    ctx.cat_of(std::slice::from_raw_parts(p, n))
+}
+
+/// a row of the tables that is a purchase, or dead, or too early for a record; false: not written
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[inline(never)]
+unsafe fn ev_other(x: &Env, p0: *const u8, c: u64, un: u64, ts: i64, ing_sec: i64, ing_ms: i64, tail: u64, tab: *mut *mut FRec, es: &mut EvBins) -> bool {
+    let (ctx, k) = (x.ctx, x.k);
+    let early = (ts - ing_ms + LATE_MS) as u64;
+    let inside = (ts.wrapping_sub(x.lo) as u64) < x.span;
+    let t = rowk::Tail::of(p0, tail);
+    let mut pc = 0;
+    let mut priced = true;
+    if t.pur {
+        let price = match rowk::dec8(t.price.add(t.nprice), t.nprice) {
+            Some(v) => Some(v),
+            None => digits_u32(std::slice::from_raw_parts(t.price, t.nprice)),
+        };
+        match price {
+            Some(v) if v >= 1 && v <= 10_000_000 => pc = (cat_fast(ctx, t.prod, t.nprod) << 24) | v,
+            _ => priced = false,
+        }
+    }
+    let (b, cl) = ((c >> k.shift) as usize, c & ((1u64 << k.shift) - 1));
+    if inside && early <= ROOM && priced {
+        let tsf = (ts - ctx.base) as u32;
+        es.put(tab, b, FRec { a: ((tsf as u64) << 33) | (un << 2) | LIVE, b: ((pc as u64) << 32) | ((ing_sec as u64 & DELTA_MASK) << MAX_SHIFT) | cl });
+        return true;
+    }
+    // an ingest long before its event is live all the same, and not for these records
+    if inside && (early as i64) > ROOM as i64 && priced {
+        return false;
+    }
+    es.put(tab, b, FRec { a: DEAD, b: ((ing_sec as u64) << 32) | cl });
+    true
+}
+
+/// a row the tables left: its dates noted, then the windows, then the reference
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
 #[cold]
 #[inline(never)]
-fn ev_rare(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache) -> usize {
+unsafe fn ev_second(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache, days: &mut rowk::Days) -> usize {
+    let p0 = x.d.as_ptr().add(p);
+    let cut = split::Cut::new();
+    let tab = es.cur.as_mut_ptr();
+    let w = split::masks_any(p0, &cut);
+    if let Some((mut a, p3)) = split::head::<3>(w.0, w.1, w.2) {
+        let p1 = p0.add(p3 + 1);
+        let w = split::masks(p1, &cut);
+        if let Some((mut b, nl)) = split::tail::<3>(w.0, w.1, w.2) {
+            let h = [a.next(), a.next(), a.next()];
+            let mut ing = b;
+            let (s3, e3) = ing.next();
+            days.learn(std::slice::from_raw_parts(p0.add(h[2].0), h[2].1 - h[2].0));
+            days.learn(std::slice::from_raw_parts(p1.add(s3), e3 - s3));
+            if ev_row::<true>(x, p0, &h, p1, || b.next(), tab, es, odd, esc, dc) {
+                return p + p3 + nl + 2;
+            }
+        }
+    }
     ev_line(x, p, es, odd, esc, dc)
 }
 
@@ -945,32 +1028,40 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
     let x = Env::new(ctx, k, fi, simd, ctx.ev_lo, ctx.ev_hi);
     let d = x.d;
     let mut p = first_line_start(d, from);
-    let PSt { es, odd, esc, dc, .. } = st;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
     if simd {
-        let cut = split::Cut::new();
-        let tab = es.cur.as_mut_ptr();
+        let PSt { es, odd, esc, dc, days, .. } = &mut *st;
         // rows that start before `to` and have a whole window to read
         let stop = to.min((d.len() + 1).saturating_sub(split::REACH));
+        // the tables read a little before a row
+        while p < stop.min(16) {
+            p = ev_line(x, p, es, odd, esc, dc);
+        }
+        let kern = rowk::Kern::new(k, days.as_ptr());
+        let tab = es.cur.as_mut_ptr();
+        let low = (1u64 << k.shift) - 1;
         while p < stop {
             unsafe {
                 let p0 = d.as_ptr().add(p);
-                let w = split::masks_any(p0, &cut);
-                if let Some((mut a, p3)) = split::head::<3>(w.0, w.1, w.2) {
-                    let p1 = p0.add(p3 + 1);
-                    let w = split::masks(p1, &cut);
-                    if let Some((mut b, nl)) = split::tail::<3>(w.0, w.1, w.2) {
-                        let h = [a.next(), a.next(), a.next()];
-                        if ev_row::<true>(x, p0, &h, p1, || b.next(), tab, es, odd, esc, dc) {
-                            p += p3 + nl + 2;
-                            continue;
-                        }
+                if let Some(e) = rowk::ev(p0, &kern) {
+                    let early = (e.ts - e.ing_ms + LATE_MS) as u64;
+                    // bit 35: a purchase
+                    if ((e.ts.wrapping_sub(x.lo) as u64) < x.span) & (early <= ROOM) & (e.tail & (8 << 32) == 0) {
+                        let tsf = (e.ts - ctx.base) as u32;
+                        es.put(tab, (e.c >> k.shift) as usize, FRec { a: ((tsf as u64) << 33) | (e.un << 2) | LIVE, b: ((e.ing_sec as u64 & DELTA_MASK) << MAX_SHIFT) | (e.c & low) });
+                        p += e.next;
+                        continue;
+                    }
+                    if ev_other(&x, p0, e.c, e.un, e.ts, e.ing_sec, e.ing_ms, e.tail, tab, es) {
+                        p += e.next;
+                        continue;
                     }
                 }
             }
-            p = ev_rare(x, p, es, odd, esc, dc);
+            p = unsafe { ev_second(x, p, es, odd, esc, dc, days) };
         }
     }
+    let PSt { es, odd, esc, dc, .. } = st;
     while p < to {
         p = ev_line(x, p, es, odd, esc, dc);
     }
@@ -2174,6 +2265,8 @@ pub(crate) fn run(
                 esc: Vec::new(),
                 oddc: Vec::new(),
                 dc: DateCache::new(),
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+                days: Box::new(rowk::Days::new()),
                 ix: Box::new(split::Index::new()),
                 lloc: (0..nb_l).map(|_| Vec::new()).collect(),
                 lglob: Vec::new(),
