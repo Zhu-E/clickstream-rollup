@@ -3,7 +3,7 @@ use crate::genid::{half, scramble, unscramble, A, AINV, M40};
 use crate::*;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 const ALIAS: u64 = 511;
 const DELTA_BITS: u32 = 17;
@@ -127,119 +127,130 @@ fn b36f(b: &[u8]) -> Option<u64> {
 }
 
 const L8: u64 = 0x0101_0101_0101_0101;
+const NONE: u64 = u64::MAX;
 
-/// the 8 bytes ending at `e`, zero-filled before `s`; none unless 1-8 digits, no leading zero
-#[inline(always)]
-fn word(d: &[u8], s: usize, e: usize) -> Option<u64> {
-    let n = e.wrapping_sub(s);
-    if n.wrapping_sub(1) > 7 || e < 8 || e > d.len() || (n > 1 && d[s] == b'0') {
-        return None;
+const fn by_digits(what: u32) -> [u64; 9] {
+    let mut t = [0u64; 9];
+    let mut m = 1;
+    let mut pow = 1u64;
+    while m <= 8 {
+        t[m] = match what {
+            // the id's own bytes of the word that ends with it
+            0 => !0u64 << (64 - 8 * m),
+            // '0' in the bytes before it
+            1 => if m == 8 { 0 } else { (L8 * 0x30) >> (8 * m) },
+            // smallest value with m digits and no leading zero
+            2 => if m == 1 { 0 } else { pow },
+            // how far above that a 40-bit value can be
+            _ => M40 - if m == 1 { 0 } else { pow },
+        };
+        pow *= 36;
+        m += 1;
     }
-    let w = u64::from_le_bytes(d[e - 8..e].try_into().unwrap());
-    Some(if n == 8 { w } else { (w & (!0u64 << (64 - 8 * n))) | ((L8 * 0x30) >> (8 * n)) })
+    t
 }
 
+static KEEP: [u64; 9] = by_digits(0);
+static FILL: [u64; 9] = by_digits(1);
+static LEAST: [u64; 9] = by_digits(2);
+static SPAN: [u64; 9] = by_digits(3);
+
 /// eight base-36 digits, first in the low byte; checked by encoding back
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "sse4.1"), allow(dead_code))]
 #[inline(always)]
-fn swar36(w: u64) -> Option<u64> {
+fn swar36(w: u64) -> u64 {
     let alpha = (w >> 6) & L8;
     let v = (w & (L8 * 0x0f)) + alpha * 9 + (alpha & (w >> 4)) * 16;
     let ten = ((v + L8 * 118) >> 7) & L8;
     if v + L8 * 0x30 + ten * 0x27 != w || (v + L8 * 92) & (L8 * 0x80) != 0 {
-        return None;
+        return NONE;
     }
     let v = (v & 0x00ff_00ff_00ff_00ff) * 36 + ((v >> 8) & 0x00ff_00ff_00ff_00ff);
     let v = (v & 0x0000_ffff_0000_ffff) * 1296 + ((v >> 16) & 0x0000_ffff_0000_ffff);
-    let v = (v & 0xffff_ffff) * 1_679_616 + (v >> 32);
-    if v > M40 {
-        None
-    } else {
-        Some(v)
-    }
+    (v & 0xffff_ffff) * 1_679_616 + (v >> 32)
 }
 
-/// `b36f(&d[s..e])` without the loop
-#[inline(always)]
-fn b36w(d: &[u8], s: usize, e: usize) -> Option<u64> {
-    if e < 8 {
-        return if s <= e && e <= d.len() { b36f(&d[s..e]) } else { None };
-    }
-    let w = word(d, s, e)?;
-    if cfg!(all(target_arch = "x86_64", target_feature = "sse4.1")) {
-        pair36(w, w).0
-    } else {
-        swar36(w)
-    }
-}
-
-/// two words of digits in one vector
+/// two words of eight digits each; NONE for a word with a byte that is no digit
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
 #[inline(always)]
-fn pair36(w0: u64, w1: u64) -> (Option<u64>, Option<u64>) {
+fn pair36(w0: u64, w1: u64) -> (u64, u64) {
     use core::arch::x86_64::*;
     unsafe {
         let x = _mm_set_epi64x(w1 as i64, w0 as i64);
         let alpha = _mm_cmpgt_epi8(x, _mm_set1_epi8(0x60));
         let v = _mm_sub_epi8(x, _mm_add_epi8(_mm_set1_epi8(0x30), _mm_and_si128(alpha, _mm_set1_epi8(0x27))));
         let lim = _mm_add_epi8(_mm_set1_epi8(9), _mm_and_si128(alpha, _mm_set1_epi8(26)));
-        let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(v, lim), v)) as u32;
+        let bad = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(v, lim), v)) as u32 ^ 0xffff;
         let p = _mm_maddubs_epi16(v, _mm_set1_epi16(0x0124));
         let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_0510));
         let z0 = _mm_cvtsi128_si64(q) as u64;
         let z1 = _mm_extract_epi64(q, 1) as u64;
         let v0 = (z0 & 0xffff_ffff) * 1_679_616 + (z0 >> 32);
         let v1 = (z1 & 0xffff_ffff) * 1_679_616 + (z1 >> 32);
-        (
-            if ok & 0xff == 0xff && v0 <= M40 { Some(v0) } else { None },
-            if ok >> 8 == 0xff && v1 <= M40 { Some(v1) } else { None },
-        )
+        (if bad & 0xff == 0 { v0 } else { NONE }, if bad >> 8 == 0 { v1 } else { NONE })
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 #[inline(always)]
-fn pair36(w0: u64, w1: u64) -> (Option<u64>, Option<u64>) {
+fn pair36(w0: u64, w1: u64) -> (u64, u64) {
     (swar36(w0), swar36(w1))
 }
 
-/// `(b36w(d, s0, e0), b36w(d, s1, e1))`
+/// the word of digits for an id of `m` digits that ends at `e`; needs `e >= 8`
 #[inline(always)]
-fn b36pair(d: &[u8], s0: usize, e0: usize, s1: usize, e1: usize) -> (Option<u64>, Option<u64>) {
-    if e0 < 8 || e1 < 8 {
-        return (b36w(d, s0, e0), b36w(d, s1, e1));
-    }
-    match (word(d, s0, e0), word(d, s1, e1)) {
-        (Some(a), Some(b)) => pair36(a, b),
-        (a, b) => (a.and_then(swar36), b.and_then(swar36)),
-    }
+unsafe fn digits_word(d: &[u8], e: usize, m: usize) -> u64 {
+    debug_assert!(e >= 8 && e <= d.len() && m >= 1 && m <= 8);
+    let w = u64::from_le((d.as_ptr().add(e - 8) as *const u64).read_unaligned());
+    (w & *KEEP.get_unchecked(m)) | *FILL.get_unchecked(m)
 }
 
 impl Keys {
-    /// counter of the non-empty event id and `user` of the user id
+    /// `counter` and `user` of two ids in one row, the event id first; NONE where one does not decode
     #[inline(always)]
-    fn event_at(&self, d: &[u8], es: usize, ee: usize, us: usize, ue: usize) -> (Option<u64>, Option<u64>) {
-        let (xe, xu) = b36pair(d, es + 1, ee, us + 1, ue);
-        let c = match xe {
-            Some(x) if d[es] == b'e' => Some(unscramble(x, self.ek)).filter(|&c| c < self.ncap),
-            _ => None,
-        };
-        let u = match xu {
-            Some(x) if d[us] == b'u' => Some(unscramble(x, self.uk)).filter(|&v| v < self.ucap << 9),
-            _ => None,
-        };
-        (c, u)
-    }
-    /// `user` for the id at `d[s..e]`, which must not be empty
-    #[inline(always)]
-    fn user_at(&self, d: &[u8], s: usize, e: usize) -> Option<u64> {
-        if d[s] != b'u' {
-            return None;
+    fn event_at(&self, d: &[u8], es: usize, ee: usize, us: usize, ue: usize) -> (u64, u64) {
+        let (me, mu) = ((ee - es).wrapping_sub(1), (ue - us).wrapping_sub(1));
+        // the usual shape: a letter and 1 to 8 digits, not in the file's first bytes
+        if (me.wrapping_sub(1) | mu.wrapping_sub(1)) > 7 || es < 8 || us < ee || ue > d.len() {
+            return (self.counter(&d[es..ee]), self.user(&d[us..ue]).unwrap_or(NONE));
         }
-        let v = unscramble(b36w(d, s + 1, e)?, self.uk);
-        if v < self.ucap << 9 {
-            Some(v)
-        } else {
-            None
+        unsafe {
+            let (ve, vu) = pair36(digits_word(d, ee, me), digits_word(d, ue, mu));
+            // one compare each: no leading zero, and no more than 40 bits
+            let oke = *d.get_unchecked(es) == b'e' && ve.wrapping_sub(*LEAST.get_unchecked(me)) <= *SPAN.get_unchecked(me);
+            let oku = *d.get_unchecked(us) == b'u' && vu.wrapping_sub(*LEAST.get_unchecked(mu)) <= *SPAN.get_unchecked(mu);
+            let c = unscramble(ve & M40, self.ek);
+            let u = unscramble(vu & M40, self.uk);
+            (if oke && c < self.ncap { c } else { NONE }, if oku && u < self.ucap << 9 { u } else { NONE })
+        }
+    }
+    /// `user` for the id at `d[s..e]`; NONE when it does not decode
+    #[inline(always)]
+    fn user_at(&self, d: &[u8], s: usize, e: usize) -> u64 {
+        let m = (e - s).wrapping_sub(1);
+        if m.wrapping_sub(1) > 7 || s < 8 || e > d.len() {
+            return self.user(&d[s..e]).unwrap_or(NONE);
+        }
+        unsafe {
+            let w = digits_word(d, e, m);
+            let v = pair36(w, w).0;
+            let ok = *d.get_unchecked(s) == b'u' && v.wrapping_sub(*LEAST.get_unchecked(m)) <= *SPAN.get_unchecked(m);
+            let u = unscramble(v & M40, self.uk);
+            if ok && u < self.ucap << 9 {
+                u
+            } else {
+                NONE
+            }
+        }
+    }
+    /// the counter an event id spells, by the byte loop; NONE when it does not decode
+    fn counter(&self, eid: &[u8]) -> u64 {
+        if eid.is_empty() || eid[0] != b'e' {
+            return NONE;
+        }
+        match b36f(&eid[1..]) {
+            Some(x) if unscramble(x, self.ek) < self.ncap => unscramble(x, self.ek),
+            _ => NONE,
         }
     }
     /// user number * 512 + alias, for ids the user table covers
@@ -537,21 +548,18 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
         let tsf = if valid { (ts - ctx.base) as u32 } else { 0 };
         let uspan = Span { fi: fi as u32, len: user.len() as u32, off: (lp + s[1] as usize) as u64 };
         let (c, un) = k.event_at(d, lp + s[0] as usize, lp + e[0] as usize, lp + s[1] as usize, lp + e[1] as usize);
-        let c = match c {
-            Some(c) => c,
-            None => {
-                let (klo, khi) = key96(fld(0));
-                odd.push(OddEv {
-                    klo,
-                    khi,
-                    ing,
-                    tsf: if valid { tsf | 0x8000_0000 } else { 0 },
-                    pc: if valid { pc } else { 0 },
-                    user: uspan,
-                });
-                return;
-            }
-        };
+        if c == NONE {
+            let (klo, khi) = key96(fld(0));
+            odd.push(OddEv {
+                klo,
+                khi,
+                ing,
+                tsf: if valid { tsf | 0x8000_0000 } else { 0 },
+                pc: if valid { pc } else { 0 },
+                user: uspan,
+            });
+            return;
+        }
         maxc = maxc.max(c);
         let b = (c >> k.shift) as usize;
         let cl = c & low;
@@ -561,7 +569,7 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
         }
         let delta = ing as i64 - ts.div_euclid(1000) + BIAS;
         match un {
-            Some(un) if delta >= 0 && delta <= DELTA_MASK as i64 => {
+            un if un != NONE && delta >= 0 && delta <= DELTA_MASK as i64 => {
                 es.push(
                     b,
                     FRec {
@@ -611,7 +619,7 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
         let off = (lp + s[0] as usize) as u64;
         let len = (e[0] - s[0]) as u64;
         match k.user_at(d, lp + s[1] as usize, lp + e[1] as usize) {
-            Some(un) if len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) => {
+            un if un != NONE && len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) => {
                 let ui = un >> 9;
                 cs.push(
                     (ui >> CSHIFT) as usize,
@@ -633,64 +641,74 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
 
 // ---------------------------------------------------------------- user table
 
-/// per user: `k | name << 9` when its linked ids are exactly aliases 0..=k, else GENERAL
-fn build_utab(links: &Links, k: &Keys) -> Blob<u32> {
-    const HAS: u32 = 1 << 30;
-    let mut u: Blob<u32> = Blob::zeroed(k.ucap as usize);
-    let dec = |key: u64| k.user_of_key(key);
+const HAS: u32 = 1 << 30;
+const UTAB_STEP: usize = 1 << 14;
+
+/// one more id of a user's component: root alias `ra`, and its own alias unless it is the root
+#[inline(always)]
+fn utab_step(e: u32, ra: u32, ia: Option<u32>) -> u32 {
     // scratch: root alias:9, other members:10, max alias:9
-    for &(id, root) in links.link.slots.iter() {
+    if e & GENERAL != 0 {
+        return e;
+    }
+    let e = if e & HAS == 0 {
+        HAS | ra | (ra << 19)
+    } else if e & 511 != ra {
+        return GENERAL;
+    } else {
+        e
+    };
+    match ia {
+        Some(ia) => HAS | ra | ((((e >> 9) & 1023) + 1) << 9) | (((e >> 19) & 511).max(ia) << 19),
+        None => e,
+    }
+}
+
+/// link-map slots `lo..hi` into the scratch table; any thread, any order
+fn utab_range(links: &Links, k: &Keys, u: &[AtomicU32], lo: usize, hi: usize) {
+    let slots = &links.link.slots;
+    let hi = hi.min(slots.len());
+    for &(id, root) in &slots[lo.min(hi)..hi] {
         if id == 0 {
             continue;
         }
-        match (dec(id), dec(root)) {
-            // a root listed under itself is a member, not one more id
-            (Some(i), Some(r)) if i == r => {
-                let e = &mut u[(i >> 9) as usize];
-                let ra = (r & ALIAS) as u32;
-                if *e & GENERAL != 0 {
-                    continue;
-                }
-                if *e & HAS == 0 {
-                    *e = HAS | ra | (ra << 19);
-                } else if *e & 511 != ra {
-                    *e = GENERAL;
-                }
-            }
+        let i = k.user_of_key(id);
+        let r = if root == id { i } else { k.user_of_key(root) };
+        match (i, r) {
             (Some(i), Some(r)) if i >> 9 == r >> 9 => {
-                let e = &mut u[(i >> 9) as usize];
-                if *e & GENERAL != 0 {
-                    continue;
+                let a = &u[(i >> 9) as usize];
+                let ia = if i == r { None } else { Some((i & ALIAS) as u32) };
+                let mut cur = a.load(Ordering::Relaxed);
+                loop {
+                    let new = utab_step(cur, (r & ALIAS) as u32, ia);
+                    if new == cur {
+                        break;
+                    }
+                    match a.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(x) => cur = x,
+                    }
                 }
-                let (ia, ra) = ((i & ALIAS) as u32, (r & ALIAS) as u32);
-                if *e & HAS == 0 {
-                    *e = HAS | ra | (ra << 19);
-                } else if *e & 511 != ra {
-                    *e = GENERAL;
-                    continue;
-                }
-                let mx = ((*e >> 19) & 511).max(ia);
-                let cnt = ((*e >> 9) & 1023) + 1;
-                *e = HAS | ra | (cnt << 9) | (mx << 19);
             }
             (i, r) => {
-                if let Some(i) = i {
-                    u[(i >> 9) as usize] = GENERAL;
-                }
-                if let Some(r) = r {
-                    u[(r >> 9) as usize] = GENERAL;
+                for v in [i, r].into_iter().flatten() {
+                    u[(v >> 9) as usize].fetch_or(GENERAL, Ordering::Relaxed);
                 }
             }
         }
     }
+}
+
+/// per user: `k | name << 9` when its linked ids are exactly aliases 0..=k, else GENERAL
+fn finish_utab(u: &mut [u32]) {
     for e in u.iter_mut() {
-        if *e & GENERAL != 0 || *e == 0 {
-            continue;
+        if *e & GENERAL != 0 {
+            *e = GENERAL;
+        } else if *e != 0 {
+            let (root, cnt, mx) = (*e & 511, (*e >> 9) & 1023, (*e >> 19) & 511);
+            *e = if mx == cnt { mx | (root << 9) } else { GENERAL };
         }
-        let (root, cnt, mx) = (*e & 511, (*e >> 9) & 1023, (*e >> 19) & 511);
-        *e = if mx == cnt { mx | (root << 9) } else { GENERAL };
     }
-    u
 }
 
 #[inline(always)]
@@ -845,6 +863,9 @@ struct Wk<'a> {
     hits: usize,
     inline_ev: usize,
     general_ev: usize,
+    /// longest regrouped fold: nanoseconds, events; and all of them together
+    slowest: (u128, usize),
+    regroup_ns: u128,
 }
 struct SendWk<'a>(Wk<'a>);
 unsafe impl<'a> Send for SendWk<'a> {}
@@ -886,6 +907,8 @@ impl<'a> Wk<'a> {
             hits: 0,
             inline_ev: 0,
             general_ev: 0,
+            slowest: (0, 0),
+            regroup_ns: 0,
         }
     }
 
@@ -1041,13 +1064,40 @@ impl<'a> Wk<'a> {
 
     /// every fragment of one user, in counter order
     fn group(&mut self, sh: &Sh, frags: &[Frag]) {
+        // odd-id events sort last among a user's pieces
+        let (slots, odd) = match frags.split_last() {
+            Some((f, rest)) if f.at == u32::MAX => (rest, Some(f)),
+            _ => (frags, None),
+        };
         self.run.clear();
         // one allocation, not a doubling chain: big ones are mapped afresh
         self.run.reserve(frags.iter().map(|f| f.ev.len()).sum());
-        for f in frags {
+        for f in slots {
             self.run.extend_from_slice(&f.ev);
         }
         let unsorted = self.run.windows(2).any(|w| w[1].ts < w[0].ts);
+        if let Some(f) = odd {
+            if unsorted {
+                self.run.extend_from_slice(&f.ev);
+            } else {
+                // a handful of events into a long sorted run: merge from the back
+                let mut x = f.ev.clone();
+                x.sort_unstable_by_key(|r| r.ts);
+                let (mut i, mut j) = (self.run.len(), x.len());
+                let mut w = i + j;
+                self.run.resize(w, PRec { person: 0, ts: 0, pc: 0 });
+                while j > 0 {
+                    if i > 0 && self.run[i - 1].ts > x[j - 1].ts {
+                        self.run[w - 1] = self.run[i - 1];
+                        i -= 1;
+                    } else {
+                        self.run[w - 1] = x[j - 1];
+                        j -= 1;
+                    }
+                    w -= 1;
+                }
+            }
+        }
         self.finish(sh, frags[0].ui, unsorted);
         self.run.clear();
     }
@@ -1096,7 +1146,12 @@ pub(crate) fn run(
     let nb_e = ((k.ncap >> k.shift) + 1) as usize;
     let nb_c = ((k.ucap >> CSHIFT) + 1) as usize;
     let next = AtomicUsize::new(0);
-    let (parts, utab) = {
+    let mut utab: Blob<u32> = Blob::zeroed(k.ucap as usize);
+    // the same words, shared while every thread fills them
+    let scratch: &[AtomicU32] = unsafe { std::slice::from_raw_parts(utab.as_mut_ptr() as *const AtomicU32, utab.len()) };
+    let unext = AtomicUsize::new(0);
+    let utab_ns = AtomicU64::new(0);
+    let (parts, t_links) = {
         let cx: &Ctx = ctx;
         let work = || -> Parsed {
             let mut st = PSt {
@@ -1122,21 +1177,33 @@ pub(crate) fn run(
                     parse_cl(cx, k, i_cl.start, fi, a, b, &mut st);
                 }
             }
+            // whoever is done parsing helps build the user table from the links
+            cx.wait_links();
+            let tu = std::time::Instant::now();
+            loop {
+                let lo = unext.fetch_add(1, Ordering::Relaxed) * UTAB_STEP;
+                if lo >= cx.links().link.slots.len() {
+                    break;
+                }
+                utab_range(cx.links(), k, scratch, lo, lo + UTAB_STEP);
+            }
+            utab_ns.fetch_add(tu.elapsed().as_nanos() as u64, Ordering::Relaxed);
             Parsed { es: st.es.finish(), cs: st.cs.finish(), odd: st.odd, esc: st.esc, oddc: st.oddc, maxc: st.maxc, rows: st.rows }
         };
         std::thread::scope(|s| {
             let hs: Vec<_> = (1..nt).map(|_| s.spawn(work)).collect();
             let links = build_links(&cx.maps, i_lk.clone());
-            let utab = build_utab(&links, k);
+            let t_links = t0.elapsed();
             // the fast parsers never read links, so publishing now is safe
             cx.set_links(links);
             let mut parts = vec![work()];
             for h in hs {
                 parts.push(h.join().unwrap());
             }
-            (parts, utab)
+            (parts, t_links)
         })
     };
+    finish_utab(&mut utab);
     let u: &[u32] = &utab;
     if timing {
         let ng = u.iter().filter(|&&e| e & GENERAL != 0).count();
@@ -1169,6 +1236,7 @@ pub(crate) fn run(
     }
     let eb = merge_blocks(eparts, nb_e);
     let cbk = merge_blocks(cparts, nb_c);
+    let t_merged = t0.elapsed();
     let gbits = ctx.per_bits.min(10);
     let nbg = 1usize << gbits;
     let gbk = |person: u64| -> usize {
@@ -1324,8 +1392,9 @@ pub(crate) fn run(
     }
 
     // ---- walk the counters
-    // about one output row per nine events, with room to spare
-    let out_rows = rows * 3 / (16 * nt.max(1)) + 4096;
+    let t_odd = t0.elapsed();
+    // a fair share at one row per event: far more than needed, and untouched pages cost nothing
+    let out_rows = rows / nt.max(1) + 4096;
     let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows, forced: &forced, defer: &defer, seen: &seen, bad: &bad, cl0, gbits };
     let sh = &sh;
     let nbu = ((maxc >> k.shift) + 1) as usize;
@@ -1385,8 +1454,14 @@ pub(crate) fn run(
                         if g >= groups.len() {
                             break;
                         }
-                        let (_, a, b) = groups[g];
+                        let (n, a, b) = groups[g];
+                        let tg = std::time::Instant::now();
                         w.0.group(sh, &frags[a..b]);
+                        let ns = tg.elapsed().as_nanos();
+                        w.0.regroup_ns += ns;
+                        if ns > w.0.slowest.0 {
+                            w.0.slowest = (ns, n);
+                        }
                     }
                     w
                 })
@@ -1405,8 +1480,11 @@ pub(crate) fn run(
     // ---- hand the folded rows back unwritten
     let mut outs: Vec<Out> = Vec::new();
     let (mut n_inline, mut n_general) = (0usize, 0usize);
+    let (mut slowest, mut regroup_ns) = ((0u128, 0usize), 0u128);
     for w in wks {
         let w = w.0;
+        regroup_ns += w.regroup_ns;
+        slowest = slowest.max(w.slowest);
         n_inline += w.inline_ev;
         n_general += w.general_ev;
         xn.extend_from_slice(&w.xn);
@@ -1421,11 +1499,19 @@ pub(crate) fn run(
     cb.resize_with(nb_per, Vec::new);
     if timing {
         eprintln!(
-            "  fast: parse {:?} clicks {:?} walk {:?} stitch {:?} | rows {} odd {} esc {} odd clicks {} | folded here {} general {} groups {}",
+            "  fast: links {:?} (main thread, in parse) user table {:?} thread time | parse {:?} merge {:?} clicks {:?} odd {:?} walk {:?} regroup {:?} (thread time {:?}, longest {:?} for {} events) tail {:?} | rows {} odd {} esc {} odd clicks {} | folded here {} general {} groups {}",
+            t_links,
+            std::time::Duration::from_nanos(utab_ns.load(Ordering::Relaxed)),
             t_parse,
-            t_cg - t_parse,
-            t_walk - t_cg,
+            t_merged - t_parse,
+            t_cg - t_merged,
+            t_odd - t_cg,
+            t_walk - t_odd,
             t_stitch - t_walk,
+            std::time::Duration::from_nanos(regroup_ns as u64),
+            std::time::Duration::from_nanos(slowest.0 as u64),
+            slowest.1,
+            t0.elapsed() - t_stitch,
             rows,
             odd.len(),
             esc.len(),
@@ -1465,32 +1551,48 @@ mod tests {
     }
 
     #[test]
-    fn b36w_matches_reference() {
+    fn row_decoders_match_the_byte_loop() {
+        let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 39, ucap: 1 << 22, shift: 12 };
+        let chk = |b: &[u8], es: usize, ee: usize, us: usize, ue: usize| {
+            let want = (k.counter(&b[es..ee]), k.user(&b[us..ue]).unwrap_or(NONE));
+            assert_eq!(k.event_at(b, es, ee, us, ue), want, "{:?} {:?}", &b[es..ee], &b[us..ue]);
+            if us < ue {
+                assert_eq!(k.user_at(b, us, ue), want.1, "{:?}", &b[us..ue]);
+            }
+            for w in [(es + 1, ee), (us + 1, ue)] {
+                if w.1 >= 8 && w.1 > w.0 && w.1 - w.0 <= 8 {
+                    let word = unsafe { digits_word(b, w.1, w.1 - w.0) };
+                    let lane = pair36(word, word);
+                    assert_eq!(swar36(word), lane.0, "{:?}", &b[w.0..w.1]);
+                    assert_eq!(lane.0, lane.1);
+                }
+            }
+        };
         // every byte value at every position of every length
-        let mut buf = vec![b'q'; 40];
-        for n in 0..=10usize {
-            for s in [0usize, 1, 3, 7, 8, 9, 20] {
-                let e = s + n;
-                for pos in s..e.max(s + 1).min(40) {
-                    for c in 0..=255u8 {
-                        for fill in [b'0', b'7', b'a', b'z', b'1'] {
-                            for x in buf.iter_mut() {
-                                *x = b',';
-                            }
-                            for x in buf[s..e].iter_mut() {
-                                *x = fill;
-                            }
-                            if pos < e {
-                                buf[pos] = c;
-                            }
-                            let want = crate::genid::b36(&buf[s..e]);
-                            assert_eq!(b36w(&buf, s, e), want, "{:?}", &buf[s..e]);
-                            if e >= 8 {
-                                assert_eq!(word(&buf, s, e).and_then(swar36), want, "{:?}", &buf[s..e]);
-                            }
-                            assert_eq!(b36pair(&buf, s, e, 28, 33), (want, crate::genid::b36(&buf[28..33])), "{:?}", &buf[s..e]);
-                            assert_eq!(b36pair(&buf, 29, 37, s, e), (crate::genid::b36(&buf[29..37]), want), "{:?}", &buf[s..e]);
+        for pre in [0usize, 3, 8, 11] {
+            for ne in 1..=11usize {
+                for nu in 0..=11usize {
+                    let mut b = vec![b'x'; pre];
+                    let es = b.len();
+                    b.push(b'e');
+                    b.extend(std::iter::repeat(b'7').take(ne - 1));
+                    let ee = b.len();
+                    b.push(b',');
+                    let us = b.len();
+                    if nu > 0 {
+                        b.push(b'u');
+                        b.extend(std::iter::repeat(b'z').take(nu - 1));
+                    }
+                    let ue = b.len();
+                    b.extend_from_slice(b",tail");
+                    chk(&b, es, ee, us, ue);
+                    for pos in (es..ee).chain(us..ue) {
+                        let keep = b[pos];
+                        for c in 0..=255u8 {
+                            b[pos] = c;
+                            chk(&b, es, ee, us, ue);
                         }
+                        b[pos] = keep;
                     }
                 }
             }
@@ -1498,29 +1600,23 @@ mod tests {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
         let dig = b"0123456789abcdefghijklmnopqrstuvwxyz";
         for _ in 0..200_000 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let n = (x % 9) as usize;
-            let mut y = x >> 8;
-            let mut b = b"xxxxxxxxxx,u".to_vec();
-            let s = b.len();
-            for _ in 0..n {
-                b.push(dig[(y % 36) as usize]);
-                y /= 36;
+            let mut b = b"xxxxxxxxxx,".to_vec();
+            let mut ends = [0usize; 4];
+            for (i, lead) in [b'e', b'u'].into_iter().enumerate() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ends[2 * i] = b.len();
+                b.push(lead);
+                let mut y = x >> 8;
+                for _ in 0..x % 9 {
+                    b.push(dig[(y % 36) as usize]);
+                    y /= 36;
+                }
+                ends[2 * i + 1] = b.len();
+                b.push(b',');
             }
-            let e = b.len();
-            b.extend_from_slice(b",rest");
-            assert_eq!(b36w(&b, s, e), crate::genid::b36(&b[s..e]), "{:?}", &b[s..e]);
-            let want = crate::genid::b36(&b[s..e]);
-            assert_eq!(b36pair(&b, s, e, 2, 10), (want, None));
-            assert_eq!(b36pair(&b, s, e, s, e), (want, want));
-            let mut two = b[s..e].to_vec();
-            two.extend_from_slice(b"|0az19zz|");
-            two.extend_from_slice(&b[s..e]);
-            let m = two.len();
-            assert_eq!(b36pair(&two, m - n, m, n + 1, n + 8), (want, crate::genid::b36(b"0az19zz")));
-            assert_eq!(b36pair(&two, n + 2, n + 8, m - n, m), (crate::genid::b36(b"az19zz"), want));
+            chk(&b, ends[0], ends[1], ends[2], ends[3]);
         }
     }
 
