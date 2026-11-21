@@ -2655,6 +2655,9 @@ fn main() {
             );
         }
     }
+    if std::env::var_os("SS_KEEPMAPS").is_none() {
+        sys::drop_pages(&ctx.maps, nt);
+    }
     // both tables are closed: let the kernel free everything at once
     std::process::exit(0);
 }
