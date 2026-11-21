@@ -19,8 +19,9 @@ const GAP_MS: u32 = 1_800_000;
 const LATE_MS: i64 = 86_400_000;
 const WEEK: u32 = 604_800_000;
 
-const NB_EID: usize = 2048; // event-id shuffle buckets
-const NB_PER: usize = 1024; // person shuffle buckets
+// Shuffle fanout is chosen from the input size so a bucket's dedup table and
+// person table stay inside L2 whatever the dataset size.
+const ROWS_PER_BUCKET: usize = 24_000;
 const BLK_E: usize = 512;
 const BLK_P: usize = 512;
 
@@ -81,6 +82,8 @@ struct Ctx {
     unknown_cat: u32,
     chan: Vec<u32>, // campaign index -> channel index
     chans: Vec<Vec<u8>>,
+    eid_bits: u32,
+    per_bits: u32,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -332,24 +335,42 @@ fn first_line_start(d: &[u8], start: usize) -> usize {
     (i + 1).min(d.len())
 }
 
-fn parse_events(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<ERec>) {
+static ACC: AtomicUsize = AtomicUsize::new(0);
+
+/// `ABL` is a diagnostic: 0 is the real thing, higher levels stop early so the
+/// cost of each parse step can be measured. It is a const, so only the level-0
+/// code survives in the shipping call.
+fn parse_events<const ABL: u32>(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<ERec>, dc: &mut DateCache) {
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
+    let mut acc = 0usize;
     while p < to {
         let sc = scan_line(d, p);
         let line = &d[p..sc.nl];
         let lp = p;
         p = sc.nl + 1;
+        if ABL == 1 {
+            acc += sc.nc ^ sc.nl ^ (sc.qm as usize);
+            continue;
+        }
         let f = match fields::<7>(line, &sc) {
             Some(f) => f,
             None => continue,
         };
+        if ABL == 2 {
+            acc += f[3].0 as usize ^ f[6].1 as usize;
+            continue;
+        }
         let eid = &line[f[0].0 as usize..f[0].1 as usize];
         if eid.is_empty() {
             continue;
         }
         let (klo, khi) = key96(eid);
-        let ing_ms = parse_ts(&line[f[3].0 as usize..f[3].1 as usize]).unwrap_or(i64::MIN);
+        if ABL == 3 {
+            acc += klo as usize ^ khi as usize;
+            continue;
+        }
+        let ing_ms = parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc).unwrap_or(0);
         let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
 
         let mut tsf = 0u32;
@@ -361,14 +382,18 @@ fn parse_events(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<ER
             if user.is_empty() {
                 break;
             }
-            let ts = match parse_ts(&line[f[2].0 as usize..f[2].1 as usize]) {
+            let ts = match parse_ts_c(&line[f[2].0 as usize..f[2].1 as usize], dc) {
                 Some(t) => t,
                 None => break,
             };
             if ts < ctx.ev_lo || ts >= ctx.ev_hi {
                 break;
             }
-            if ing_ms - ts > LATE_MS {
+            if ABL == 4 {
+                acc += ts as usize;
+                break;
+            }
+            if ing_ms.saturating_sub(ts) > LATE_MS {
                 break;
             }
             let ety = &line[f[4].0 as usize..f[4].1 as usize];
@@ -398,17 +423,28 @@ fn parse_events(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<ER
                 };
                 pc = (ctx.cat_of(pid) << 24) | price;
             }
+            if ABL == 5 {
+                acc += pid.len() ^ pc as usize;
+                break;
+            }
             person = ctx.person_of(user);
             sref = sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize);
             tsf = (ts - ctx.base) as u32 | 0x8000_0000;
             break;
         }
-        let b = (mix(klo ^ (khi as u64), 0x9e37_79b9_7f4a_7c15) >> (64 - 11)) as usize;
+        let b = (mix(klo ^ (khi as u64), 0x9e37_79b9_7f4a_7c15) >> (64 - ctx.eid_bits)) as usize;
+        if ABL == 6 {
+            acc += b ^ tsf as usize ^ pc as usize ^ person as usize ^ sref as usize ^ ing as usize;
+            continue;
+        }
         sink.push(b, ERec { klo, khi, ing, person, sref, tsf, pc });
+    }
+    if ABL != 0 {
+        ACC.fetch_add(acc, Ordering::Relaxed);
     }
 }
 
-fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CRec>) {
+fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CRec>, dc: &mut DateCache) {
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
     while p < to {
@@ -427,7 +463,7 @@ fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CR
         if user.is_empty() {
             continue;
         }
-        let ts = match parse_ts(&line[f[3].0 as usize..f[3].1 as usize]) {
+        let ts = match parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc) {
             Some(t) => t,
             None => continue,
         };
@@ -440,14 +476,14 @@ fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CR
         };
         let person = ctx.person_of(user);
         let sref = sref_of(fi, lp + f[0].0 as usize, (f[0].1 - f[0].0) as usize);
-        let b = (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - 10)) as usize;
+        let b = (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - ctx.per_bits)) as usize;
         sink.push(b, CRec { person, sref, ts: (ts - ctx.base) as u32, camp });
     }
 }
 
 #[inline(always)]
-fn person_bucket(person: u64) -> usize {
-    (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - 10)) as usize
+fn person_bucket(person: u64, bits: u32) -> usize {
+    (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - bits)) as usize
 }
 
 // --------------------------------------------------------------- dedup stage
@@ -461,7 +497,7 @@ struct DEnt {
     ptr: *const ERec,
 }
 
-fn dedup_bucket(blocks: &[Blk<ERec>], tbl: &mut Vec<DEnt>, sink: &mut Sink<PRec>) {
+fn dedup_bucket(blocks: &[Blk<ERec>], tbl: &mut Vec<DEnt>, sink: &mut Sink<PRec>, per_bits: u32) {
     let n: usize = blocks.iter().map(|b| b.len as usize).sum();
     if n == 0 {
         return;
@@ -495,7 +531,7 @@ fn dedup_bucket(blocks: &[Blk<ERec>], tbl: &mut Vec<DEnt>, sink: &mut Sink<PRec>
             let r = unsafe { &*e.ptr };
             if r.tsf & 0x8000_0000 != 0 {
                 sink.push(
-                    person_bucket(r.person),
+                    person_bucket(r.person, per_bits),
                     PRec { person: r.person, sref: r.sref, ts: r.tsf & 0x7fff_ffff, pc: r.pc },
                 );
             }
@@ -801,6 +837,7 @@ struct Fold {
     dense: Vec<u32>,
     cdense: Vec<u32>,
     persons: Vec<(u64, u64)>,
+    pslot: Vec<u32>,
     ecnt: Vec<u32>,
     ccnt: Vec<u32>,
     epos: Vec<u32>,
@@ -858,7 +895,7 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
     if n == 0 {
         return;
     }
-    let Fold { ev, cl, dense, cdense, persons, ecnt, ccnt, epos, cpos, cur, tbl, t, o } = f;
+    let Fold { ev, cl, dense, cdense, persons, pslot, ecnt, ccnt, epos, cpos, cur, tbl, t, o } = f;
 
     // ---- pass 1: intern person keys, count rows per person
     let mut want = (n / 2 + 8).next_power_of_two().max(64);
@@ -867,6 +904,7 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
     }
     let mut mask = want - 1;
     persons.clear();
+    pslot.clear();
     ecnt.clear();
     dense.clear();
     dense.reserve(n);
@@ -877,6 +915,7 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
                 let d = persons.len() as u32;
                 tbl[i] = (r.person, d);
                 persons.push((r.person, r.sref));
+                pslot.push(i as u32);
                 ecnt.push(0);
                 // keep the load factor under ~0.6
                 if persons.len() * 5 > want * 3 {
@@ -889,9 +928,11 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
                     }
                     want = nw;
                     mask = nw - 1;
+                    pslot.clear();
                     for (k, &(key, _)) in persons.iter().enumerate() {
                         let j = tprobe(tbl, mask, key);
                         tbl[j] = (key, k as u32);
+                        pslot.push(j as u32);
                     }
                 }
                 d
@@ -1018,10 +1059,11 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
         process_person(ctx, &ev[es..ee], &cl[cs..ce], t, o, name);
     }
 
-    // ---- leave the table empty for the next bucket
-    for &(key, _) in persons.iter() {
-        let i = tprobe(tbl, mask, key);
-        tbl[i] = (0, 0);
+    // ---- leave the table empty for the next bucket. Clear the recorded
+    // slots directly: probing again would stop at a slot already zeroed and
+    // leave live entries behind.
+    for &i in pslot.iter() {
+        tbl[i as usize] = (0, 0);
     }
 }
 
@@ -1428,6 +1470,20 @@ fn main() {
     // ---- links
     let links = build_links(&maps, i_lk.clone(), nt);
 
+    let ev_bytes: usize = i_ev.clone().map(|i| maps[i].len).sum();
+    let cl_bytes: usize = i_cl.clone().map(|i| maps[i].len).sum();
+    let est_rows = ev_bytes / 70 + 1;
+    let bits = {
+        let mut b = 8u32;
+        while b < 13 && (1usize << b) * ROWS_PER_BUCKET < est_rows {
+            b += 1;
+        }
+        b
+    };
+    let eid_bits = bits;
+    let per_bits = bits.min(12);
+    let nb_eid = 1usize << eid_bits;
+    let nb_per = 1usize << per_bits;
     let day0 = ws.div_euclid(DAY_MS);
     let day_last = (we - 1).div_euclid(DAY_MS);
     let ndays = (day_last - day0 + 1) as usize;
@@ -1452,10 +1508,68 @@ fn main() {
         unknown_cat,
         chan,
         chans,
+        eid_bits,
+        per_bits,
     };
 
-    let total_bytes: usize = i_ev.clone().chain(i_cl.clone()).map(|i| ctx.maps[i].len).sum();
-    let arena = Arena::new(total_bytes * 2 + (3 << 30));
+    let arena = Arena::new((ev_bytes + cl_bytes) * 2 + (3 << 30));
+
+    // ---- optional parse micro-benchmark: SS_BENCH=<ablation level>
+    if let Ok(lv) = std::env::var("SS_BENCH") {
+        let lv: u32 = lv.parse().unwrap_or(0);
+        const CH: usize = 1 << 20;
+        let mut cks: Vec<(usize, usize, usize)> = Vec::new();
+        let mut nb = 0usize;
+        for fi in i_ev.clone() {
+            let n = ctx.maps[fi].len;
+            nb += n;
+            let mut a = 0;
+            while a < n {
+                cks.push((fi, a, (a + CH).min(n)));
+                a += CH;
+            }
+        }
+        for _ in 0..3 {
+            let ar = Arena::new(nb * 2 + (1 << 30));
+            let next = AtomicUsize::new(0);
+            let t = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for _ in 0..nt {
+                    let next = &next;
+                    let cks = &cks;
+                    let ctx = &ctx;
+                    let ar = &ar;
+                    s.spawn(move || {
+                        let mut es = Sink::<ERec>::new(ar, nb_eid, BLK_E);
+                        let mut dc = DateCache::new();
+                        loop {
+                            let k = next.fetch_add(1, Ordering::Relaxed);
+                            if k >= cks.len() {
+                                break;
+                            }
+                            let (fi, a, b) = cks[k];
+                            match lv {
+                                1 => parse_events::<1>(ctx, fi, a, b, &mut es, &mut dc),
+                                2 => parse_events::<2>(ctx, fi, a, b, &mut es, &mut dc),
+                                3 => parse_events::<3>(ctx, fi, a, b, &mut es, &mut dc),
+                                4 => parse_events::<4>(ctx, fi, a, b, &mut es, &mut dc),
+                                5 => parse_events::<5>(ctx, fi, a, b, &mut es, &mut dc),
+                                6 => parse_events::<6>(ctx, fi, a, b, &mut es, &mut dc),
+                                _ => parse_events::<0>(ctx, fi, a, b, &mut es, &mut dc),
+                            }
+                        }
+                        std::mem::forget(es);
+                    });
+                }
+            });
+            let el = t.elapsed();
+            eprintln!(
+                "bench lv={} {:?}  {:.2} GB/s  acc {}",
+                lv, el, nb as f64 / el.as_secs_f64() / 1e9, ACC.load(Ordering::Relaxed)
+            );
+        }
+        return;
+    }
 
     // ---- parse
     const CHUNK: usize = 1 << 20;
@@ -1487,8 +1601,9 @@ fn main() {
                 let ctx = &ctx;
                 let arena = &arena;
                 s.spawn(move || {
-                    let mut es = Sink::<ERec>::new(arena, NB_EID, BLK_E);
-                    let mut cs = Sink::<CRec>::new(arena, NB_PER, BLK_P);
+                    let mut es = Sink::<ERec>::new(arena, nb_eid, BLK_E);
+                    let mut cs = Sink::<CRec>::new(arena, nb_per, BLK_P);
+                    let mut dc = DateCache::new();
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         if k >= chunks.len() {
@@ -1496,9 +1611,9 @@ fn main() {
                         }
                         let (kind, fi, a, b) = chunks[k];
                         if kind == 0 {
-                            parse_events(ctx, fi as usize, a, b, &mut es);
+                            parse_events::<0>(ctx, fi as usize, a, b, &mut es, &mut dc);
                         } else {
-                            parse_clicks(ctx, fi as usize, a, b, &mut cs);
+                            parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc);
                         }
                     }
                     (es.finish(), cs.finish())
@@ -1511,8 +1626,8 @@ fn main() {
             cparts.push(c);
         }
     });
-    let ebuckets = merge_blocks(eparts, NB_EID);
-    let cbuckets = merge_blocks(cparts, NB_PER);
+    let ebuckets = merge_blocks(eparts, nb_eid);
+    let cbuckets = merge_blocks(cparts, nb_per);
     let t_parse = t0.elapsed();
 
     // ---- dedup
@@ -1525,14 +1640,15 @@ fn main() {
                 let ebuckets = &ebuckets;
                 let arena = &arena;
                 s.spawn(move || {
-                    let mut sink = Sink::<PRec>::new(arena, NB_PER, BLK_P);
+                    let mut sink = Sink::<PRec>::new(arena, nb_per, BLK_P);
                     let mut tbl: Vec<DEnt> = Vec::new();
+                    let pb = per_bits;
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
-                        if k >= NB_EID {
+                        if k >= nb_eid {
                             break;
                         }
-                        dedup_bucket(&ebuckets[k], &mut tbl, &mut sink);
+                        dedup_bucket(&ebuckets[k], &mut tbl, &mut sink, pb);
                     }
                     sink.finish()
                 })
@@ -1542,7 +1658,7 @@ fn main() {
             pparts.push(h.join().unwrap());
         }
     });
-    let pbuckets = merge_blocks(pparts, NB_PER);
+    let pbuckets = merge_blocks(pparts, nb_per);
     let t_dedup = t0.elapsed();
 
     // ---- fold + write user_daily
@@ -1569,6 +1685,7 @@ fn main() {
                         dense: Vec::new(),
                         cdense: Vec::new(),
                         persons: Vec::new(),
+                        pslot: Vec::new(),
                         ecnt: Vec::new(),
                         ccnt: Vec::new(),
                         epos: Vec::new(),
@@ -1603,7 +1720,7 @@ fn main() {
                     };
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
-                        if k >= NB_PER {
+                        if k >= nb_per {
                             break;
                         }
                         fold_bucket(ctx, &mut f, &pbuckets[k], &cbuckets[k]);

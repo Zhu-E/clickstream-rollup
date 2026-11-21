@@ -287,3 +287,264 @@ impl Map64 {
         }
     }
 }
+
+// ------------------------------------------------- fast timestamp parsing
+
+/// True when all eight bytes are ASCII digits.
+#[inline(always)]
+fn digits8(w: u64) -> bool {
+    const HN: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const Z: u64 = 0x3030_3030_3030_3030;
+    (w & HN) == Z && (w.wrapping_add(0x0606_0606_0606_0606) & HN) == Z
+}
+
+/// Eight ASCII digits, most significant first, to a number.
+#[inline(always)]
+fn val8(w: u64) -> u64 {
+    let x = w.wrapping_sub(0x3030_3030_3030_3030);
+    let y = (x & 0x000f_000f_000f_000f) * 10 + ((x >> 8) & 0x000f_000f_000f_000f);
+    let z = (y & 0x0000_00ff_0000_00ff) * 100 + ((y >> 16) & 0x0000_00ff_0000_00ff);
+    (z & 0xffff) * 10000 + ((z >> 32) & 0xffff)
+}
+
+/// `HH:MM:SS` at `b[11..19]` as milliseconds into the day.
+#[inline(always)]
+fn time_ms(b: &[u8]) -> Option<i64> {
+    let w = rd8(b, 11);
+    // ':' at word bytes 2 and 5
+    if (w & 0x0000_ff00_00ff_0000) != 0x0000_3a00_003a_0000 {
+        return None;
+    }
+    // replace the separators with '0' so one digit test covers the word
+    let y = (w & !0x0000_ff00_00ff_0000) | 0x0000_3000_0030_0000;
+    if !digits8(y) {
+        return None;
+    }
+    let h = (b[11] - b'0') as i64 * 10 + (b[12] - b'0') as i64;
+    let m = (b[14] - b'0') as i64 * 10 + (b[15] - b'0') as i64;
+    let s = (b[17] - b'0') as i64 * 10 + (b[18] - b'0') as i64;
+    if h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    Some((h * 3600 + m * 60 + s) * 1000)
+}
+
+/// Caches `YYYY-MM-DD` -> days since the epoch. A dataset's window spans a
+/// couple of weeks, so a handful of dates cover almost every row.
+pub struct DateCache {
+    klo: [u64; 64],
+    khi: [u16; 64],
+    val: [i64; 64],
+}
+
+const BAD: i64 = i64::MIN;
+
+impl DateCache {
+    pub fn new() -> DateCache {
+        DateCache { klo: [1; 64], khi: [0; 64], val: [BAD; 64] }
+    }
+    #[inline(always)]
+    fn days(&mut self, b: &[u8]) -> Option<i64> {
+        let k = rd8(b, 0);
+        let k2 = u16::from_le_bytes([b[8], b[9]]);
+        let i = (((b[8] as usize) << 4) ^ (b[9] as usize)) & 63;
+        unsafe {
+            if *self.klo.get_unchecked(i) == k && *self.khi.get_unchecked(i) == k2 {
+                let v = *self.val.get_unchecked(i);
+                return if v == BAD { None } else { Some(v) };
+            }
+        }
+        let v = date_days(b);
+        self.klo[i] = k;
+        self.khi[i] = k2;
+        self.val[i] = v.unwrap_or(BAD);
+        v
+    }
+}
+
+/// Validate `YYYY-MM-DD` and convert to days since the epoch.
+#[inline(never)]
+fn date_days(b: &[u8]) -> Option<i64> {
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let w = (rd8(b, 0) & !0xff00_00ff_0000_0000) | 0x3000_0030_0000_0000; // '-' -> '0'
+    if !digits8(w) || !(b[8].wrapping_sub(b'0') <= 9) || !(b[9].wrapping_sub(b'0') <= 9) {
+        return None;
+    }
+    let y = (val8(w) / 10_000) as u32;
+    let mo = ((b[5] - b'0') * 10 + (b[6] - b'0')) as u32;
+    let d = ((b[8] - b'0') * 10 + (b[9] - b'0')) as u32;
+    if mo < 1 || mo > 12 || d < 1 || d > days_in_month(y, mo) {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
+/// Digits-only epoch milliseconds, fast path for up to 18 digits.
+#[inline(always)]
+fn epoch_fast(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n == 0 {
+        return None;
+    }
+    if n > 18 {
+        return parse_epoch_ms(b);
+    }
+    let mut v: u64 = 0;
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let w = rd8(b, i);
+        if !digits8(w) {
+            return None;
+        }
+        v = v * 100_000_000 + val8(w);
+        i += 8;
+    }
+    while i < n {
+        let d = unsafe { *b.get_unchecked(i) }.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        v = v * 10 + d as u64;
+        i += 1;
+    }
+    Some(v as i64)
+}
+
+/// Same contract as `parse_ts`, with the date cache in front.
+#[inline(always)]
+pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let n = b.len();
+    if n == 20 {
+        if b[19] != b'Z' || b[10] != b'T' {
+            return epoch_fast(b);
+        }
+        let days = dc.days(b)?;
+        Some(days * DAY_MS + time_ms(b)?)
+    } else if n == 25 && (b[19] == b'+' || b[19] == b'-') {
+        if b[10] != b'T' || b[22] != b':' {
+            return None;
+        }
+        let days = dc.days(b)?;
+        let base = days * DAY_MS + time_ms(b)?;
+        let oh = d2(b, 20)?;
+        let om = d2(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let off = (oh as i64 * 3600 + om as i64 * 60) * 1000;
+        Some(if b[19] == b'+' { base - off } else { base + off })
+    } else {
+        epoch_fast(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn both(x: &str) -> (Option<i64>, Option<i64>) {
+        let mut dc = DateCache::new();
+        (parse_ts(x.as_bytes()), parse_ts_c(x.as_bytes(), &mut dc))
+    }
+
+    #[test]
+    fn timestamps_agree() {
+        let cases = [
+            "2026-10-03T23:58:10Z",
+            "2026-10-03T19:58:10-04:00",
+            "2026-10-03T23:58:10+00:00",
+            "2026-10-03T23:58:10-00:00",
+            "2026-10-04T11:58:10+12:00",
+            "1791071890000",
+            "0001791071890000",
+            "86400000",
+            "0",
+            "",
+            "2026-10-03T23:58:10.5Z",
+            "2026-10-03t23:58:10Z",
+            "2026-10-03T23:58:10z",
+            "2026-10-03 23:58:10Z",
+            "2026-10-03T23:58:10",
+            "2026-13-03T23:58:10Z",
+            "2026-02-30T23:58:10Z",
+            "2027-02-29T00:00:00Z",
+            "2028-02-29T00:00:00Z",
+            "2026-10-03T24:00:00Z",
+            "2026-10-03T23:60:10Z",
+            "2026-10-03T23:58:60Z",
+            "2026-10-03T23:58:10+24:00",
+            "2026-10-03T23:58:10+05:60",
+            "2026-10-03T23:58:10+0200",
+            "1791071890000.0",
+            "1.79e12",
+            "-5",
+            "99999999999999999999999999",
+            "2026-00-03T23:58:10Z",
+            "2026-10-00T23:58:10Z",
+            "2026-10-32T23:58:10Z",
+            "202X-10-03T23:58:10Z",
+            "2026-1O-03T23:58:10Z",
+            "2026-10-03X23:58:10Z",
+            "2026-10-03T23X58:10Z",
+            "2026-10-03T23:58X10Z",
+            " 1791071890000",
+            "1791071890000 ",
+            "2026-10-03T23:58:10Y",
+            "2100-02-29T00:00:00Z",
+            "2000-02-29T00:00:00Z",
+            "9999-12-31T23:59:59Z",
+            "0001-01-01T00:00:00Z",
+        ];
+        for c in cases {
+            let (a, b) = both(c);
+            assert_eq!(a, b, "mismatch for {:?}: slow {:?} fast {:?}", c, a, b);
+        }
+    }
+
+    #[test]
+    fn date_cache_holds_many_dates() {
+        let mut dc = DateCache::new();
+        for y in [2025u32, 2026, 2027, 2028] {
+            for m in 1..=12u32 {
+                for d in 1..=31u32 {
+                    let s = format!("{:04}-{:02}-{:02}T12:34:56Z", y, m, d);
+                    let a = parse_ts(s.as_bytes());
+                    let b = parse_ts_c(s.as_bytes(), &mut dc);
+                    assert_eq!(a, b, "{}", s);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_digits() {
+        let mut dc = DateCache::new();
+        for n in 1..=25usize {
+            for seed in 0..40u64 {
+                let v = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) % 10u64.pow(n.min(19) as u32);
+                let s = format!("{:0width$}", v, width = n);
+                let a = parse_ts(s.as_bytes());
+                let b = parse_ts_c(s.as_bytes(), &mut dc);
+                assert_eq!(a, b, "{}", s);
+            }
+        }
+    }
+
+    #[test]
+    fn key96_is_injective_for_short_ids() {
+        let ids: Vec<Vec<u8>> = vec![
+            b"".to_vec(), b"e".to_vec(), b"ea".to_vec(), b"e42huhoug".to_vec(),
+            b"e42huhouG".to_vec(), b"e42huhou".to_vec(), b"01234567890".to_vec(),
+            b"0123456789".to_vec(), b" e1".to_vec(), b"e1 ".to_vec(),
+        ];
+        for i in 0..ids.len() {
+            for j in 0..ids.len() {
+                let a = key96(&ids[i]);
+                let b = key96(&ids[j]);
+                assert_eq!(a == b, i == j, "{:?} vs {:?}", ids[i], ids[j]);
+            }
+        }
+    }
+}
