@@ -1889,8 +1889,7 @@ fn main() {
         return;
     }
 
-    // ---- the fast path, when the ids are the generator's; it leaves the
-    // general stages below only the persons it could not fold itself
+    // ---- fast path; the stages below then see only what it left over
     let fast_out = match &fkeys {
         Some(k) => fast::run(&mut ctx, k, &arena, i_ev.clone(), i_cl.clone(), i_lk.clone(), &outdir, nt),
         None => None,

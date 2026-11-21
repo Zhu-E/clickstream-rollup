@@ -1,9 +1,4 @@
-// The fast path. When event and user ids are the generator's scrambled
-// counters, an id decodes to a small number: dedup becomes one slot per
-// counter, and walking the slots in order visits one user at a time with
-// timestamps already ascending. Every property is checked per row or per
-// run; whatever does not fit goes to the general fold, or the whole run
-// falls back to the general pipeline.
+// fast path: ids decode to counters, so dedup is a slot and order is free
 use crate::genid::{half, scramble, unscramble, A, AINV, M40};
 use crate::*;
 use std::collections::HashMap;
@@ -33,8 +28,7 @@ pub(crate) struct Keys {
     shift: u32,
 }
 
-/// a: ts:31 | user:31 | tag:2      b: pc:32 | delta:17 | counter low:15
-/// dead and escaped rows keep only: b = ingest:32 | 0:17 | counter low:15
+/// a = ts:31 user:31 tag:2, b = pc:32 delta:17 slot:15 (dead, escaped: ingest:32 0:17 slot:15)
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct FRec {
@@ -42,7 +36,7 @@ struct FRec {
     b: u64,
 }
 
-/// a: user:22 | ts:31 | alias:9    b: camp:16 | file:8 | offset:36 | len:4
+/// a = user:22 ts:31 alias:9, b = camp:16 file:8 offset:36 len:4
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct FC {
@@ -134,8 +128,7 @@ fn b36f(b: &[u8]) -> Option<u64> {
 
 const L8: u64 = 0x0101_0101_0101_0101;
 
-/// The eight bytes that end at `e`, with the ones before `s` read as '0'.
-/// None unless the id is 1 to 8 bytes with no leading zero.
+/// the 8 bytes ending at `e`, zero-filled before `s`; none unless 1-8 digits, no leading zero
 #[inline(always)]
 fn word(d: &[u8], s: usize, e: usize) -> Option<u64> {
     let n = e.wrapping_sub(s);
@@ -146,8 +139,7 @@ fn word(d: &[u8], s: usize, e: usize) -> Option<u64> {
     Some(if n == 8 { w } else { (w & (!0u64 << (64 - 8 * n))) | ((L8 * 0x30) >> (8 * n)) })
 }
 
-/// Eight base-36 digits, first digit in the low byte: digit values, checked
-/// by encoding them back, then folded up in pairs.
+/// eight base-36 digits, first in the low byte; checked by encoding back
 #[inline(always)]
 fn swar36(w: u64) -> Option<u64> {
     let alpha = (w >> 6) & L8;
@@ -223,8 +215,7 @@ fn b36pair(d: &[u8], s0: usize, e0: usize, s1: usize, e1: usize) -> (Option<u64>
 }
 
 impl Keys {
-    /// the counter of the non-empty event id at `d[es..ee]` and `user` of
-    /// the id at `d[us..ue]`
+    /// counter of the non-empty event id and `user` of the user id
     #[inline(always)]
     fn event_at(&self, d: &[u8], es: usize, ee: usize, us: usize, ue: usize) -> (Option<u64>, Option<u64>) {
         let (xe, xu) = b36pair(d, es + 1, ee, us + 1, ue);
@@ -264,8 +255,7 @@ impl Keys {
             None
         }
     }
-    /// `user` of the id a person key encodes, without writing the id out:
-    /// the key holds ten 6-bit codes, '0'-'9' as 1-10 and 'a'-'z' as 38-63
+    /// `user` of the id a person key encodes ('0'-'9' are codes 1-10, 'a'-'z' 38-63)
     fn user_of_key(&self, key: u64) -> Option<u64> {
         if key & PTAG != 0 || key == 0 {
             return None;
@@ -388,8 +378,7 @@ fn find_key(samples: &[u64], ncand: u64, lim: u64, users: bool, nt: usize) -> Op
     None
 }
 
-/// Decides whether to try the fast path: recovers both id keys from the
-/// first rows. None means the general pipeline.
+/// both id keys from the first rows; none means the general pipeline
 pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
     if std::env::var_os("SS_NOFAST").is_some() {
         return None;
@@ -480,7 +469,7 @@ struct Parsed {
     rows: usize,
 }
 
-/// Row rules as in `parse_events`; only the record differs.
+/// row rules as in `parse_events`; only the record differs
 fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
@@ -599,7 +588,7 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
     st.rows += rows;
 }
 
-/// Row rules as in `parse_clicks`; the person is resolved later.
+/// row rules as in `parse_clicks`; the person is resolved later
 fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
@@ -659,16 +648,12 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
 
 // ---------------------------------------------------------------- user table
 
-/// Per user number, from the links alone. An entry is either
-///   k | name << 9 : the linked ids of this user are exactly aliases 0..=k,
-///                   one person on their own, named by alias `name`
-///   GENERAL       : anything else; resolve each id through the link map
-/// A user no link mentions is k = 0, name = 0.
+/// per user: `k | name << 9` when its linked ids are exactly aliases 0..=k, else GENERAL
 fn build_utab(links: &Links, k: &Keys) -> Blob<u32> {
     const HAS: u32 = 1 << 30;
     let mut u: Blob<u32> = Blob::zeroed(k.ucap as usize);
     let dec = |key: u64| k.user_of_key(key);
-    // scratch layout: root alias:9 | members beside the root:10 | max alias:9
+    // scratch: root alias:9, other members:10, max alias:9
     for &(id, root) in links.link.slots.iter() {
         if id == 0 {
             continue;
@@ -717,8 +702,7 @@ fn member(ue: u32, alias: u64) -> bool {
 
 // ------------------------------------------------------------- click groups
 
-/// One click bucket regrouped by user: `starts[l]..starts[l + 1]` are the
-/// clicks of the bucket's l-th user that belong to that user's own person.
+/// a click bucket by user: `starts[l]..starts[l + 1]` is user l's own person
 #[derive(Copy, Clone)]
 struct CG {
     starts: *const u32,
@@ -839,8 +823,7 @@ impl<'a> Sh<'a> {
     }
 }
 
-/// A piece of one user's events: a run cut by a bucket edge, or events
-/// that came from outside the slots.
+/// part of one user's events: a run cut by a bucket edge, or odd-id events
 struct Frag {
     ui: u32,
     at: u32,
@@ -1111,10 +1094,7 @@ pub(crate) fn no_links() -> Links {
     Links { link: Map64::with_capacity(0), lbloom: Bloom::new(0), names: Map64::with_capacity(0) }
 }
 
-/// Runs the fast path. Some: every person it could fold in place is written
-/// to `user_daily` and counted in `cd`; `pb`/`cb` hold the rest, bucketed for
-/// the general fold. None: the structure did not hold and nothing was
-/// written. Either way `ctx` has its links when this returns.
+/// some: folded persons are written, `pb`/`cb` hold the rest; none: nothing written
 pub(crate) fn run(
     ctx: &mut Ctx,
     k: &Keys,
@@ -1198,8 +1178,7 @@ pub(crate) fn run(
     let u: &[u32] = &utab;
     if timing {
         let ng = u.iter().filter(|&&e| e & GENERAL != 0).count();
-        let first: Vec<String> = u.iter().take(12).map(|e| format!("{:x}", e)).collect();
-        eprintln!("  fast: general users {} of {}; first {:?}", ng, u.len(), first);
+        eprintln!("  fast: general users {} of {}", ng, u.len());
     }
     let t_parse = t0.elapsed();
 
@@ -1333,8 +1312,7 @@ pub(crate) fn run(
                 None
             }
         };
-        // a click the click groups cannot hold sends its person to the
-        // general fold, whole
+        // a click the groups cannot hold sends its whole person to the general fold
         for r in &oddc {
             let bytes = r.user.bytes(ctx);
             let person = match own(bytes) {
@@ -1541,8 +1519,7 @@ mod tests {
 
     #[test]
     fn b36w_matches_reference() {
-        // every byte value at every position of every length, in a buffer
-        // with other bytes around it
+        // every byte value at every position of every length
         let mut buf = vec![b'q'; 40];
         for n in 0..=10usize {
             for s in [0usize, 1, 3, 7, 8, 9, 20] {
