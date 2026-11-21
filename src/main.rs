@@ -6,6 +6,7 @@
 //   fold   -> per person bucket: sort, sessionize, attribute, aggregate
 //   write  -> Parquet
 mod pq;
+mod split;
 mod sys;
 mod tbl;
 
@@ -469,45 +470,35 @@ fn parse_events<const ABL: u32>(
 ) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
-    let mut p = first_line_start(d, from);
+    let p = first_line_start(d, from);
     let mut acc = 0usize;
     let mut lkh = 0usize;
     let mut nrow = 0usize;
     let mut nval = 0usize;
-    while p < to {
-        let sc = scan_line(d, p, simd);
-        let line = &d[p..sc.nl];
-        let lp = p;
-        p = sc.nl + 1;
+    let mut ix = split::Index::new();
+    split::each_row::<7, _>(d, p, to, simd, &mut ix, |lp, s, e| {
+        let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
         nrow += 1;
-        if ABL == 1 {
-            acc += sc.nc as usize ^ sc.nl ^ (sc.qm as usize);
-            continue;
+        if ABL == 1 || ABL == 2 {
+            acc += lp + s[3] as usize ^ e[6] as usize;
+            return;
         }
-        let f = match fields::<7>(line, &sc) {
-            Some(f) => f,
-            None => continue,
-        };
-        if ABL == 2 {
-            acc += f[3].0 as usize ^ f[6].1 as usize;
-            continue;
-        }
-        let eid = &line[f[0].0 as usize..f[0].1 as usize];
+        let eid = fld(0);
         if eid.is_empty() {
-            continue;
+            return;
         }
         let (klo, khi) = key96(eid);
         if ABL == 3 {
             acc += klo as usize ^ khi as usize;
-            continue;
+            return;
         }
-        let ing_ms = parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc).unwrap_or(0);
+        let ing_ms = parse_ts_c(fld(3), dc).unwrap_or(0);
         let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
 
         // Resolving a user to a person ends in a line of a link map far too
         // big to cache. The probe is started here and read after validation,
         // so the event timestamp covers the miss instead of waiting on it.
-        let user = &line[f[1].0 as usize..f[1].1 as usize];
+        let user = fld(1);
         let has_user = !user.is_empty();
         let mut pk = 0u64;
         let mut linked = false;
@@ -526,7 +517,7 @@ fn parse_events<const ABL: u32>(
             if !has_user {
                 break;
             }
-            let ts = match parse_ts_c(&line[f[2].0 as usize..f[2].1 as usize], dc) {
+            let ts = match parse_ts_c(fld(2), dc) {
                 Some(t) => t,
                 None => break,
             };
@@ -540,7 +531,7 @@ fn parse_events<const ABL: u32>(
             if ing_ms.saturating_sub(ts) > LATE_MS {
                 break;
             }
-            let ety = &line[f[4].0 as usize..f[4].1 as usize];
+            let ety = fld(4);
             let is_pur = match ety.len() {
                 4 => {
                     if ety != b"view" && ety != b"cart" {
@@ -556,12 +547,12 @@ fn parse_events<const ABL: u32>(
                 }
                 _ => break,
             };
-            let pid = &line[f[5].0 as usize..f[5].1 as usize];
+            let pid = fld(5);
             if pid.is_empty() {
                 break;
             }
             if is_pur {
-                let price = match digits_u32(&line[f[6].0 as usize..f[6].1 as usize]) {
+                let price = match digits_u32(fld(6)) {
                     Some(v) if v >= 1 && v <= 10_000_000 => v,
                     _ => break,
                 };
@@ -585,7 +576,7 @@ fn parse_events<const ABL: u32>(
             if person & PTAG != 0 && ctx.names.get(person).is_none() {
                 // An id too long or too odd to encode, and in no link: keep
                 // track of where its bytes are so the name can be written out.
-                xn.push((person, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
+                xn.push((person, sref_of(fi, lp + s[1] as usize, (e[1] - s[1]) as usize)));
             }
             tsf = (ts - ctx.base) as u32 | 0x8000_0000;
             nval += 1;
@@ -594,10 +585,10 @@ fn parse_events<const ABL: u32>(
         let b = (mix(klo ^ (khi as u64), 0x9e37_79b9_7f4a_7c15) >> (64 - ctx.eid_bits)) as usize;
         if ABL == 6 {
             acc += b ^ tsf as usize ^ pc as usize ^ person as usize ^ ing as usize;
-            continue;
+            return;
         }
         sink.push(b, ERec { klo, khi, ing, person, tsf, pc });
-    }
+    });
     if ABL != 0 {
         ACC.fetch_add(acc, Ordering::Relaxed);
     }
@@ -609,40 +600,34 @@ fn parse_events<const ABL: u32>(
 fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CRec>, dc: &mut DateCache) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
-    let mut p = first_line_start(d, from);
+    let p = first_line_start(d, from);
     let mut lkh = 0usize;
-    while p < to {
-        let sc = scan_line(d, p, simd);
-        let line = &d[p..sc.nl];
-        let lp = p;
-        p = sc.nl + 1;
-        let f = match fields::<4>(line, &sc) {
-            Some(f) => f,
-            None => continue,
-        };
-        if f[0].0 == f[0].1 {
-            continue; // empty click_id
+    let mut ix = split::Index::new();
+    split::each_row::<4, _>(d, p, to, simd, &mut ix, |lp, s, e| {
+        let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
+        if s[0] == e[0] {
+            return; // empty click_id
         }
-        let user = &line[f[1].0 as usize..f[1].1 as usize];
+        let user = fld(1);
         if user.is_empty() {
-            continue;
+            return;
         }
-        let ts = match parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc) {
+        let ts = match parse_ts_c(fld(3), dc) {
             Some(t) => t,
-            None => continue,
+            None => return,
         };
         if ts < ctx.cl_lo || ts >= ctx.cl_hi {
-            continue;
+            return;
         }
-        let camp = match ctx.camp_of(&line[f[2].0 as usize..f[2].1 as usize]) {
+        let camp = match ctx.camp_of(fld(2)) {
             Some(c) => c,
-            None => continue,
+            None => return,
         };
         let person = ctx.person_of(user, &mut lkh);
-        let sref = sref_of(fi, lp + f[0].0 as usize, (f[0].1 - f[0].0) as usize);
+        let sref = sref_of(fi, lp + s[0] as usize, (e[0] - s[0]) as usize);
         let b = (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - ctx.per_bits)) as usize;
         sink.push(b, CRec { person, sref, ts: (ts - ctx.base) as u32, camp });
-    }
+    });
     LKH.fetch_add(lkh, Ordering::Relaxed);
 }
 
@@ -1516,7 +1501,7 @@ fn check_simd() -> bool {
         }
         p = a.nl + 1;
     }
-    true
+    split::agrees()
 }
 
 fn main() {
