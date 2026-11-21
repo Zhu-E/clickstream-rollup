@@ -58,9 +58,9 @@ fn hash_long(b: &[u8]) -> u64 {
         i += 16;
     }
     if i < b.len() {
+        // the last sixteen bytes, overlapping the block before
         let n = b.len();
-        let a = if n >= 8 { rd8(b, n - 8) } else { 0 };
-        h = mix(h ^ a ^ S1, (n as u64) ^ S2);
+        h = mix(h ^ rd8(b, n - 16) ^ S1, rd8(b, n - 8) ^ S2);
     }
     h = mix(h ^ S2, h.rotate_left(29) ^ S0);
     if h == 0 { 1 } else { h }
@@ -801,6 +801,19 @@ mod tests {
                 .map(|_| if it % 5 == 0 && next() % 6 == 0 { next() as u8 } else { ALPHA[(next() % 63) as usize] })
                 .collect();
             assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
+        }
+    }
+
+    #[test]
+    fn long_hash_reads_every_byte() {
+        for n in 16..=64usize {
+            let base: Vec<u8> = (0..n).map(|i| b'a' + (i % 26) as u8).collect();
+            let h = hash(&base);
+            for i in 0..n {
+                let mut v = base.clone();
+                v[i] ^= 1;
+                assert_ne!(hash(&v), h, "length {} ignores byte {}", n, i);
+            }
         }
     }
 
