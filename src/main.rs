@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use sys::*;
 use tbl::*;
 
+#[global_allocator]
+static ALLOC: HugeAlloc = HugeAlloc;
+
 const WEEK_MS: i64 = 7 * 86_400_000;
 const GAP_MS: u32 = 1_800_000;
 const LATE_MS: i64 = 86_400_000;
@@ -2190,10 +2193,12 @@ fn main() {
             };
             let (anon, huge) = (kb("Anonymous:"), kb("AnonHugePages:"));
             eprintln!(
-                "  at exit: rss {} MB, anonymous {} MB of which 4K pages {} MB",
+                "  at exit: rss {} MB, anonymous {} MB of which 4K pages {} MB; {} huge blocks mapped, {} MB",
                 kb("Rss:") >> 10,
                 anon >> 10,
-                (anon - huge.min(anon)) >> 10
+                (anon - huge.min(anon)) >> 10,
+                HUGE_BLOCKS.load(Ordering::Relaxed),
+                HUGE_BYTES.load(Ordering::Relaxed) >> 20
             );
         }
     }
