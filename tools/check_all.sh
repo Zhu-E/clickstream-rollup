@@ -24,6 +24,9 @@ rm -rf "${TMPDIR:-/tmp}/ck-dev"
 $BIN "$DEV" "${TMPDIR:-/tmp}/ck-dev" >/dev/null
 python3 tools/cmp.py "${TMPDIR:-/tmp}/ck-dev" "$ANSWER" | tail -1
 
+say "every installed Parquet reader sees the same rows"
+python3 tools/readers.py "${TMPDIR:-/tmp}/ck-dev" | tail -1
+
 say "36 edge-case fixtures"
 BIN=$BIN ./tools/fixtures.sh 2>&1 | tail -2 | head -1
 
@@ -46,6 +49,9 @@ say "more product categories than the generator makes"
 python3 tools/cats_test.py $BIN "$DEV" "$ANSWER" 40 | tail -2
 python3 tools/cats_test.py $BIN "$DEV" "$ANSWER" 200 | tail -2
 
+say "a revenue that needs 64 bits"
+python3 tools/wide_test.py $BIN | tail -1
+
 say "inputs with nothing in them"
 for d in ck-empty ck-nolinks; do rm -rf "${TMPDIR:-/tmp}/$d" "${TMPDIR:-/tmp}/$d-in"; done
 mkdir -p "${TMPDIR:-/tmp}/ck-empty-in/events"
@@ -59,6 +65,7 @@ for t in ("user_daily", "campaign_daily"):
     assert d.num_rows == 0, t
     print(f"  {t}: 0 rows, schema {[str(f.type) for f in d.schema]}")
 PY
+python3 tools/readers.py "${TMPDIR:-/tmp}/ck-empty" | tail -1
 
 if [ -x "$GEN" ]; then
   say "fresh seeds"
