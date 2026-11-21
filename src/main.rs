@@ -1700,7 +1700,7 @@ fn check_simd() -> bool {
         }
         p = a.nl + 1;
     }
-    split::agrees()
+    split::agrees() && fast::wide_ok()
 }
 
 fn main() {

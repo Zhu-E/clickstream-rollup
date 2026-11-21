@@ -156,7 +156,6 @@ static LEAST: [u64; 9] = by_digits(2);
 static SPAN: [u64; 9] = by_digits(3);
 
 /// eight base-36 digits, first in the low byte; checked by encoding back
-#[cfg_attr(all(target_arch = "x86_64", target_feature = "sse4.1"), allow(dead_code))]
 #[inline(always)]
 fn swar36(w: u64) -> u64 {
     let alpha = (w >> 6) & L8;
@@ -173,8 +172,11 @@ fn swar36(w: u64) -> u64 {
 /// two words of eight digits each; NONE for a word with a byte that is no digit
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
 #[inline(always)]
-fn pair36(w0: u64, w1: u64) -> (u64, u64) {
+fn pair36(w0: u64, w1: u64, vec: bool) -> (u64, u64) {
     use core::arch::x86_64::*;
+    if !vec {
+        return (swar36(w0), swar36(w1));
+    }
     unsafe {
         let x = _mm_set_epi64x(w1 as i64, w0 as i64);
         let alpha = _mm_cmpgt_epi8(x, _mm_set1_epi8(0x60));
@@ -193,7 +195,7 @@ fn pair36(w0: u64, w1: u64) -> (u64, u64) {
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 #[inline(always)]
-fn pair36(w0: u64, w1: u64) -> (u64, u64) {
+fn pair36(w0: u64, w1: u64, _vec: bool) -> (u64, u64) {
     (swar36(w0), swar36(w1))
 }
 
@@ -205,17 +207,148 @@ unsafe fn digits_word(d: &[u8], e: usize, m: usize) -> u64 {
     (w & *KEEP.get_unchecked(m)) | *FILL.get_unchecked(m)
 }
 
+/// for an id of n bytes: its digits right-aligned in 0..8, its letter in 8, its first digit in 9
+const fn id_shuffle() -> [[u8; 16]; 64] {
+    let mut t = [[0x80u8; 16]; 64];
+    let mut n = 2;
+    while n <= 9 {
+        let m = n - 1;
+        let mut j = 8 - m;
+        while j < 8 {
+            t[n][j] = (1 + j - (8 - m)) as u8;
+            j += 1;
+        }
+        t[n][8] = 0;
+        // a lone digit may be zero: the letter stands in
+        t[n][9] = if m >= 2 { 1 } else { 0 };
+        n += 1;
+    }
+    t
+}
+
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(dead_code))]
+static IDSH: [[u8; 16]; 64] = id_shuffle();
+
+/// inverse of the generator's second multiplier mod 2^40; a test holds it to `half`
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx512dq", target_feature = "avx512vl")), allow(dead_code))]
+const BINV: u64 = {
+    let b = 0xD6E8_FEB8_6659u64;
+    let mut x = b;
+    let mut i = 0;
+    while i < 6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(b.wrapping_mul(x)));
+        i += 1;
+    }
+    x & M40
+};
+
+/// `unscramble` of two values at once, the first under `k0`
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512dq", target_feature = "avx512vl"))]
+#[inline(always)]
+unsafe fn unscramble2(val: core::arch::x86_64::__m128i, k0: u64, k1: u64) -> (u64, u64) {
+    use core::arch::x86_64::*;
+    let m40 = _mm_set1_epi64x(M40 as i64);
+    let m = _mm_and_si128(_mm_mullo_epi64(val, _mm_set1_epi64x(BINV as i64)), m40);
+    let h = _mm_xor_si128(_mm_xor_si128(m, _mm_srli_epi64(m, 17)), _mm_srli_epi64(m, 34));
+    let keys = _mm_set_epi64x(k1 as i64, k0 as i64);
+    let r = _mm_and_si128(_mm_mullo_epi64(_mm_xor_si128(h, keys), _mm_set1_epi64x(AINV as i64)), m40);
+    (_mm_cvtsi128_si64(r) as u64, _mm_extract_epi64(r, 1) as u64)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(all(target_feature = "avx512dq", target_feature = "avx512vl"))))]
+#[inline(always)]
+unsafe fn unscramble2(val: core::arch::x86_64::__m128i, k0: u64, k1: u64) -> (u64, u64) {
+    use core::arch::x86_64::*;
+    (unscramble(_mm_cvtsi128_si64(val) as u64 & M40, k0), unscramble(_mm_extract_epi64(val, 1) as u64 & M40, k1))
+}
+
 impl Keys {
+    /// `event_at` for ids with sixteen readable bytes each and under 64 long
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    unsafe fn ids_wide(&self, pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> (u64, u64) {
+        use core::arch::x86_64::*;
+        debug_assert!(ne < 64 && nu < 64);
+        let ld = |p: *const u8| _mm_loadu_si128(p as *const __m128i);
+        let two = |a: __m128i, b: __m128i| _mm256_inserti128_si256(_mm256_castsi128_si256(a), b, 1);
+        let x = two(ld(pe), ld(pu));
+        let ctl = two(ld(IDSH.get_unchecked(ne).as_ptr()), ld(IDSH.get_unchecked(nu).as_ptr()));
+        let y = _mm256_shuffle_epi8(_mm256_sub_epi8(x, _mm256_set1_epi8(0x30)), ctl);
+        let alpha = _mm256_cmpgt_epi8(y, _mm256_set1_epi8(0x30));
+        let v = _mm256_sub_epi8(y, _mm256_and_si256(alpha, _mm256_set1_epi8(0x27)));
+        let lim = _mm256_add_epi8(_mm256_set1_epi8(9), _mm256_and_si256(alpha, _mm256_set1_epi8(26)));
+        let digits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epu8(v, lim), lim)) as u32;
+        // byte 8 must be the letter, byte 9 anything but a zero
+        let (e, u) = (b'e' as i8 - 0x30, b'u' as i8 - 0x30);
+        let want = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, e, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, u, 0, -1, -1, -1, -1, -1, -1);
+        let lead = _mm256_movemask_epi8(_mm256_cmpeq_epi8(y, want)) as u32;
+        let dg = _mm_unpacklo_epi64(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        let q = _mm_madd_epi16(_mm_maddubs_epi16(dg, _mm_set1_epi16(0x0124)), _mm_set1_epi32(0x0001_0510));
+        let val = _mm_add_epi64(_mm_mul_epu32(q, _mm_set1_epi64x(1_679_616)), _mm_srli_epi64(q, 32));
+        let over = _mm_movemask_epi8(_mm_cmpgt_epi64(val, _mm_set1_epi64x(M40 as i64)));
+        let (c, un) = unscramble2(val, self.ek, self.uk);
+        if digits == !0 && lead & 0x0300_0300 == 0x0100_0100 && over == 0 && c < self.ncap && un < self.ucap << 9 {
+            (c, un)
+        } else {
+            self.ids_slow(pe, ne, pu, nu)
+        }
+    }
+    /// `user_at` for an id with sixteen readable bytes and under 64 long
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    unsafe fn user_wide(&self, p: *const u8, n: usize) -> u64 {
+        use core::arch::x86_64::*;
+        debug_assert!(n < 64);
+        let x = _mm_loadu_si128(p as *const __m128i);
+        let ctl = _mm_loadu_si128(IDSH.get_unchecked(n).as_ptr() as *const __m128i);
+        let y = _mm_shuffle_epi8(_mm_sub_epi8(x, _mm_set1_epi8(0x30)), ctl);
+        let alpha = _mm_cmpgt_epi8(y, _mm_set1_epi8(0x30));
+        let v = _mm_sub_epi8(y, _mm_and_si128(alpha, _mm_set1_epi8(0x27)));
+        let lim = _mm_add_epi8(_mm_set1_epi8(9), _mm_and_si128(alpha, _mm_set1_epi8(26)));
+        let digits = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(v, lim), lim)) as u32;
+        let want = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, b'u' as i8 - 0x30, 0, -1, -1, -1, -1, -1, -1);
+        let lead = _mm_movemask_epi8(_mm_cmpeq_epi8(y, want)) as u32;
+        let q = _mm_madd_epi16(_mm_maddubs_epi16(v, _mm_set1_epi16(0x0124)), _mm_set1_epi32(0x0001_0510));
+        let z = _mm_cvtsi128_si64(q) as u64;
+        let val = (z & 0xffff_ffff) * 1_679_616 + (z >> 32);
+        let un = unscramble(val & M40, self.uk);
+        if digits == 0xffff && lead & 0x0300 == 0x0100 && val <= M40 && un < self.ucap << 9 {
+            un
+        } else {
+            self.user_slow(p, n)
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[inline(always)]
+    unsafe fn ids_wide(&self, pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> (u64, u64) {
+        self.ids_slow(pe, ne, pu, nu)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[inline(always)]
+    unsafe fn user_wide(&self, p: *const u8, n: usize) -> u64 {
+        self.user_slow(p, n)
+    }
+    /// both ids by the byte loop
+    #[cold]
+    #[inline(never)]
+    unsafe fn ids_slow(&self, pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> (u64, u64) {
+        (self.counter(std::slice::from_raw_parts(pe, ne)), self.user(std::slice::from_raw_parts(pu, nu)).unwrap_or(NONE))
+    }
+    #[cold]
+    #[inline(never)]
+    unsafe fn user_slow(&self, p: *const u8, n: usize) -> u64 {
+        self.user(std::slice::from_raw_parts(p, n)).unwrap_or(NONE)
+    }
     /// `counter` and `user` of two ids in one row, the event id first; NONE where one does not decode
     #[inline(always)]
-    fn event_at(&self, d: &[u8], es: usize, ee: usize, us: usize, ue: usize) -> (u64, u64) {
+    fn event_at(&self, d: &[u8], es: usize, ee: usize, us: usize, ue: usize, vec: bool) -> (u64, u64) {
         let (me, mu) = ((ee - es).wrapping_sub(1), (ue - us).wrapping_sub(1));
         // the usual shape: a letter and 1 to 8 digits, not in the file's first bytes
         if (me.wrapping_sub(1) | mu.wrapping_sub(1)) > 7 || es < 8 || us < ee || ue > d.len() {
             return (self.counter(&d[es..ee]), self.user(&d[us..ue]).unwrap_or(NONE));
         }
         unsafe {
-            let (ve, vu) = pair36(digits_word(d, ee, me), digits_word(d, ue, mu));
+            let (ve, vu) = pair36(digits_word(d, ee, me), digits_word(d, ue, mu), vec);
             // one compare each: no leading zero, and no more than 40 bits
             let oke = *d.get_unchecked(es) == b'e' && ve.wrapping_sub(*LEAST.get_unchecked(me)) <= *SPAN.get_unchecked(me);
             let oku = *d.get_unchecked(us) == b'u' && vu.wrapping_sub(*LEAST.get_unchecked(mu)) <= *SPAN.get_unchecked(mu);
@@ -226,14 +359,14 @@ impl Keys {
     }
     /// `user` for the id at `d[s..e]`; NONE when it does not decode
     #[inline(always)]
-    fn user_at(&self, d: &[u8], s: usize, e: usize) -> u64 {
+    fn user_at(&self, d: &[u8], s: usize, e: usize, vec: bool) -> u64 {
         let m = (e - s).wrapping_sub(1);
         if m.wrapping_sub(1) > 7 || s < 8 || e > d.len() {
             return self.user(&d[s..e]).unwrap_or(NONE);
         }
         unsafe {
             let w = digits_word(d, e, m);
-            let v = pair36(w, w).0;
+            let v = pair36(w, w, vec).0;
             let ok = *d.get_unchecked(s) == b'u' && v.wrapping_sub(*LEAST.get_unchecked(m)) <= *SPAN.get_unchecked(m);
             let u = unscramble(v & M40, self.uk);
             if ok && u < self.ucap << 9 {
@@ -284,6 +417,38 @@ impl Keys {
         out[1..].copy_from_slice(&w.to_le_bytes());
         n + 1
     }
+}
+
+/// the vector id decoders against the byte loop, on ids good and damaged; run at startup
+pub(crate) fn wide_ok() -> bool {
+    let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 39, ucap: 1 << 30, shift: 12 };
+    let pool = b"0123456789abcdefghijklmnopqrstuvwxyzEU\",-";
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut hits = 0;
+    for i in 0..6000u64 {
+        let mut buf = [b','; 32];
+        let mut len = [0usize; 2];
+        for (j, lead) in [b'e', b'u'].into_iter().enumerate() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 12) as usize;
+            let mut y = x >> 8;
+            for t in 0..n {
+                let m = if i % 4 == 0 { pool.len() as u64 } else { 36 };
+                buf[16 * j + t] = if t == 0 && i % 7 != 3 { lead } else { pool[(y % m) as usize] };
+                y /= 41;
+            }
+            len[j] = n;
+        }
+        let want = (k.counter(&buf[..len[0]]), k.user(&buf[16..16 + len[1]]).unwrap_or(NONE));
+        let got = unsafe { (k.ids_wide(buf.as_ptr(), len[0], buf.as_ptr().add(16), len[1]), k.user_wide(buf.as_ptr().add(16), len[1])) };
+        if got != (want, want.1) {
+            return false;
+        }
+        hits += (want.0 != NONE && want.1 != NONE) as usize;
+    }
+    hits > 100
 }
 
 // -------------------------------------------------------------- key recovery
@@ -422,9 +587,75 @@ pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
 
 // ------------------------------------------------------------------- parsing
 
+/// records scattered into buckets, in blocks of `BYTES` aligned to their size
+struct Bins<'a, T: Copy, const BYTES: usize> {
+    arena: &'a Arena,
+    /// where each bucket writes next; an aligned address has no room
+    cur: Vec<*mut T>,
+    full: Vec<Vec<Blk<T>>>,
+    slab: usize,
+    left: usize,
+}
+
+impl<'a, T: Copy, const BYTES: usize> Bins<'a, T, BYTES> {
+    const PER: usize = BYTES / std::mem::size_of::<T>();
+
+    fn new(arena: &'a Arena, nb: usize) -> Self {
+        assert!(BYTES.is_power_of_two() && BYTES >= 64 && BYTES % std::mem::size_of::<T>() == 0);
+        Bins { arena, cur: vec![std::ptr::null_mut(); nb], full: (0..nb).map(|_| Vec::new()).collect(), slab: 0, left: 0 }
+    }
+    /// a fresh block for bucket `b`; `old` is null or one past its full block
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, b: usize, old: *mut T) -> *mut T {
+        if !old.is_null() {
+            self.full[b].push(Blk { ptr: unsafe { old.sub(Self::PER) }, len: Self::PER as u32 });
+        }
+        if self.left < BYTES {
+            let raw = self.arena.slab(crate::sys::SLAB + BYTES) as usize;
+            self.slab = (raw + BYTES - 1) & !(BYTES - 1);
+            self.left = crate::sys::SLAB;
+        }
+        let p = self.slab as *mut T;
+        self.slab += BYTES;
+        self.left -= BYTES;
+        p
+    }
+    /// `tab` is `cur`'s buffer, held by the caller across rows
+    #[inline(always)]
+    unsafe fn put(&mut self, tab: *mut *mut T, b: usize, v: T) {
+        let slot = tab.add(b);
+        let mut p = *slot;
+        if p as usize & (BYTES - 1) == 0 {
+            p = self.grow(b, p);
+        }
+        p.write(v);
+        *slot = p.add(1);
+    }
+    /// the last bucket that holds a record
+    fn top(&self) -> Option<usize> {
+        self.cur.iter().rposition(|p| !p.is_null())
+    }
+    fn finish(mut self) -> Vec<Vec<Blk<T>>> {
+        for b in 0..self.cur.len() {
+            let p = self.cur[b];
+            if p.is_null() {
+                continue;
+            }
+            let used = (p as usize & (BYTES - 1)) / std::mem::size_of::<T>();
+            let len = if used == 0 { Self::PER } else { used };
+            self.full[b].push(Blk { ptr: unsafe { p.sub(len) }, len: len as u32 });
+        }
+        std::mem::take(&mut self.full)
+    }
+}
+
+type EvBins<'a> = Bins<'a, FRec, { 512 * 16 }>;
+type ClBins<'a> = Bins<'a, FC, { 128 * 16 }>;
+
 struct PSt<'a> {
-    es: Sink<'a, FRec>,
-    cs: Sink<'a, FC>,
+    es: EvBins<'a>,
+    cs: ClBins<'a>,
     odd: Vec<OddEv>,
     esc: Vec<(u64, Esc)>,
     oddc: Vec<OddCl>,
@@ -432,7 +663,6 @@ struct PSt<'a> {
     ix: Box<split::Index>,
     lloc: Vec<Vec<LocalLink>>,
     lglob: Vec<GlobalLink>,
-    maxc: u64,
     rows: usize,
 }
 
@@ -448,163 +678,265 @@ struct Parsed {
     rows: usize,
 }
 
-/// row rules as in `parse_events`; only the record differs
+/// what a row is read against; `WIDE` rows have `split::REACH` readable bytes and spans under 64
+#[derive(Clone, Copy)]
+struct Env<'a> {
+    ctx: &'a Ctx,
+    k: &'a Keys,
+    d: &'a [u8],
+    fi: usize,
+    simd: bool,
+}
+
+/// an event row by the rules of `parse_events`: fields 0..3 from `p0`, the rest from `p1`
+#[inline(always)]
+unsafe fn ev_row<const WIDE: bool>(
+    x: Env,
+    p0: *const u8,
+    p1: *const u8,
+    s: &[usize; 7],
+    e: &[usize; 7],
+    tab: *mut *mut FRec,
+    es: &mut EvBins,
+    odd: &mut Vec<OddEv>,
+    esc: &mut Vec<(u64, Esc)>,
+    dc: &mut DateCache,
+    rows: &mut usize,
+) {
+    let fld = |k: usize| -> &[u8] { unsafe { std::slice::from_raw_parts(if k < 3 { p0 } else { p1 }.add(s[k]), e[k] - s[k]) } };
+    let (ne, nu) = (e[0] - s[0], e[1] - s[1]);
+    if ne == 0 {
+        return;
+    }
+    *rows += 1;
+    let (ctx, k) = (x.ctx, x.k);
+    let g = ingest(fld(3), dc);
+    let mut ts = 0i64;
+    let mut pc = 0u32;
+    let valid = 'v: {
+        if nu == 0 {
+            break 'v false;
+        }
+        ts = match parse_ts_c(fld(2), dc) {
+            Some(t) => t,
+            None => break 'v false,
+        };
+        if ts < ctx.ev_lo || ts >= ctx.ev_hi {
+            break 'v false;
+        }
+        if g.ms > ts.saturating_add(LATE_MS) {
+            break 'v false;
+        }
+        let is_pur = match fld(4) {
+            b"view" | b"cart" => false,
+            b"purchase" => true,
+            _ => break 'v false,
+        };
+        let pid = fld(5);
+        if pid.is_empty() {
+            break 'v false;
+        }
+        if is_pur {
+            let price = match digits_u32(fld(6)) {
+                Some(v) if v >= 1 && v <= 10_000_000 => v,
+                _ => break 'v false,
+            };
+            pc = (ctx.cat_of(pid) << 24) | price;
+        }
+        true
+    };
+    let at = p0 as usize - x.d.as_ptr() as usize;
+    let (c, un) = if WIDE {
+        k.ids_wide(p0.add(s[0]), ne, p0.add(s[1]), nu)
+    } else {
+        k.event_at(x.d, at + s[0], at + e[0], at + s[1], at + e[1], x.simd)
+    };
+    let user = Span { fi: x.fi as u32, len: nu as u32, off: (at + s[1]) as u64 };
+    if c == NONE {
+        let (klo, khi) = key96(fld(0));
+        odd.push(OddEv {
+            klo,
+            khi,
+            ing: g.sec,
+            tsf: if valid { (ts - ctx.base) as u32 | 0x8000_0000 } else { 0 },
+            pc: if valid { pc } else { 0 },
+            user,
+        });
+        return;
+    }
+    let b = (c >> k.shift) as usize;
+    let cl = c & ((1u64 << k.shift) - 1);
+    if !valid {
+        es.put(tab, b, FRec { a: DEAD, b: ((g.sec as u64) << 32) | cl });
+        return;
+    }
+    let tsf = (ts - ctx.base) as u32;
+    // a valid ts is inside the window, which starts at or after the epoch
+    let delta = (g.sec as i64 - (ts as u64 / 1000) as i64 + BIAS) as u64;
+    if un != NONE && delta <= DELTA_MASK {
+        es.put(tab, b, FRec { a: ((tsf as u64) << 33) | (un << 2) | LIVE, b: ((pc as u64) << 32) | (delta << MAX_SHIFT) | cl });
+    } else {
+        esc.push(((c << 32) | g.sec as u64, Esc { ts: tsf, pc, user }));
+        es.put(tab, b, FRec { a: ESC, b: ((g.sec as u64) << 32) | cl });
+    }
+}
+
+/// the line at `p` through the reference splitter; returns where the next starts
+#[inline(never)]
+fn ev_line(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache, rows: &mut usize) -> usize {
+    let tab = es.cur.as_mut_ptr();
+    split::line::<7, _>(x.d, p, x.simd, &mut |lp, s, e| {
+        let (mut st, mut en) = ([0usize; 7], [0usize; 7]);
+        for k in 0..7 {
+            st[k] = s[k] as usize;
+            en[k] = e[k] as usize;
+        }
+        let at = unsafe { x.d.as_ptr().add(lp) };
+        unsafe { ev_row::<false>(x, at, at, &st, &en, tab, es, odd, esc, dc, rows) }
+    })
+}
+
+/// `ev_line` for the rows the windows leave
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2")), allow(dead_code))]
+#[cold]
+#[inline(never)]
+fn ev_rare(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Vec<(u64, Esc)>, dc: &mut DateCache, rows: &mut usize) -> usize {
+    ev_line(x, p, es, odd, esc, dc, rows)
+}
+
 fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
-    let p = first_line_start(d, from);
-    let low = (1u64 << k.shift) - 1;
-    let PSt { es, odd, esc, dc, ix, .. } = st;
-    let mut rows = 0usize;
-    let mut maxc = 0u64;
-    split::each_row::<7, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
-        let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
-        if s[0] == e[0] {
-            return;
-        }
-        rows += 1;
-        let g = ingest(fld(3), dc);
-        let (ing_ms, ing) = (g.ms, g.sec);
-        let user = fld(1);
-        let mut valid = false;
-        let mut ts = 0i64;
-        let mut pc = 0u32;
-        loop {
-            if user.is_empty() {
-                break;
-            }
-            ts = match parse_ts_c(fld(2), dc) {
-                Some(t) => t,
-                None => break,
-            };
-            if ts < ctx.ev_lo || ts >= ctx.ev_hi {
-                break;
-            }
-            if ing_ms > ts.saturating_add(LATE_MS) {
-                break;
-            }
-            let ety = fld(4);
-            let is_pur = match ety.len() {
-                4 => {
-                    if ety != b"view" && ety != b"cart" {
-                        break;
+    let mut p = first_line_start(d, from);
+    let PSt { es, odd, esc, dc, rows: total, .. } = st;
+    let x = Env { ctx, k, d, fi, simd };
+    // rows the windows take, and the rest
+    #[allow(unused_mut)]
+    let (mut rows, mut rare) = (0usize, 0usize);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    if simd {
+        let tab = es.cur.as_mut_ptr();
+        while p < to && p + split::REACH <= d.len() {
+            unsafe {
+                let p0 = d.as_ptr().add(p);
+                if let Some((mut a, mut b, at, nl)) = split::row7(split::masks(p0), |o| split::masks(p0.add(o))) {
+                    let (mut s, mut e) = ([0usize; 7], [0usize; 7]);
+                    for k in 0..3 {
+                        (s[k], e[k]) = a.next();
                     }
-                    false
-                }
-                8 => {
-                    if ety != b"purchase" {
-                        break;
+                    for k in 3..7 {
+                        (s[k], e[k]) = b.next();
                     }
-                    true
+                    ev_row::<true>(x, p0, p0.add(at), &s, &e, tab, es, odd, esc, dc, &mut rows);
+                    p += at + nl + 1;
+                    continue;
                 }
-                _ => break,
-            };
-            let pid = fld(5);
-            if pid.is_empty() {
-                break;
             }
-            if is_pur {
-                let price = match digits_u32(fld(6)) {
-                    Some(v) if v >= 1 && v <= 10_000_000 => v,
-                    _ => break,
-                };
-                pc = (ctx.cat_of(pid) << 24) | price;
-            }
-            valid = true;
-            break;
+            p = ev_rare(x, p, es, odd, esc, dc, &mut rare);
         }
-        let tsf = if valid { (ts - ctx.base) as u32 } else { 0 };
-        let uspan = Span { fi: fi as u32, len: user.len() as u32, off: (lp + s[1] as usize) as u64 };
-        let (c, un) = k.event_at(d, lp + s[0] as usize, lp + e[0] as usize, lp + s[1] as usize, lp + e[1] as usize);
-        if c == NONE {
-            let (klo, khi) = key96(fld(0));
-            odd.push(OddEv {
-                klo,
-                khi,
-                ing,
-                tsf: if valid { tsf | 0x8000_0000 } else { 0 },
-                pc: if valid { pc } else { 0 },
-                user: uspan,
-            });
-            return;
-        }
-        maxc = maxc.max(c);
-        let b = (c >> k.shift) as usize;
-        let cl = c & low;
-        if !valid {
-            es.push(b, FRec { a: DEAD, b: ((ing as u64) << 32) | cl });
-            return;
-        }
-        let delta = ing as i64 - ts.div_euclid(1000) + BIAS;
-        match un {
-            un if un != NONE && delta >= 0 && delta <= DELTA_MASK as i64 => {
-                es.push(
-                    b,
-                    FRec {
-                        a: ((tsf as u64) << 33) | (un << 2) | LIVE,
-                        b: ((pc as u64) << 32) | ((delta as u64) << MAX_SHIFT) | cl,
-                    },
-                );
-            }
-            _ => {
-                esc.push(((c << 32) | ing as u64, Esc { ts: tsf, pc, user: uspan }));
-                es.push(b, FRec { a: ESC, b: ((ing as u64) << 32) | cl });
-            }
-        }
-    });
-    st.maxc = st.maxc.max(maxc);
-    st.rows += rows;
+    }
+    while p < to {
+        p = ev_line(x, p, es, odd, esc, dc, &mut rare);
+    }
+    *total += rows + rare;
 }
 
-/// row rules as in `parse_clicks`; the person is resolved later
+/// a click row by the rules of `parse_clicks`; the person is resolved later
+#[inline(always)]
+unsafe fn cl_row<const WIDE: bool>(
+    x: Env,
+    fr: u64,
+    p0: *const u8,
+    s: &[usize; 4],
+    e: &[usize; 4],
+    tab: *mut *mut FC,
+    cs: &mut ClBins,
+    oddc: &mut Vec<OddCl>,
+    dc: &mut DateCache,
+) {
+    let fld = |k: usize| -> &[u8] { unsafe { std::slice::from_raw_parts(p0.add(s[k]), e[k] - s[k]) } };
+    let (len, nu) = (e[0] - s[0], e[1] - s[1]);
+    if len == 0 || nu == 0 {
+        return;
+    }
+    let (ctx, k) = (x.ctx, x.k);
+    let ts = match parse_ts_c(fld(3), dc) {
+        Some(t) => t,
+        None => return,
+    };
+    if ts < ctx.cl_lo || ts >= ctx.cl_hi {
+        return;
+    }
+    let camp = match ctx.camp_of(fld(2)) {
+        Some(c) => c,
+        None => return,
+    };
+    let ts = (ts - ctx.base) as u32;
+    let at = p0 as usize - x.d.as_ptr() as usize;
+    let off = (at + s[0]) as u64;
+    let un = if WIDE { k.user_wide(p0.add(s[1]), nu) } else { k.user_at(x.d, at + s[1], at + e[1], x.simd) };
+    if un != NONE && len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) {
+        let ui = un >> 9;
+        cs.put(
+            tab,
+            (ui >> CSHIFT) as usize,
+            FC { a: (ui << 40) | ((ts as u64) << 9) | (un & ALIAS), b: ((camp as u64) << 48) | (fr << 40) | (off << 4) | len as u64 },
+        );
+    } else {
+        oddc.push(OddCl { user: Span { fi: x.fi as u32, len: nu as u32, off: (at + s[1]) as u64 }, sref: sref_of(x.fi, off as usize, len), ts, camp });
+    }
+}
+
+#[inline(never)]
+fn cl_line(x: Env, fr: u64, p: usize, cs: &mut ClBins, oddc: &mut Vec<OddCl>, dc: &mut DateCache) -> usize {
+    let tab = cs.cur.as_mut_ptr();
+    split::line::<4, _>(x.d, p, x.simd, &mut |lp, s, e| {
+        let (mut st, mut en) = ([0usize; 4], [0usize; 4]);
+        for k in 0..4 {
+            st[k] = s[k] as usize;
+            en[k] = e[k] as usize;
+        }
+        unsafe { cl_row::<false>(x, fr, x.d.as_ptr().add(lp), &st, &en, tab, cs, oddc, dc) }
+    })
+}
+
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2")), allow(dead_code))]
+#[cold]
+#[inline(never)]
+fn cl_rare(x: Env, fr: u64, p: usize, cs: &mut ClBins, oddc: &mut Vec<OddCl>, dc: &mut DateCache) -> usize {
+    cl_line(x, fr, p, cs, oddc, dc)
+}
+
 fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
-    let p = first_line_start(d, from);
-    let PSt { cs, oddc, dc, ix, .. } = st;
+    let mut p = first_line_start(d, from);
+    let PSt { cs, oddc, dc, .. } = st;
+    let x = Env { ctx, k, d, fi, simd };
     let fr = (fi - cl0) as u64;
-    split::each_row::<4, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
-        let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
-        if s[0] == e[0] {
-            return;
-        }
-        let user = fld(1);
-        if user.is_empty() {
-            return;
-        }
-        let ts = match parse_ts_c(fld(3), dc) {
-            Some(t) => t,
-            None => return,
-        };
-        if ts < ctx.cl_lo || ts >= ctx.cl_hi {
-            return;
-        }
-        let camp = match ctx.camp_of(fld(2)) {
-            Some(c) => c,
-            None => return,
-        };
-        let ts = (ts - ctx.base) as u32;
-        let off = (lp + s[0] as usize) as u64;
-        let len = (e[0] - s[0]) as u64;
-        match k.user_at(d, lp + s[1] as usize, lp + e[1] as usize) {
-            un if un != NONE && len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) => {
-                let ui = un >> 9;
-                cs.push(
-                    (ui >> CSHIFT) as usize,
-                    FC {
-                        a: (ui << 40) | ((ts as u64) << 9) | (un & ALIAS),
-                        b: ((camp as u64) << 48) | (fr << 40) | (off << 4) | len,
-                    },
-                );
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    if simd {
+        let tab = cs.cur.as_mut_ptr();
+        while p < to && p + split::REACH <= d.len() {
+            unsafe {
+                let p0 = d.as_ptr().add(p);
+                let m = split::masks(p0);
+                if let Some((mut a, nl)) = split::tail::<3>(m.0, m.1, m.2) {
+                    let (mut s, mut e) = ([0usize; 4], [0usize; 4]);
+                    for k in 0..4 {
+                        (s[k], e[k]) = a.next();
+                    }
+                    cl_row::<true>(x, fr, p0, &s, &e, tab, cs, oddc, dc);
+                    p += nl + 1;
+                    continue;
+                }
             }
-            _ => oddc.push(OddCl {
-                user: Span { fi: fi as u32, len: user.len() as u32, off: (lp + s[1] as usize) as u64 },
-                sref: sref_of(fi, off as usize, len as usize),
-                ts,
-                camp,
-            }),
+            p = cl_rare(x, fr, p, cs, oddc, dc);
         }
-    });
+    }
+    while p < to {
+        p = cl_line(x, fr, p, cs, oddc, dc);
+    }
 }
 
 // ---------------------------------------------------------------- user table
@@ -628,7 +960,7 @@ fn parse_lk(ctx: &Ctx, k: &Keys, shared: &[AtomicU64], fi: usize, from: usize, t
         if a0 == a1 || b0 == b1 {
             return;
         }
-        let (ua, ub) = (k.user_at(d, a0, a1), k.user_at(d, b0, b1));
+        let (ua, ub) = (k.user_at(d, a0, a1, simd), k.user_at(d, b0, b1, simd));
         if ua != NONE && ub != NONE && ua >> 9 == ub >> 9 {
             if ua != ub {
                 lloc[(ua >> (9 + LSHIFT)) as usize].push((ua << 9) | (ub & ALIAS));
@@ -1197,8 +1529,8 @@ pub(crate) fn run(
         let shared = &shared[..];
         let work = || -> Parsed {
             let mut st = PSt {
-                es: Sink::new(arena, nb_e, 512),
-                cs: Sink::new(arena, nb_c, 128),
+                es: Bins::new(arena, nb_e),
+                cs: Bins::new(arena, nb_c),
                 odd: Vec::new(),
                 esc: Vec::new(),
                 oddc: Vec::new(),
@@ -1206,7 +1538,6 @@ pub(crate) fn run(
                 ix: Box::new(split::Index::new()),
                 lloc: (0..nb_l).map(|_| Vec::new()).collect(),
                 lglob: Vec::new(),
-                maxc: 0,
                 rows: 0,
             };
             loop {
@@ -1222,6 +1553,7 @@ pub(crate) fn run(
                 }
             }
             Parsed {
+                maxc: st.es.top().map_or(0, |b| (b as u64) << k.shift),
                 es: st.es.finish(),
                 cs: st.cs.finish(),
                 odd: st.odd,
@@ -1229,7 +1561,6 @@ pub(crate) fn run(
                 oddc: st.oddc,
                 lloc: st.lloc,
                 lglob: st.lglob,
-                maxc: st.maxc,
                 rows: st.rows,
             }
         };
@@ -1243,6 +1574,10 @@ pub(crate) fn run(
         })
     };
     let t_rows = t0.elapsed();
+    // parse only, for counting instructions
+    if std::env::var_os("SS_FSTOP").is_some() {
+        std::process::exit(0);
+    }
 
     // ---- links: each user from its own rows, the link map for the rest
     let mut global: Vec<GlobalLink> = Vec::new();
@@ -1650,17 +1985,25 @@ mod tests {
 
     #[test]
     fn row_decoders_match_the_byte_loop() {
-        let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 39, ucap: 1 << 22, shift: 12 };
+        let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 39, ucap: 1 << 30, shift: 12 };
         let chk = |b: &[u8], es: usize, ee: usize, us: usize, ue: usize| {
             let want = (k.counter(&b[es..ee]), k.user(&b[us..ue]).unwrap_or(NONE));
-            assert_eq!(k.event_at(b, es, ee, us, ue), want, "{:?} {:?}", &b[es..ee], &b[us..ue]);
-            if us < ue {
-                assert_eq!(k.user_at(b, us, ue), want.1, "{:?}", &b[us..ue]);
+            for vec in [true, false] {
+                assert_eq!(k.event_at(b, es, ee, us, ue, vec), want, "{:?} {:?}", &b[es..ee], &b[us..ue]);
+                if us < ue {
+                    assert_eq!(k.user_at(b, us, ue, vec), want.1, "{:?}", &b[us..ue]);
+                }
+            }
+            // the test rows end in padding, so sixteen bytes are there to read
+            assert!(us + 16 <= b.len());
+            unsafe {
+                assert_eq!(k.ids_wide(b.as_ptr().add(es), ee - es, b.as_ptr().add(us), ue - us), want, "{:?} {:?}", &b[es..ee], &b[us..ue]);
+                assert_eq!(k.user_wide(b.as_ptr().add(us), ue - us), want.1, "{:?}", &b[us..ue]);
             }
             for w in [(es + 1, ee), (us + 1, ue)] {
                 if w.1 >= 8 && w.1 > w.0 && w.1 - w.0 <= 8 {
                     let word = unsafe { digits_word(b, w.1, w.1 - w.0) };
-                    let lane = pair36(word, word);
+                    let lane = pair36(word, word, true);
                     assert_eq!(swar36(word), lane.0, "{:?}", &b[w.0..w.1]);
                     assert_eq!(lane.0, lane.1);
                 }
@@ -1682,7 +2025,7 @@ mod tests {
                         b.extend(std::iter::repeat(b'z').take(nu - 1));
                     }
                     let ue = b.len();
-                    b.extend_from_slice(b",tail");
+                    b.extend_from_slice(b",tail,0123456789abcdef");
                     chk(&b, es, ee, us, ue);
                     for pos in (es..ee).chain(us..ue) {
                         let keep = b[pos];
@@ -1714,8 +2057,109 @@ mod tests {
                 ends[2 * i + 1] = b.len();
                 b.push(b',');
             }
+            b.extend_from_slice(b"0123456789abcdef");
             chk(&b, ends[0], ends[1], ends[2], ends[3]);
         }
+        assert!(wide_ok());
+    }
+
+    #[test]
+    fn wide_decoders_match_the_byte_loop_under_real_caps() {
+        // small caps, so the range checks decide too
+        let k = Keys { ek: 0x5a_1234_5678, uk: 0x33_9876_5432, ncap: 3_000_000, ucap: 100_000, shift: 12 };
+        let dig = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let b36 = |mut v: u64, lead: u8, out: &mut Vec<u8>| {
+            let mut t = Vec::new();
+            loop {
+                t.push(dig[(v % 36) as usize]);
+                v /= 36;
+                if v == 0 {
+                    break;
+                }
+            }
+            out.push(lead);
+            out.extend(t.iter().rev());
+        };
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let (mut both, mut over) = (0, 0);
+        for i in 0..400_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            // counters and users around the caps, and values past 40 bits
+            let c = match i % 8 {
+                0 => x % 8_000_000,
+                1 => (1 << 40) + x % (1 << 41),
+                _ => x % 3_000_000,
+            };
+            let u = match i % 5 {
+                0 => (x >> 20) % (300_000 << 9),
+                _ => (x >> 20) % (100_000 << 9),
+            };
+            let mut b = Vec::new();
+            let ve = if c >> 40 != 0 { c } else { scramble(c, k.ek) };
+            b36(ve, b'e', &mut b);
+            let ee = b.len();
+            b.push(b',');
+            let us = b.len();
+            b36(scramble(u, k.uk), b'u', &mut b);
+            let ue = b.len();
+            b.extend_from_slice(b",0123456789abcdef");
+            if ee > 9 {
+                continue;
+            }
+            let want = (k.counter(&b[..ee]), k.user(&b[us..ue]).unwrap_or(NONE));
+            if c < k.ncap {
+                assert_eq!(want.0, c);
+            }
+            unsafe {
+                assert_eq!(k.ids_wide(b.as_ptr(), ee, b.as_ptr().add(us), ue - us), want, "{:?}", std::str::from_utf8(&b));
+                assert_eq!(k.user_wide(b.as_ptr().add(us), ue - us), want.1);
+            }
+            both += (want.0 != NONE && want.1 != NONE) as usize;
+            over += (c >> 40 != 0) as usize;
+        }
+        assert!(both > 100_000 && over > 1000, "{} {}", both, over);
+    }
+
+    #[test]
+    fn the_second_multiplier_inverts() {
+        for x in [1u64, 2, 0x12_3456_789a, M40] {
+            let m = x.wrapping_mul(BINV) & M40;
+            assert_eq!(half(x), m ^ (m >> 17) ^ (m >> 34));
+        }
+    }
+
+    #[test]
+    fn bins_keep_every_record_in_order() {
+        let arena = Arena::new(64 << 20);
+        let mut bins: Bins<u64, 256> = Bins::new(&arena, 7);
+        let tab = bins.cur.as_mut_ptr();
+        let per = [0usize, 1, 31, 32, 33, 64, 1000];
+        let mut left = per;
+        let mut i = 0u64;
+        // round robin, so blocks of different buckets interleave
+        while left.iter().any(|&n| n > 0) {
+            for b in 0..7 {
+                if left[b] > 0 {
+                    left[b] -= 1;
+                    unsafe { bins.put(tab, b, ((b as u64) << 32) | i) };
+                    i += 1;
+                }
+            }
+        }
+        assert_eq!(bins.top(), Some(6));
+        let out = bins.finish();
+        for b in 0..7 {
+            let got: Vec<u64> = out[b].iter().flat_map(|blk| blk.as_slice().iter().copied()).collect();
+            assert_eq!(got.len(), per[b]);
+            assert!(got.iter().all(|&v| v >> 32 == b as u64));
+            assert!(got.windows(2).all(|w| w[0] < w[1]));
+            assert!(out[b].iter().all(|blk| blk.len >= 1 && blk.len <= 32 && blk.ptr as usize % 8 == 0));
+        }
+        let none: Bins<u64, 256> = Bins::new(&arena, 3);
+        assert_eq!(none.top(), None);
+        assert!(none.finish().iter().all(|v| v.is_empty()));
     }
 
     #[test]
