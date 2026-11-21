@@ -348,14 +348,52 @@ fn sample(seed: u64, lines: usize, long: usize) -> Vec<u8> {
     b
 }
 
+/// Four-field lines of exactly 128 bytes, so every one starts on a block
+/// boundary, with a quote or a delimiter on each side of the next boundary:
+/// the cases where one block needs a bit from its neighbour.
+fn edges() -> Vec<u8> {
+    // (the first field opens with a quote, what follows it); five are good
+    const TAILS: [(bool, &[u8]); 12] = [
+        (false, b",\"b,c,d"),
+        (false, b",\"b\",c,d"),
+        (false, b",\",c,d"),
+        (false, b",\"\",c,d"),
+        (false, b"\",b,c,d"),
+        (true, b"\",b,c,d"),
+        (true, b",b,c,d"),
+        (true, b"\"\",b,c,d"),
+        (false, b",b\",c,d"),
+        (false, b",,\"c\",d"),
+        (false, b",\"b\"\",c,d"),
+        (true, b"\",\"b\",\"c\",d"),
+    ];
+    let mut b: Vec<u8> = vec![b'h', 10];
+    for pre in 56..72usize {
+        for &(quoted, tail) in TAILS.iter() {
+            let at = b.len();
+            if quoted {
+                b.push(b'"');
+            }
+            b.resize(at + pre, b'x');
+            b.extend_from_slice(tail);
+            b.resize(at + 127, b'y');
+            b.push(10);
+        }
+    }
+    b
+}
+
 /// The two-pass splitter must hand out exactly the rows the reference one
 /// does, for every field count in use; checked once at startup.
 pub fn agrees() -> bool {
     let d = sample(0x243f_6a88_85a3_08d3, 400, 200);
-    let cuts = [0, d.len() / 3, d.len() / 2, d.len()];
+    let mut cuts: Vec<usize> = (0..d.len()).step_by(2500).collect();
+    cuts.push(d.len());
+    let e = edges();
     collect::<7>(&d, &cuts, true) == collect::<7>(&d, &cuts, false)
         && collect::<4>(&d, &cuts, true) == collect::<4>(&d, &cuts, false)
         && collect::<2>(&d, &cuts, true) == collect::<2>(&d, &cuts, false)
+        && collect::<4>(&e, &[0, e.len()], true) == collect::<4>(&e, &[0, e.len()], false)
 }
 
 #[cfg(test)]
@@ -425,6 +463,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rows_match_at_block_edges() {
+        let e = edges();
+        let a = collect::<4>(&e, &[0, e.len()], true);
+        assert!(a == collect::<4>(&e, &[0, e.len()], false));
+        assert_eq!(a.len(), 16 * 5);
+        assert!(agrees());
     }
 
     #[test]
