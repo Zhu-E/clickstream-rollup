@@ -2498,6 +2498,10 @@ pub(crate) fn run(
         })
     };
     let t_rows = t0.elapsed();
+    crate::sys::stage("parse");
+    if timing {
+        eprintln!("  arena used {} MB", arena.used() >> 20);
+    }
     // parse only, for counting instructions
     if std::env::var_os("SS_FSTOP").is_some() {
         std::process::exit(0);
@@ -2564,6 +2568,7 @@ pub(crate) fn run(
         eprintln!("  fast: general users {} of {}", ng, u.len());
     }
     let t_parse = t0.elapsed();
+    crate::sys::stage("links");
 
     let mut eparts = Vec::new();
     let mut cparts = Vec::new();
@@ -2591,6 +2596,7 @@ pub(crate) fn run(
     let eb = merge_blocks(eparts, nb_e);
     let cbk = merge_blocks(cparts, nb_c);
     let t_merged = t0.elapsed();
+    crate::sys::stage("merge");
     let gbits = ctx.per_bits.min(10);
     let nbg = 1usize << gbits;
     let gbk = |person: u64| -> usize {
@@ -2665,6 +2671,10 @@ pub(crate) fn run(
         });
     }
     let t_cg = t0.elapsed();
+    crate::sys::stage("clicks");
+    if timing {
+        eprintln!("  arena used {} MB", arena.used() >> 20);
+    }
 
     let nw = (k.ucap as usize + 63) / 64;
     let mut forced = vec![0u64; nw];
@@ -2747,6 +2757,7 @@ pub(crate) fn run(
 
     // ---- walk the counters
     let t_odd = t0.elapsed();
+    crate::sys::stage("odd");
     // a fair share at one row per event: far more than needed, and untouched pages cost nothing
     let out_rows = rows / nt.max(1) + 4096;
     let sh = Sh { ctx, lk, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows, forced: &forced, defer: &defer, seen: &seen, bad: &bad, cl0, gbits };
@@ -2776,6 +2787,10 @@ pub(crate) fn run(
         }
     });
     let t_walk = t0.elapsed();
+    crate::sys::stage("walk");
+    if timing {
+        eprintln!("  arena used {} MB", arena.used() >> 20);
+    }
 
     // ---- runs cut by a bucket edge: put each user's pieces back together
     for w in wks.iter_mut() {
@@ -2824,6 +2839,10 @@ pub(crate) fn run(
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let t_stitch = t0.elapsed();
+    crate::sys::stage("regroup");
+    if timing {
+        eprintln!("  arena used {} MB", arena.used() >> 20);
+    }
     if bad.load(Ordering::SeqCst) {
         if timing {
             eprintln!("  fast: gave up, a user's rows were not contiguous");
@@ -2885,6 +2904,7 @@ pub(crate) fn run(
     }
     // nothing below needs more than these links
     ctx.set_links(links);
+    crate::sys::stage("outs");
     Some(FastOut { pb, cb, outs, xn })
 }
 
