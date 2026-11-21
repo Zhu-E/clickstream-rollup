@@ -1250,21 +1250,56 @@ fn cl_rare(x: Env, fr: u64, p: usize, cs: &mut ClBins, oddc: &mut Vec<OddCl>, dc
     cl_line(x, fr, p, cs, oddc, dc)
 }
 
+/// a row the tables left: its date noted, then the window, then the reference
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[cold]
+#[inline(never)]
+unsafe fn cl_second(
+    x: Env,
+    fr: u64,
+    p: usize,
+    cs: &mut ClBins,
+    oddc: &mut Vec<OddCl>,
+    dc: &mut DateCache,
+    days: &mut rowk::Days,
+    camps: Option<&CampTab>,
+    fine: bool,
+) -> usize {
+    let p0 = x.d.as_ptr().add(p);
+    let cut = split::Cut::new();
+    let tab = cs.cur.as_mut_ptr();
+    let m = split::masks(p0, &cut);
+    if let Some((mut a, nl)) = split::tail::<3>(m.0, m.1, m.2) {
+        let mut w = a;
+        let (s3, e3) = (w.next(), w.next(), w.next(), w.next()).3;
+        days.learn(std::slice::from_raw_parts(p0.add(s3), e3 - s3));
+        if cl_row::<true>(x, fr, p0, || a.next(), tab, cs, oddc, dc, camps, fine) {
+            return p + nl + 1;
+        }
+    }
+    cl_rare(x, fr, p, cs, oddc, dc)
+}
+
 fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let x = Env::new(ctx, k, fi, simd, ctx.cl_lo, ctx.cl_hi);
     let d = x.d;
     let mut p = first_line_start(d, from);
-    let PSt { cs, oddc, dc, .. } = st;
     let fr = (fi - cl0) as u64;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
     if simd {
-        let cut = split::Cut::new();
-        let tab = cs.cur.as_mut_ptr();
+        let PSt { cs, oddc, dc, days, .. } = &mut *st;
         // rows that start before `to` and have a whole window to read
         let stop = to.min((d.len() + 1).saturating_sub(split::REACH));
+        // the tables read a little before a row
+        while p < stop.min(16) {
+            p = cl_line(x, fr, p, cs, oddc, dc);
+        }
         // every campaign index is below ncamp, from either lookup
         let fine = fr < 256 && (d.len() as u64) < (1 << 36) && ctx.ncamp <= 1 << 16;
+        // the campaign numbers the kernel's rows may name; none when a record could not hold them
+        let ncn = if fine { ctx.camp.len() as u64 } else { 0 };
+        let kern = rowk::Kern::new(k, days.as_ptr());
         // one table per thread, rebuilt only when the campaigns change
         let sum = CampTab::sum(&ctx.camp);
         CAMPS.with(|c| {
@@ -1273,21 +1308,34 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
                 *c = Some((sum, CampTab::new(&ctx.camp)));
             }
             let camps = c.as_ref().and_then(|t| t.1.as_ref());
+            let tab = cs.cur.as_mut_ptr();
             while p < stop {
                 unsafe {
                     let p0 = d.as_ptr().add(p);
-                    let m = split::masks(p0, &cut);
-                    if let Some((mut a, nl)) = split::tail::<3>(m.0, m.1, m.2) {
-                        if cl_row::<true>(x, fr, p0, || a.next(), tab, cs, oddc, dc, camps, fine) {
-                            p += nl + 1;
+                    if let Some(e) = rowk::cl(p0, &kern) {
+                        // index + 1, or 0 for a number that is no campaign here
+                        let c = if e.camp < ncn { *ctx.camp.get_unchecked(e.camp as usize) } else { 0 };
+                        if c != 0 {
+                            if (e.ts.wrapping_sub(x.lo) as u64) < x.span {
+                                let ts = (e.ts - ctx.base) as u32;
+                                let ui = e.un >> 9;
+                                let off = (p + e.id) as u64;
+                                cs.put(
+                                    tab,
+                                    (ui >> CSHIFT) as usize,
+                                    FC { a: (ui << 40) | ((ts as u64) << 9) | (e.un & ALIAS), b: (((c - 1) as u64) << 48) | (fr << 40) | (off << 4) | e.nid as u64 },
+                                );
+                            }
+                            p += e.next;
                             continue;
                         }
                     }
+                    p = cl_second(x, fr, p, cs, oddc, dc, days, camps, fine);
                 }
-                p = cl_rare(x, fr, p, cs, oddc, dc);
             }
         });
     }
+    let PSt { cs, oddc, dc, .. } = st;
     while p < to {
         p = cl_line(x, fr, p, cs, oddc, dc);
     }
