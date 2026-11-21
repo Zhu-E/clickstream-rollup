@@ -22,6 +22,7 @@ const MAP_NORESERVE: i32 = 0x4000;
 #[cfg(not(target_os = "linux"))]
 const MAP_NORESERVE: i32 = 0x40;
 const MADV_WILLNEED: i32 = 3;
+const MADV_DONTNEED: i32 = 4;
 #[cfg(target_os = "linux")]
 const MADV_HUGEPAGE: i32 = 14;
 #[cfg(target_os = "linux")]
@@ -259,6 +260,30 @@ impl Map {
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+}
+
+// clear the inputs' page tables on nt threads; exit would do it on one
+pub fn drop_pages(maps: &[Map], nt: usize) {
+    const PIECE: usize = 64 << 20;
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for m in maps {
+        let mut off = 0;
+        while off < m.len {
+            let n = PIECE.min(m.len - off);
+            pieces.push((m.ptr as usize + off, n));
+            off += n;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..nt.min(pieces.len()) {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(p, n)) = pieces.get(k) else { break };
+                unsafe { madvise(p as *mut u8, n, MADV_DONTNEED) };
+            });
+        }
+    });
 }
 
 /// One big anonymous mapping handed out with a bump pointer. Transparent huge
