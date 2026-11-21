@@ -680,6 +680,26 @@ pub fn ingest(b: &[u8], dc: &mut DateCache) -> Ingest {
     ingest_slow(b)
 }
 
+/// The number in `c_` plus two to four digits with no leading zero, which
+/// is all but nine of the campaign ids the generator writes. None says only
+/// that the id is not of that shape.
+#[inline(always)]
+pub fn c_num(b: &[u8]) -> Option<u32> {
+    let n = b.len();
+    if n.wrapping_sub(4) > 2 {
+        return None;
+    }
+    // the last four bytes hold every digit, the units always in the top one
+    let tail = rd4(b, n - 4) as u32;
+    let x = (tail ^ 0x3030_3030) & (!0u32 << (8 * (6 - n)));
+    let bad = (x.wrapping_add(0x7676_7676) | x) & 0x8080_8080;
+    if (rd2(b, 0) != pair(b'c', b'_')) | (bad != 0) | (b[2] == b'0') {
+        return None;
+    }
+    let t = x.wrapping_mul(10).wrapping_add(x >> 8);
+    Some((t & 0xff) * 100 + ((t >> 16) & 0xff))
+}
+
 // --------------------------------------------- invertible short-id encoding
 //
 // Ids here are short strings over a small alphabet, so one fits in a u64 and
@@ -1027,6 +1047,41 @@ mod tests {
         let sec = if ms <= 0 { 0u32 } else { (ms / 1000).min(u32::MAX as i64) as u32 };
         let g = ingest(v, dc);
         assert_eq!((g.ms, g.sec), (ms, sec), "ingest {:?}", String::from_utf8_lossy(v));
+    }
+
+    #[test]
+    fn campaign_numbers_agree_with_the_digit_loop() {
+        // the rule `camp_of` had before: c_ and a canonical decimal
+        let slow = |b: &[u8]| -> Option<u32> {
+            if b.len() < 4 || b.len() > 6 || &b[..2] != b"c_" || b[2] == b'0' {
+                return None;
+            }
+            let mut v = 0u32;
+            for &c in &b[2..] {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                v = v * 10 + (c - b'0') as u32;
+            }
+            Some(v)
+        };
+        for v in 0..10_000u32 {
+            for s in [format!("c_{}", v), format!("c_{:04}", v), format!("c_{:03}", v), format!("C_{}", v), format!("c-{}", v)] {
+                assert_eq!(c_num(s.as_bytes()), slow(s.as_bytes()), "{}", s);
+            }
+        }
+        for s in ["c_1234", "c_123", "c_12", "c_1", "c_", "c", "", "c_12345"] {
+            let mut v = s.as_bytes().to_vec();
+            assert_eq!(c_num(&v), slow(&v), "{}", s);
+            for i in 0..v.len() {
+                let keep = v[i];
+                for c in 0..=255u8 {
+                    v[i] = c;
+                    assert_eq!(c_num(&v), slow(&v), "{:?}", v);
+                }
+                v[i] = keep;
+            }
+        }
     }
 
     #[test]

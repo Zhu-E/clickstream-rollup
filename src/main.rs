@@ -414,6 +414,19 @@ impl Ctx {
     }
     #[inline(always)]
     fn camp_of(&self, cid: &[u8]) -> Option<u32> {
+        // the usual shape, without the digit loop; the rest below is the rule
+        if let Some(v) = c_num(cid) {
+            if (v as usize) < self.camp.len() {
+                let x = unsafe { *self.camp.get_unchecked(v as usize) };
+                if x != 0 {
+                    return Some(x - 1);
+                }
+            }
+        }
+        self.camp_any(cid)
+    }
+    #[inline(never)]
+    fn camp_any(&self, cid: &[u8]) -> Option<u32> {
         if cid.len() >= 3 && cid[0] == b'c' && cid[1] == b'_' {
             if let Some(v) = canon_num(&cid[2..]) {
                 if (v as usize) < self.camp.len() {
@@ -492,6 +505,7 @@ fn parse_events<const ABL: u32>(
     to: usize,
     sink: &mut Sink<ERec>,
     dc: &mut DateCache,
+    ix: &mut split::Index,
     xn: &mut Vec<(u64, u64)>,
 ) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
@@ -501,8 +515,7 @@ fn parse_events<const ABL: u32>(
     let mut lkh = 0usize;
     let mut nrow = 0usize;
     let mut nval = 0usize;
-    let mut ix = split::Index::new();
-    split::each_row::<7, _>(d, p, to, simd, &mut ix, #[inline(always)] |lp, s, e| {
+    split::each_row::<7, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
         let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
         nrow += 1;
         if ABL == 1 || ABL == 2 {
@@ -554,7 +567,8 @@ fn parse_events<const ABL: u32>(
                 acc += ts as usize;
                 break;
             }
-            if ing_ms.saturating_sub(ts) > LATE_MS {
+            // the same as ingest - ts > a day, without the two-sided clamp
+            if ing_ms > ts.saturating_add(LATE_MS) {
                 break;
             }
             let ety = fld(4);
@@ -623,13 +637,20 @@ fn parse_events<const ABL: u32>(
     NVAL.fetch_add(nval, Ordering::Relaxed);
 }
 
-fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CRec>, dc: &mut DateCache) {
+fn parse_clicks(
+    ctx: &Ctx,
+    fi: usize,
+    from: usize,
+    to: usize,
+    sink: &mut Sink<CRec>,
+    dc: &mut DateCache,
+    ix: &mut split::Index,
+) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
     let p = first_line_start(d, from);
     let mut lkh = 0usize;
-    let mut ix = split::Index::new();
-    split::each_row::<4, _>(d, p, to, simd, &mut ix, #[inline(always)] |lp, s, e| {
+    split::each_row::<4, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
         let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
         if s[0] == e[0] {
             return; // empty click_id
@@ -2019,6 +2040,7 @@ fn main() {
                         let lk = ctx.links();
                         let mut es = Sink::<ERec>::new(ar, nb_eid, BLK_E);
                         let mut dc = DateCache::new();
+                        let mut ix = Box::new(split::Index::new());
                         let mut xn: Vec<(u64, u64)> = Vec::new();
                         loop {
                             let k = next.fetch_add(1, Ordering::Relaxed);
@@ -2027,13 +2049,13 @@ fn main() {
                             }
                             let (fi, a, b) = cks[k];
                             match lv {
-                                1 => parse_events::<1>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
-                                2 => parse_events::<2>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
-                                3 => parse_events::<3>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
-                                4 => parse_events::<4>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
-                                5 => parse_events::<5>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
-                                6 => parse_events::<6>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
-                                _ => parse_events::<0>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                1 => parse_events::<1>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut ix, &mut xn),
+                                2 => parse_events::<2>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut ix, &mut xn),
+                                3 => parse_events::<3>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut ix, &mut xn),
+                                4 => parse_events::<4>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut ix, &mut xn),
+                                5 => parse_events::<5>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut ix, &mut xn),
+                                6 => parse_events::<6>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut ix, &mut xn),
+                                _ => parse_events::<0>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut ix, &mut xn),
                             }
                         }
                         std::mem::forget(es);
@@ -2097,6 +2119,7 @@ fn main() {
                     let mut es = Sink::<ERec>::new(arena_e, nb_eid, BLK_E);
                     let mut cs = Sink::<CRec>::new(arena, nb_per, BLK_P);
                     let mut dc = DateCache::new();
+                    let mut ix = Box::new(split::Index::new());
                     let mut xn: Vec<(u64, u64)> = Vec::new();
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
@@ -2111,13 +2134,13 @@ fn main() {
                                 as_users = false;
                             }
                             let lk = if as_users { &ctx.no_links } else { ctx.links() };
-                            parse_events::<0>(ctx, lk, fi as usize, a, b, &mut es, &mut dc, &mut xn);
+                            parse_events::<0>(ctx, lk, fi as usize, a, b, &mut es, &mut dc, &mut ix, &mut xn);
                             NS_EV.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         } else {
                             // clicks are scattered by person
                             ctx.wait_links();
                             let tc = std::time::Instant::now();
-                            parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc);
+                            parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc, &mut ix);
                             NS_CL.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         }
                     }
