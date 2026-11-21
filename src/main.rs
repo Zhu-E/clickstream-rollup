@@ -518,8 +518,8 @@ fn parse_events<const ABL: u32>(
             acc += klo as usize ^ khi as usize;
             return;
         }
-        let ing_ms = parse_ts_c(fld(3), dc).unwrap_or(0);
-        let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
+        let g = ingest(fld(3), dc);
+        let (ing_ms, ing) = (g.ms, g.sec);
 
         // Resolving a user to a person ends in a line of a link map far too
         // big to cache. The probe is started here and read after validation,

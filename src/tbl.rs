@@ -359,77 +359,135 @@ fn val8(w: u64) -> u64 {
     val8x(w.wrapping_sub(ZEROS))
 }
 
-const HI_BITS: u64 = 0x8080_8080_8080_8080;
+// A time of day is read two bytes at a time through tables indexed by the
+// pair itself, so a lookup validates and converts at once and anything that
+// is not the expected pair lands on `TBAD`. The pairs of `HH:MM:SS` are
+// `HH`, `:M`, `M:` and `SS`, which leaves no separator unchecked.
 
-/// `HH:MM:SS` as a word: seconds into the day, and nonzero when it is not a
-/// time. Each byte is checked against its own limit by one carry-free add.
-#[inline(always)]
-fn hms(t: u64) -> (u64, u64) {
-    let x = t ^ 0x3030_3a30_303a_3030;
-    // per byte 0x7f - limit: h 2 9, colon 0, m 5 9, colon 0, s 5 9
-    let bad = (x.wrapping_add(0x767a_7f76_7a7f_767d) | x) & HI_BITS;
-    let y = x.wrapping_mul(0xa01);
-    let h = (y >> 8) & 0xff;
-    let m = (y >> 32) & 0xff;
-    let s = y >> 56;
-    (h * 3600 + m * 60 + s, bad | (h > 23) as u64)
+/// At least this much in a sum of table entries means some pair was wrong.
+const TBAD: u32 = 1 << 20;
+
+const fn pair(a: u8, b: u8) -> usize {
+    a as usize | ((b as usize) << 8)
 }
 
-/// `HH:MM` in the low five bytes: the offset in seconds, and nonzero when bad.
+/// Seconds for `HH`, `:M`, `M:` and `SS`.
+const fn tod_tbl(kind: usize) -> [u32; 65536] {
+    let mut t = [TBAD; 65536];
+    let mut a = 0u8;
+    while a < 10 {
+        let mut c = 0u8;
+        while c < 10 {
+            let v = (a * 10 + c) as u32;
+            if kind == 0 && v < 24 {
+                t[pair(b'0' + a, b'0' + c)] = v * 3600;
+            }
+            if kind == 3 && v < 60 {
+                t[pair(b'0' + a, b'0' + c)] = v;
+            }
+            c += 1;
+        }
+        if kind == 1 && a < 6 {
+            t[pair(b':', b'0' + a)] = a as u32 * 600;
+        }
+        if kind == 2 {
+            t[pair(b'0' + a, b':')] = a as u32 * 60;
+        }
+        a += 1;
+    }
+    t
+}
+
+static TOD: [[u32; 65536]; 4] = [tod_tbl(0), tod_tbl(1), tod_tbl(2), tod_tbl(3)];
+
 #[inline(always)]
-fn hm(t: u64) -> (u64, u64) {
-    let x = t ^ 0x30_303a_3030;
-    let bad = (x.wrapping_add(0x76_7a7f_767d) | x) & 0x80_8080_8080;
-    let y = x.wrapping_mul(0xa01);
-    let h = (y >> 8) & 0xff;
-    let m = (y >> 32) & 0xff;
-    (h * 3600 + m * 60, bad | (h > 23) as u64)
+fn rd2(b: &[u8], i: usize) -> usize {
+    let mut t = [0u8; 2];
+    t.copy_from_slice(&b[i..i + 2]);
+    u16::from_le_bytes(t) as usize
+}
+
+/// Seconds into the day of `HH:MM:SS` at `b[i..i + 8]`, or `TBAD` and up.
+#[inline(always)]
+fn tod(b: &[u8], i: usize) -> u32 {
+    TOD[0][rd2(b, i)] + TOD[1][rd2(b, i + 2)] + TOD[2][rd2(b, i + 4)] + TOD[3][rd2(b, i + 6)]
+}
+
+/// Seconds of the `HH:MM` at `b[i..i + 5]`, or `TBAD` and up.
+#[inline(always)]
+fn hhmm(b: &[u8], i: usize) -> u32 {
+    TOD[0][rd2(b, i)] + TOD[1][rd2(b, i + 2)] + TOD[2][pair(b[i + 4], b':')]
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DateEnt {
-    klo: u64,
-    khi: u64,
+    k1: u64,
+    k2: u64,
     ms: i64,
-    pad: u64,
+    sec: i64,
 }
 
-/// Caches `YYYY-MM-DD` -> milliseconds at that midnight. A dataset's window
-/// spans a couple of weeks, so a handful of dates cover almost every row.
+/// Caches `YYYY-MM-DDT` -> that midnight, in milliseconds and in seconds. A
+/// dataset's window spans a couple of weeks, so a handful of dates cover
+/// almost every row. Only real dates whose seconds fit a u32 get in, so a hit
+/// needs no further check; everything else goes to `parse_ts` each time.
 pub struct DateCache {
-    e: [DateEnt; 64],
+    e: [DateEnt; 128],
 }
 
-const BAD: i64 = i64::MIN;
+/// Where a date lives: the low bits of its day and the parity of its month.
+#[inline(always)]
+fn slot(k2: u64) -> usize {
+    const M: u64 = (1 << 24) | (3 << 40) | (0xf << 48);
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        core::arch::x86_64::_pext_u64(k2, M) as usize
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        (((k2 >> 24) & 1) | ((k2 >> 39) & 6) | ((k2 >> 45) & 0x78)) as usize
+    }
+}
 
 impl DateCache {
     pub fn new() -> DateCache {
-        DateCache { e: [DateEnt { klo: 1, khi: 0, ms: BAD, pad: 0 }; 64] }
+        // no slot starts out holding a key that maps to it
+        let mut e = [DateEnt { k1: 0, k2: !0, ms: 0, sec: 0 }; 128];
+        e[127].k2 = 0;
+        DateCache { e }
     }
-    /// Midnight of the date in `b[..10]`, or `BAD`.
+    /// The entry for the date `b` opens with, which a `T` must follow; `b`
+    /// has at least eleven bytes.
     #[inline(always)]
-    fn day_ms(&mut self, b: &[u8]) -> i64 {
-        let k = rd8(b, 0);
-        let mut t = [0u8; 2];
-        t.copy_from_slice(&b[8..10]);
-        let k2 = u16::from_le_bytes(t) as u64;
-        let i = (((k2 << 4) ^ (k2 >> 8)) & 63) as usize;
-        let e = unsafe { self.e.get_unchecked(i) };
-        if ((e.klo ^ k) | (e.khi ^ k2)) == 0 {
-            return e.ms;
+    fn day(&mut self, b: &[u8]) -> Option<&DateEnt> {
+        let k1 = rd8(b, 0);
+        let k2 = rd8(b, 3);
+        let i = slot(k2);
+        let hit = {
+            let e = unsafe { self.e.get_unchecked(i) };
+            ((e.k1 ^ k1) | (e.k2 ^ k2)) == 0
+        };
+        if !hit && !self.fill(b, i, k1, k2) {
+            return None;
         }
-        self.fill(b, i, k, k2)
+        Some(unsafe { self.e.get_unchecked(i) })
     }
+    /// Put the date in its slot, if it is one.
     #[cold]
     #[inline(never)]
-    fn fill(&mut self, b: &[u8], i: usize, k: u64, k2: u64) -> i64 {
-        let ms = match date_days(b) {
-            Some(d) => d * DAY_MS,
-            None => BAD,
-        };
-        self.e[i] = DateEnt { klo: k, khi: k2, ms, pad: 0 };
-        ms
+    fn fill(&mut self, b: &[u8], i: usize, k1: u64, k2: u64) -> bool {
+        if b[10] != b'T' {
+            return false;
+        }
+        // 1970-01-02 to 2104: seconds after midnight still fit a u32
+        match date_days(b) {
+            Some(d) if d >= 1 && d <= 49_000 => {
+                self.e[i & 127] = DateEnt { k1, k2, ms: d * DAY_MS, sec: d * 86_400 };
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -522,6 +580,11 @@ fn split_digits_sw(b: &[u8], k: usize) -> Option<(u64, u64)> {
 #[inline(always)]
 fn epoch_fast(b: &[u8]) -> Option<i64> {
     let n = b.len();
+    if n == 13 {
+        // what the generator writes: the same with every constant known
+        let (hi, lo) = split_digits(b, 5)?;
+        return Some((hi * 100_000 + lo) as i64);
+    }
     if n.wrapping_sub(8) <= 8 {
         let k = n - 8;
         let (hi, lo) = split_digits(b, k)?;
@@ -550,36 +613,71 @@ fn epoch_slow(b: &[u8]) -> Option<i64> {
     Some(v as i64)
 }
 
-/// Same contract as `parse_ts`, with the date cache in front.
+/// Whatever the fast paths would not take: the reference decides.
+#[cold]
+#[inline(never)]
+fn ts_slow(b: &[u8]) -> Option<i64> {
+    parse_ts(b)
+}
+
+/// Same contract as `parse_ts`. The two calendar forms are taken only when
+/// the date is cached and every pair of the time checks out; anything else
+/// about them is `parse_ts`'s to judge.
 #[inline(always)]
 pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = b.len();
     if n == 20 {
-        if (b[19] ^ b'Z') | (b[10] ^ b'T') != 0 {
-            return epoch_slow(b);
+        if let Some(e) = dc.day(b) {
+            let t = tod(b, 11);
+            if (t < TBAD) & (b[19] == b'Z') {
+                return Some(e.ms + t as i64 * 1000);
+            }
         }
-        let day = dc.day_ms(b);
-        let (s, bad) = hms(rd8(b, 11));
-        if (bad != 0) | (day == BAD) {
-            return None;
-        }
-        Some(day + s as i64 * 1000)
+        ts_slow(b)
     } else if n == 25 {
-        let neg = b[19] == b'-';
-        if !(neg | (b[19] == b'+')) {
-            return epoch_slow(b);
+        if let Some(e) = dc.day(b) {
+            let t = tod(b, 11);
+            let o = hhmm(b, 20);
+            let neg = b[19] == b'-';
+            if ((t | o) < TBAD) & (neg | (b[19] == b'+')) {
+                let o = o as i64 * 1000;
+                return Some(e.ms + t as i64 * 1000 + if neg { o } else { -o });
+            }
         }
-        let day = dc.day_ms(b);
-        let (s, bad) = hms(rd8(b, 11));
-        let (off, obad) = hm(rd4(b, 20) | ((b[24] as u64) << 32));
-        if ((bad | obad) != 0) | (day == BAD) | (b[10] != b'T') {
-            return None;
-        }
-        let off = off as i64 * 1000;
-        Some(day + s as i64 * 1000 + if neg { off } else { -off })
+        ts_slow(b)
     } else {
         epoch_fast(b)
     }
+}
+
+/// An `ingest_ts`: milliseconds, and whole seconds clamped to a u32. Both are
+/// zero when the field is not a timestamp.
+#[derive(Clone, Copy)]
+pub struct Ingest {
+    pub ms: i64,
+    pub sec: u32,
+}
+
+#[cold]
+#[inline(never)]
+fn ingest_slow(b: &[u8]) -> Ingest {
+    let ms = parse_ts(b).unwrap_or(0);
+    Ingest { ms, sec: if ms <= 0 { 0 } else { (ms / 1000).min(u32::MAX as i64) as u32 } }
+}
+
+/// `ingest_ts`, which the rules promise is `YYYY-MM-DDTHH:MM:SSZ`: no choice
+/// of form on the way in. Anything else gets what `parse_ts` makes of it.
+#[inline(always)]
+pub fn ingest(b: &[u8], dc: &mut DateCache) -> Ingest {
+    if b.len() == 20 {
+        if let Some(e) = dc.day(b) {
+            let t = tod(b, 11);
+            if (t < TBAD) & (b[19] == b'Z') {
+                return Ingest { ms: e.ms + t as i64 * 1000, sec: (e.sec + t as i64) as u32 };
+            }
+        }
+    }
+    ingest_slow(b)
 }
 
 // --------------------------------------------- invertible short-id encoding
@@ -911,6 +1009,64 @@ mod tests {
         }
     }
 
+    #[inline(never)]
+    pub fn probe_ts(b: &[u8], dc: &mut DateCache) -> i64 {
+        parse_ts_c(b, dc).unwrap_or(0)
+    }
+    #[inline(never)]
+    pub fn probe_ingest(b: &[u8], dc: &mut DateCache) -> i64 {
+        let g = ingest(b, dc);
+        g.ms ^ g.sec as i64
+    }
+
+    /// both fast decoders against the reference, for one field
+    fn same(v: &[u8], dc: &mut DateCache) {
+        let want = parse_ts(v);
+        assert_eq!(parse_ts_c(v, dc), want, "{:?}", String::from_utf8_lossy(v));
+        let ms = want.unwrap_or(0);
+        let sec = if ms <= 0 { 0u32 } else { (ms / 1000).min(u32::MAX as i64) as u32 };
+        let g = ingest(v, dc);
+        assert_eq!((g.ms, g.sec), (ms, sec), "ingest {:?}", String::from_utf8_lossy(v));
+    }
+
+    #[test]
+    fn time_tables_hold_exactly_the_valid_pairs() {
+        for v in 0..65536usize {
+            let (a, c) = ((v & 255) as u8, (v >> 8) as u8);
+            let (da, dc) = (a.wrapping_sub(b'0'), c.wrapping_sub(b'0'));
+            let two = if da < 10 && dc < 10 { Some(da as u32 * 10 + dc as u32) } else { None };
+            assert_eq!(TOD[0][v], match two { Some(x) if x < 24 => x * 3600, _ => TBAD });
+            assert_eq!(TOD[1][v], if a == b':' && dc < 6 { dc as u32 * 600 } else { TBAD });
+            assert_eq!(TOD[2][v], if c == b':' && da < 10 { da as u32 * 60 } else { TBAD });
+            assert_eq!(TOD[3][v], match two { Some(x) if x < 60 => x, _ => TBAD });
+        }
+    }
+
+    #[test]
+    fn date_cache_survives_collisions_and_odd_dates() {
+        let mut rng = Rng(0x7f4a_7c15_9e37_79b9);
+        let mut dc = DateCache::new();
+        let mut pool: Vec<Vec<u8>> = Vec::new();
+        for y in [1969u32, 1970, 1971, 2024, 2027, 2028, 2103, 2104, 2105, 2106, 2107, 9999] {
+            for (m, d) in [(1u32, 1u32), (1, 2), (2, 28), (2, 29), (2, 30), (3, 1), (12, 31), (11, 31), (13, 1), (0, 1), (6, 0)] {
+                pool.push(format!("{:04}-{:02}-{:02}", y, m, d).into_bytes());
+            }
+        }
+        pool.push(vec![0u8; 10]);
+        pool.push(vec![0xffu8; 10]);
+        let tails: [&[u8]; 7] = [b"12:34:56Z", b"00:00:00Z", b"23:59:59Z", b"24:00:00Z", b"12:34:56+05:30", b"12:34:56-23:59", b"12:34:56z"];
+        for it in 0..400_000u32 {
+            let mut v = pool[rng.below(pool.len() as u64) as usize].clone();
+            v.push(if rng.below(50) == 0 { b' ' } else { b'T' });
+            v.extend_from_slice(tails[rng.below(tails.len() as u64) as usize]);
+            same(&v, &mut dc);
+            // an untouched cache must not take nothing-but-zeros for a date either
+            if it < 200 {
+                same(&v, &mut DateCache::new());
+            }
+        }
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -948,7 +1104,7 @@ mod tests {
                 let keep = v[i];
                 for c in 0..=255u8 {
                     v[i] = c;
-                    assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                    same(&v, &mut dc);
                 }
                 v[i] = keep;
             }
@@ -968,10 +1124,10 @@ mod tests {
                 for d in 0..100 {
                     put(&mut v, 5, mo);
                     put(&mut v, 8, d);
-                    assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
-                    assert_eq!(parse_ts(&v[..19]), parse_ts_c(&v[..19], &mut dc));
+                    same(&v, &mut dc);
+                    same(&v[..19], &mut dc);
                     v[19] = b'Z';
-                    assert_eq!(parse_ts(&v[..20]), parse_ts_c(&v[..20], &mut dc));
+                    same(&v[..20], &mut dc);
                     v[19] = b'+';
                 }
             }
@@ -989,10 +1145,10 @@ mod tests {
                         let keep = [v[at2], v[at2 + 1]];
                         for b in 0..100 {
                             put(&mut v, at2, b);
-                            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                            same(&v, &mut dc);
                             let mut z = v[..20].to_vec();
                             z[19] = b'Z';
-                            assert_eq!(parse_ts(&z), parse_ts_c(&z, &mut dc), "{:?}", String::from_utf8_lossy(&z));
+                            same(&z, &mut dc);
                         }
                         v[at2] = keep[0];
                         v[at2 + 1] = keep[1];
@@ -1065,7 +1221,7 @@ mod tests {
                     _ => {}
                 }
             }
-            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+            same(&v, &mut dc);
         }
     }
 
@@ -1110,6 +1266,71 @@ mod tests {
             let v: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
             assert_eq!(key96(&v), slow(&v), "{:?}", v);
         }
+    }
+
+    /// Not a test: `SS_KIND=f1|f2|f3|ing|pair|none SS_N=<calls>` under
+    /// `perf stat`, differenced against `SS_N=0`, gives instructions a call.
+    #[test]
+    #[ignore]
+    fn bench_ts() {
+        let kind = std::env::var("SS_KIND").unwrap_or_default();
+        let n: usize = std::env::var("SS_N").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut rng = Rng(0x1357_9bdf_2468_ace1);
+        let w0 = 1_828_000_000_000i64;
+        // (ts, ingest) as an event row has them: same window, minutes apart
+        let rows: Vec<(String, String)> = (0..1024)
+            .map(|_| {
+                let ts = w0 + rng.below(14 * 86_400) as i64 * 1000;
+                let ing = ts + (1 + rng.below(600)) as i64 * 1000;
+                let off = [0i64, 60, -240, 330, 720, -600][rng.below(6) as usize];
+                let t = match kind.as_str() {
+                    "f2" => {
+                        let mut s = civil_text(ts, off, &mut rng);
+                        while s.len() != 25 {
+                            s = civil_text(ts, off, &mut rng);
+                        }
+                        s
+                    }
+                    "f3" => format!("{}", ts + rng.below(1000) as i64),
+                    _ => {
+                        let mut s = civil_text(ts, 0, &mut rng);
+                        while s.len() != 20 {
+                            s = civil_text(ts, 0, &mut rng);
+                        }
+                        s
+                    }
+                };
+                let mut g = civil_text(ing, 0, &mut rng);
+                while g.len() != 20 {
+                    g = civil_text(ing, 0, &mut rng);
+                }
+                (t, g)
+            })
+            .collect();
+        // one loop per kind, so no dispatch is counted
+        fn run<F: FnMut(&[u8], &[u8]) -> i64>(rows: &[(String, String)], n: usize, mut f: F) -> i64 {
+            let mut acc = 0i64;
+            for i in 0..n {
+                let (t, g) = &rows[i & 1023];
+                acc ^= f(std::hint::black_box(t.as_bytes()), std::hint::black_box(g.as_bytes()));
+            }
+            acc
+        }
+        let mut dc = DateCache::new();
+        let acc = match kind.as_str() {
+            "none" => run(&rows, n, |t, g| t.len() as i64 ^ g.len() as i64),
+            "ing" => run(&rows, n, |_, g| {
+                let a = ingest(g, &mut dc);
+                a.ms ^ a.sec as i64
+            }),
+            "old_ing" => run(&rows, n, |_, g| {
+                let ms = parse_ts_c(g, &mut dc).unwrap_or(0);
+                let sec = if ms <= 0 { 0u32 } else { (ms / 1000).min(u32::MAX as i64) as u32 };
+                ms ^ sec as i64
+            }),
+            _ => run(&rows, n, |t, _| parse_ts_c(t, &mut dc).unwrap_or(0)),
+        };
+        println!("acc {}", std::hint::black_box(acc));
     }
 
     #[test]
