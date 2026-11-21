@@ -14,6 +14,9 @@ const MAX_SHIFT: u32 = 15;
 const CSHIFT: u32 = 10;
 const GENERAL: u32 = 1 << 31;
 
+/// how many users ahead of the one being folded the clicks are asked for
+const AHEAD: usize = 3;
+
 const DEAD: u64 = 1;
 const LIVE: u64 = 2;
 const ESC: u64 = 3;
@@ -1489,6 +1492,14 @@ struct Wk<'a> {
     /// the current user's events in counter order: room for every slot of a bucket
     ev: Blob<PRec>,
     run: Vec<PRec>,
+    c: cols::Cols,
+    lt: cols::Light,
+    /// the vector kernels are in the build and agree with the plain ones
+    simd: bool,
+    /// nanoseconds in dedup, compact, cut and the fold of the persons
+    ns: [u64; 4],
+    /// users folded in place and not yet noted in the shared bits: word, bits
+    seen: (usize, u64),
     cl: Vec<CRec>,
     t: Tmp,
     o: Out,
@@ -1496,8 +1507,8 @@ struct Wk<'a> {
     gc: Sink<'a, CRec>,
     frags: Vec<Frag>,
     xn: Vec<(u64, u64)>,
-    g_un: u64,
-    g_person: u64,
+    /// the persons of the user ids seen last, by the low bits of the alias
+    g_memo: [(u64, u64); 16],
     hits: usize,
     inline_ev: usize,
     general_ev: usize,
@@ -1517,6 +1528,11 @@ impl<'a> Wk<'a> {
             slots: Blob::zeroed(1 << sh.k.shift),
             ev: Blob::zeroed(1 << sh.k.shift),
             run: Vec::new(),
+            c: cols::Cols::new(1 << sh.k.shift),
+            lt: cols::Light::new(sh.ctx.ncamp),
+            simd: cols::VEC && SIMD_OK.load(Ordering::Relaxed),
+            seen: (0, 0),
+            ns: [0; 4],
             cl: Vec::new(),
             t: Tmp::new(sh.ctx),
             o: Out::new(sh.out_rows, (sh.ctx.ncamp + 1) * (sh.ctx.ndays + 2)),
@@ -1524,8 +1540,7 @@ impl<'a> Wk<'a> {
             gc: Sink::new(arena, nbg, 64),
             frags: Vec::new(),
             xn: Vec::new(),
-            g_un: u64::MAX,
-            g_person: 0,
+            g_memo: [(u64::MAX, 0); 16],
             hits: 0,
             inline_ev: 0,
             general_ev: 0,
@@ -1537,14 +1552,15 @@ impl<'a> Wk<'a> {
     /// an event whose id is not part of its user's own person
     #[inline(never)]
     fn general(&mut self, sh: &Sh, un: u64, ts: u32, pc: u32) {
-        if un != self.g_un {
+        // a user's rows change alias all the time: one entry per low alias bits
+        let e = &mut self.g_memo[(un & 15) as usize];
+        if e.0 != un {
             let mut nb = [0u8; 9];
             let n = sh.k.user_str(un, &mut nb);
-            self.g_un = un;
             self.hits += 1;
-            self.g_person = person_in(sh.lk, &nb[..n]);
+            *e = (un, person_in(sh.lk, &nb[..n]));
         }
-        let person = self.g_person;
+        let person = e.1;
         self.general_ev += 1;
         self.gp.push(sh.gb(person), PRec { person, ts, pc });
     }
@@ -1666,79 +1682,390 @@ impl<'a> Wk<'a> {
         }
     }
 
-    /// dedup one counter range into the slots, then fold it in counter order
+    /// one slot the plain way: its event, if it holds one, joins the columns at `m`
+    #[inline(never)]
+    fn slot_one(&mut self, sh: &Sh, b: usize, i: usize, m: usize) -> usize {
+        let slot = unsafe { &mut *self.slots.as_mut_ptr().add(i) };
+        let s = *slot;
+        if s.a == 0 {
+            return m;
+        }
+        slot.a = 0;
+        let (ts, un, pc) = if s.a & 3 == LIVE {
+            ((s.a >> 33) as u32, (s.a >> 2) & 0x7fff_ffff, (s.b >> 32) as u32)
+        } else {
+            match self.escaped(sh, ((b as u64) << sh.k.shift) | i as u64, s) {
+                Some(e) => e,
+                None => return m,
+            }
+        };
+        unsafe {
+            *self.c.cu.p().add(m) = un as u32;
+            *self.c.ct.p().add(m) = ts;
+        }
+        if pc != 0 {
+            self.c.pl.push(((m as u64) << 32) | pc as u64);
+        }
+        m + 1
+    }
+
+    /// the slots in counter order into the event columns; returns how many
+    fn compact(&mut self, sh: &Sh, b: usize) -> usize {
+        let n = 1usize << sh.k.shift;
+        self.c.pl.clear();
+        let mut m = 0usize;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl", target_feature = "avx2", target_feature = "popcnt", target_feature = "bmi2"))]
+        if self.simd {
+            let slots = self.slots.as_mut_ptr() as *mut u64;
+            let (cu, ct) = (self.c.cu.p(), self.c.ct.p());
+            let mut i = 0usize;
+            while i < n {
+                let (live, priced, esc) = unsafe { cols::v::slots4(slots.add(2 * i), cu.add(m), ct.add(m)) };
+                if esc != 0 {
+                    for q in i..i + 4 {
+                        m = self.slot_one(sh, b, q, m);
+                    }
+                } else {
+                    if priced {
+                        let mut at = m;
+                        for q in 0..4 {
+                            let pc = unsafe { *slots.add(2 * (i + q) + 1) } >> 32;
+                            if live >> q & 1 != 0 {
+                                if pc != 0 {
+                                    self.c.pl.push(((at as u64) << 32) | pc);
+                                }
+                                at += 1;
+                            }
+                        }
+                    }
+                    unsafe { cols::v::zero4(slots.add(2 * i)) };
+                    m += live.count_ones() as usize;
+                }
+                i += 4;
+            }
+            return m;
+        }
+        for i in 0..n {
+            m = self.slot_one(sh, b, i, m);
+        }
+        m
+    }
+
+    /// sessions and rows of events `0..m`; returns how many rows
+    fn cut(&mut self, sh: &Sh, m: usize) -> usize {
+        let ctx = sh.ctx;
+        let (cu, ct, si, st, su) = (self.c.cu.p(), self.c.ct.p(), self.c.si.p(), self.c.st.p(), self.c.su.p());
+        let (sd, sv, rs, rrev, rcat) = (self.c.sd.p(), self.c.sv.p(), self.c.rs.p(), self.c.rrev.p(), self.c.rcat.p());
+        let dis = &mut self.c.dis;
+        dis.clear();
+        // days count from the day the time base is in
+        let rem = ctx.base.rem_euclid(DAY_MS) as u32;
+        let off = (ctx.base.div_euclid(DAY_MS) - ctx.day0) as u32;
+        unsafe {
+            *cu.offset(-1) = cols::BEFORE;
+            for i in m..m + 8 {
+                *cu.add(i) = cols::AFTER;
+                *ct.add(i) = 0;
+            }
+            *su.offset(-1) = cols::BEFORE;
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl", target_feature = "avx2", target_feature = "popcnt", target_feature = "bmi2"))]
+            let (ns, nr) = if self.simd {
+                let ns = cols::v::cut_sessions(cu, ct, m, si, st, su, dis);
+                for k in ns..ns + 9 {
+                    *su.add(k) = cols::AFTER;
+                    *st.add(k) = 0;
+                }
+                (ns, cols::v::cut_rows(st, su, ns, rem, off, sd, rs))
+            } else {
+                let ns = cols::cut_sessions_plain(cu, ct, m, si, st, su, dis);
+                (ns, cols::cut_rows_plain(st, su, ns, rem, off, sd, rs))
+            };
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl", target_feature = "avx2", target_feature = "popcnt", target_feature = "bmi2")))]
+            let (ns, nr) = {
+                let ns = cols::cut_sessions_plain(cu, ct, m, si, st, su, dis);
+                (ns, cols::cut_rows_plain(st, su, ns, rem, off, sd, rs))
+            };
+            // the starts are read 8 at a time
+            for k in ns..ns + 9 {
+                *st.add(k) = 0;
+            }
+            std::ptr::write_bytes(sv, 0, ns);
+            std::ptr::write_bytes(rrev, 0, nr);
+            std::ptr::write_bytes(rcat, CAT_NONE as u8, nr);
+            nr
+        }
+    }
+
+    /// dedup one counter range into the slots, then fold it as columns
     fn bucket(&mut self, sh: &Sh, b: usize) {
         let blocks = &sh.eb[b];
         if blocks.is_empty() {
             return;
         }
+        debug_assert!(cols::VEC || !self.simd);
         let n = 1usize << sh.k.shift;
+        let t0 = std::time::Instant::now();
         self.dedup(sh, blocks, n - 1);
-        let slots = self.slots.as_mut_ptr();
+        let t1 = std::time::Instant::now();
+        let m = self.compact(sh, b);
+        let t2 = std::time::Instant::now();
+        self.ns[0] += (t1 - t0).as_nanos() as u64;
+        self.ns[1] += (t2 - t1).as_nanos() as u64;
+        if m == 0 {
+            return;
+        }
+        let nr = self.cut(sh, m);
+        let t3 = std::time::Instant::now();
+        self.ns[2] += (t3 - t2).as_nanos() as u64;
+        let (cu, ct, si, su, rs) = (self.c.cu.p() as *const u32, self.c.ct.p(), self.c.si.p(), self.c.su.p(), self.c.rs.p());
+        self.o.reserve_rows(nr);
+        let npl = self.c.pl.len();
+        let ndis = self.c.dis.len();
         let ev = self.ev.as_mut_ptr();
-        const NONE: u32 = u32::MAX;
-        let mut cur = NONE;
-        let mut ue = 0u32;
-        let mut runs = 0u32;
-        let mut last = 0u32;
-        // bit 31 set once a timestamp is below the one before it
-        let mut back = 0u32;
-        // a plain event of the current user's own person has (user:31 tag:2) in own..=own + 4 * top
-        let (mut own, mut top) = (u64::MAX, 0u64);
-        // events of the current user written so far
-        let mut to = 0usize;
-        for i in 0..n {
-            let s = unsafe { *slots.add(i) };
-            // one compare for: live, this user, an alias of the own person
-            if (s.a & 0x1_ffff_ffff).wrapping_sub(own).rotate_right(2) <= top {
-                let ts = (s.a >> 33) as u32;
-                back |= ts.wrapping_sub(last);
-                last = ts;
-                unsafe {
-                    (*slots.add(i)).a = 0;
-                    *ev.add(to) = PRec { person: 0, ts, pc: (s.b >> 32) as u32 };
-                }
-                to += 1;
-                continue;
-            }
-            if s.a == 0 {
-                continue;
-            }
-            unsafe { (*slots.add(i)).a = 0 };
-            let (ts, un, pc) = if s.a & 3 == LIVE {
-                ((s.a >> 33) as u32, (s.a >> 2) & 0x7fff_ffff, (s.b >> 32) as u32)
-            } else {
-                match self.escaped(sh, ((b as u64) << sh.k.shift) | i as u64, s) {
-                    Some(e) => e,
-                    None => continue,
-                }
-            };
-            let ui = (un >> 9) as u32;
-            if ui != cur {
-                if cur != NONE {
-                    self.end_run(sh, cur, (b as u32) << 1, runs == 1, back >> 31 != 0, to);
-                }
-                cur = ui;
-                ue = sh.u[ui as usize];
-                runs += 1;
-                last = 0;
-                back = 0;
-                // the run is folded or copied out: the next one reuses the warm start of the buffer
-                to = 0;
-                (own, top) = if ue & GENERAL == 0 { (((ui as u64) << 11) | LIVE, (ue & 511) as u64) } else { (u64::MAX, 0) };
-            }
-            if member(ue, un & ALIAS) {
-                back |= ts.wrapping_sub(last);
-                last = ts;
-                // at most one event per slot
-                unsafe { *ev.add(to) = PRec { person: 0, ts, pc } };
-                to += 1;
-            } else {
-                self.general(sh, un, ts, pc);
+        // the first row of each user, and of no user after the last
+        let ps = self.c.ps.p();
+        let mut np = 0usize;
+        let mut prev = cols::BEFORE >> 9;
+        for r in 0..=nr {
+            unsafe {
+                let ui = *su.add(*rs.add(r) as usize) >> 9;
+                *ps.add(np) = r as u32;
+                np += (ui != prev) as usize;
+                prev = ui;
             }
         }
-        if cur != NONE {
-            self.end_run(sh, cur, ((b as u32) << 1) | (runs > 1) as u32, true, back >> 31 != 0, to);
+        let np = np - 1;
+        let (mut pp, mut dp) = (0usize, 0usize);
+        for p in 0..np {
+            let (r, r1) = unsafe { (*ps.add(p) as usize, *ps.add(p + 1) as usize) };
+            let (k0, ui) = unsafe {
+                let k0 = *rs.add(r) as usize;
+                (k0, *su.add(k0) >> 9)
+            };
+            // the clicks of a user soon to come are far away and cold
+            if p + AHEAD < np {
+                let f = sh.clicks_of(unsafe { *su.add(*rs.add(*ps.add(p + AHEAD) as usize) as usize) } >> 9);
+                prefetch(f.as_ptr(), (f.len() * 16).min(128));
+            }
+            let k1 = unsafe { *rs.add(r1) } as usize;
+            let (e0, e1) = unsafe { (*si.add(k0) as usize, *si.add(k1) as usize) };
+            let mut pq = pp;
+            while pq < npl && ((self.c.pl[pq] >> 32) as usize) < e1 {
+                pq += 1;
+            }
+            let mut unsorted = false;
+            while dp < ndis && (self.c.dis[dp] as usize) < e1 {
+                unsorted = true;
+                dp += 1;
+            }
+            let ue = sh.u[ui as usize];
+            // every event is of the user's own person
+            let own = ue & GENERAL == 0 && !self.alias_over(e0, e1, ue & 511);
+            let edge = r == 0 || r1 == nr;
+            let w = (ui >> 6) as usize;
+            if !own || edge || unsorted || (sh.defer[w] | sh.forced[w]) >> (ui & 63) & 1 != 0 {
+                // the run as events, for the pieces that take them
+                let (mut n, mut p) = (0usize, pp);
+                for e in e0..e1 {
+                    let (un, ts) = unsafe { (*cu.add(e) as u64, *ct.add(e)) };
+                    let mut pc = 0u32;
+                    if p < pq && (self.c.pl[p] >> 32) as usize == e {
+                        pc = self.c.pl[p] as u32;
+                        p += 1;
+                    }
+                    if member(ue, un & ALIAS) {
+                        unsafe { *ev.add(n) = PRec { person: 0, ts, pc } };
+                        n += 1;
+                    } else {
+                        self.general(sh, un, ts, pc);
+                    }
+                }
+                let at = ((b as u32) << 1) | (r != 0 && r1 == nr) as u32;
+                self.end_run(sh, ui, at, edge, unsorted, n);
+            } else {
+                self.person(sh, ui, ue, r, r1, pp, pq);
+            }
+            pp = pq;
+        }
+        self.lt.flush(&mut self.o.asst, &mut self.o.cs);
+        self.note_seen(sh);
+        self.ns[3] += t3.elapsed().as_nanos() as u64;
+    }
+
+    /// whether any of events `e0..e1` has an alias above `top`
+    #[inline(always)]
+    fn alias_over(&mut self, e0: usize, e1: usize, top: u32) -> bool {
+        let cu = self.c.cu.p() as *const u32;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl", target_feature = "avx2", target_feature = "popcnt", target_feature = "bmi2"))]
+        if self.simd {
+            return unsafe { cols::v::alias_over(cu.add(e0), e1 - e0, top) };
+        }
+        (e0..e1).any(|e| unsafe { *cu.add(e) } & 511 > top)
+    }
+
+    /// publish the users folded in place; one of them twice anywhere spoils the run
+    fn note_seen(&mut self, sh: &Sh) {
+        let (w, bits) = self.seen;
+        if bits != 0 && sh.seen[w].fetch_or(bits, Ordering::SeqCst) & bits != 0 {
+            sh.bad.store(true, Ordering::SeqCst);
+        }
+        self.seen.1 = 0;
+    }
+
+    /// the sessions `k0..k1` of rows `r0..r1` as the attribution of any person reads them
+    #[inline(never)]
+    fn fill_tmp(&mut self, r0: usize, r1: usize, k0: usize, k1: usize) {
+        let (st, sd, sv, rs) = (self.c.st.p(), self.c.sd.p(), self.c.sv.p(), self.c.rs.p());
+        let t = &mut self.t;
+        let ns = k1 - k0;
+        unsafe {
+            t.ss.clear();
+            t.ss.reserve(ns + 8);
+            std::ptr::copy_nonoverlapping(st.add(k0), t.ss.as_mut_ptr(), ns);
+            std::ptr::write_bytes(t.ss.as_mut_ptr().add(ns), 0, 8);
+            t.ss.set_len(ns);
+            t.sd.clear();
+            t.sd.extend_from_slice(std::slice::from_raw_parts(sd.add(k0), ns));
+            t.sv.clear();
+            t.sv.extend_from_slice(std::slice::from_raw_parts(sv.add(k0), ns));
+            t.df.clear();
+            t.pd.clear();
+            t.sx.clear();
+            for r in r0..r1 {
+                let ka = *rs.add(r) as usize;
+                t.df.push((ka - k0) as u32);
+                t.pd.push(*sd.add(ka));
+                if ns <= SMALL {
+                    for _ in ka..*rs.add(r + 1) as usize {
+                        t.sx.push((r - r0) as u8);
+                    }
+                }
+            }
+            t.df.push(ns as u32);
+        }
+    }
+
+    /// rows `r0..r1` are one user's own person, whole and in time order
+    #[inline]
+    fn person(&mut self, sh: &Sh, ui: u32, ue: u32, r0: usize, r1: usize, pp: usize, pq: usize) {
+        let bit = 1u64 << (ui & 63);
+        if self.seen.0 != (ui >> 6) as usize {
+            self.note_seen(sh);
+            self.seen.0 = (ui >> 6) as usize;
+        }
+        if self.seen.1 & bit != 0 {
+            sh.bad.store(true, Ordering::SeqCst);
+            return;
+        }
+        self.seen.1 |= bit;
+        let ctx = sh.ctx;
+        let (si, sd, sv, rs, rrev, rcat) = (self.c.si.p(), self.c.sd.p(), self.c.sv.p(), self.c.rs.p(), self.c.rrev.p(), self.c.rcat.p());
+        let (k0, k1) = unsafe { (*rs.add(r0) as usize, *rs.add(r1) as usize) };
+        let ns = k1 - k0;
+        let t = &mut self.t;
+        unsafe {
+            self.inline_ev += (*si.add(k1) - *si.add(k0)) as usize;
+            if pp < pq {
+                // each purchase to its session and its row
+                let (mut kk, mut rr) = (k0, r0);
+                let mut ntouch = 0usize;
+                for p in pp..pq {
+                    let x = *self.c.pl.get_unchecked(p);
+                    let j = (x >> 32) as u32;
+                    let price = x & 0x00ff_ffff;
+                    let cat = ((x >> 24) & 255) as usize;
+                    while *si.add(kk + 1) <= j {
+                        kk += 1;
+                    }
+                    *sv.add(kk) = (*sv.add(kk) + (price << 1)) | 1;
+                    if *si.add(*rs.add(rr + 1) as usize) <= j {
+                        if ntouch != 0 {
+                            *rcat.add(rr) = top_cat(t, ntouch);
+                            ntouch = 0;
+                        }
+                        rr += 1;
+                        while *si.add(*rs.add(rr + 1) as usize) <= j {
+                            rr += 1;
+                        }
+                    }
+                    *rrev.add(rr) += price;
+                    if t.catrev[cat] == 0 {
+                        t.touch[ntouch] = cat as u32;
+                        ntouch += 1;
+                    }
+                    t.catrev[cat] += price;
+                }
+                *rcat.add(rr) = top_cat(t, ntouch);
+            }
+            let mut nb = [0u8; 9];
+            let un = ((ui as u64) << 9) | ((ue >> 9) & 511) as u64;
+            let n = sh.k.user_str(un, &mut nb);
+            let o = &mut self.o;
+            let at = o.day.len();
+            let mut up = o.uid.as_mut_ptr().add(o.uid.len());
+            let (dayp, sessp, evp, revp, catp) =
+                (o.day.as_mut_ptr().add(at), o.sessions.as_mut_ptr().add(at), o.events.as_mut_ptr().add(at), o.rev.as_mut_ptr().add(at), o.cat.as_mut_ptr().add(at));
+            let name8 = u64::from_le_bytes([nb[0], nb[1], nb[2], nb[3], nb[4], nb[5], nb[6], nb[7]]);
+            let mut all = 0u64;
+            for r in r0..r1 {
+                let (ka, kb) = (*rs.add(r) as usize, *rs.add(r + 1) as usize);
+                let nsess = (kb - ka) as u64;
+                let nev = (*si.add(kb) - *si.add(ka)) as u64;
+                let rev = *rrev.add(r);
+                (up as *mut u32).write_unaligned(n as u32);
+                (up.add(4) as *mut u64).write_unaligned(name8);
+                *up.add(12) = nb[8];
+                up = up.add(4 + n);
+                let x = r - r0;
+                *dayp.add(x) = (ctx.day0 + *sd.add(ka) as i64) as i32;
+                *sessp.add(x) = nsess as i64;
+                *evp.add(x) = nev as i64;
+                *revp.add(x) = rev as i64;
+                *catp.add(x) = *rcat.add(r);
+                all |= nsess | nev | rev;
+            }
+            o.all_bits |= all;
+            let rows = at + (r1 - r0);
+            o.uid.set_len(up as usize - o.uid.as_ptr() as usize);
+            o.day.set_len(rows);
+            o.sessions.set_len(rows);
+            o.events.set_len(rows);
+            o.rev.set_len(rows);
+            o.cat.set_len(rows);
+
+        }
+        let fcs = sh.clicks_of(ui);
+        let stride = ctx.ndays + 2;
+        if fcs.is_empty() {
+            // every session is organic
+            let row = ctx.ncamp * stride;
+            for k in k0..k1 {
+                unsafe { self.o.credit(row + *sd.add(k) as usize, *sv.add(k)) };
+            }
+            return;
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl", target_feature = "avx2", target_feature = "popcnt", target_feature = "lzcnt", target_feature = "bmi2"))]
+        if self.simd && fcs.len() <= cols::MID {
+            // of two clicks at one time the smaller id is the later
+            let before = |j: usize, i: usize| {
+                let (a, b) = (fcs[j].id(ctx, sh.cl0), fcs[i].id(ctx, sh.cl0));
+                a > b || (a == b && j < i)
+            };
+            let st = self.c.st.p();
+            unsafe { cols::va::attribute(&mut self.lt, &before, fcs, st.add(k0), sd.add(k0), sv.add(k0), ns, stride, ctx.ncamp, (self.o.cs.as_mut_ptr(), self.o.cp.as_mut_ptr(), self.o.cr.as_mut_ptr()), &mut self.o.asst) };
+            return;
+        }
+        self.fill_tmp(r0, r1, k0, k1);
+        if ns <= SMALL {
+            attribute_small(sh.ctx, fcs, sh.cl0, &mut self.t, &mut self.o);
+        } else {
+            self.cl.clear();
+            self.cl.reserve(fcs.len());
+            for f in fcs {
+                self.cl.push(sh.crec(f, 0));
+            }
+            sort_clicks(&mut self.cl, &mut self.cl2);
+            attribute_any(sh.ctx, &self.cl, &mut self.t, &mut self.o);
         }
     }
 
@@ -2226,8 +2553,12 @@ pub(crate) fn run(
     let mut outs: Vec<Out> = Vec::new();
     let (mut n_inline, mut n_general) = (0usize, 0usize);
     let (mut slowest, mut regroup_ns) = ((0u128, 0usize), 0u128);
+    let mut walk_ns = [0u64; 4];
     for w in wks {
         let w = w.0;
+        for i in 0..4 {
+            walk_ns[i] += w.ns[i];
+        }
         regroup_ns += w.regroup_ns;
         slowest = slowest.max(w.slowest);
         n_inline += w.inline_ev;
@@ -2243,6 +2574,8 @@ pub(crate) fn run(
     pb.resize_with(nb_per, Vec::new);
     cb.resize_with(nb_per, Vec::new);
     if timing {
+        let ms = |i: usize| walk_ns[i] as f64 / 1e6;
+        eprintln!("  fast: walk thread ms: dedup {:.1} compact {:.1} cut {:.1} persons {:.1}", ms(0), ms(1), ms(2), ms(3));
         eprintln!(
             "  fast: links after parse {:?}, rows local {} global {} moved {} | parse {:?} merge {:?} clicks {:?} odd {:?} walk {:?} regroup {:?} (thread time {:?}, longest {:?} for {} events) tail {:?} | rows {} odd {} esc {} odd clicks {} | folded here {} general {} groups {}",
             t_links,
