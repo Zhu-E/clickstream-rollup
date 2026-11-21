@@ -331,75 +331,98 @@ impl Map64 {
 
 // ------------------------------------------------- fast timestamp parsing
 
+const ZEROS: u64 = 0x3030_3030_3030_3030;
+
 /// True when all eight bytes are ASCII digits.
 #[inline(always)]
 fn digits8(w: u64) -> bool {
     const HN: u64 = 0xf0f0_f0f0_f0f0_f0f0;
-    const Z: u64 = 0x3030_3030_3030_3030;
-    (w & HN) == Z && (w.wrapping_add(0x0606_0606_0606_0606) & HN) == Z
+    (w & HN) == ZEROS && (w.wrapping_add(0x0606_0606_0606_0606) & HN) == ZEROS
 }
 
-/// Eight ASCII digits, most significant first, to a number.
+/// Eight digit values, most significant in the low byte, to a number.
 #[inline(always)]
-fn val8(w: u64) -> u64 {
-    let x = w.wrapping_sub(0x3030_3030_3030_3030);
+fn val8x(x: u64) -> u64 {
     let y = (x & 0x000f_000f_000f_000f) * 10 + ((x >> 8) & 0x000f_000f_000f_000f);
     let z = (y & 0x0000_00ff_0000_00ff) * 100 + ((y >> 16) & 0x0000_00ff_0000_00ff);
     (z & 0xffff) * 10000 + ((z >> 32) & 0xffff)
 }
 
-/// `HH:MM:SS` at `b[11..19]` as milliseconds into the day.
+/// Eight ASCII digits, most significant first, to a number.
 #[inline(always)]
-fn time_ms(b: &[u8]) -> Option<i64> {
-    let w = rd8(b, 11);
-    // ':' at word bytes 2 and 5
-    if (w & 0x0000_ff00_00ff_0000) != 0x0000_3a00_003a_0000 {
-        return None;
-    }
-    // replace the separators with '0' so one digit test covers the word
-    let y = (w & !0x0000_ff00_00ff_0000) | 0x0000_3000_0030_0000;
-    if !digits8(y) {
-        return None;
-    }
-    let h = (b[11] - b'0') as i64 * 10 + (b[12] - b'0') as i64;
-    let m = (b[14] - b'0') as i64 * 10 + (b[15] - b'0') as i64;
-    let s = (b[17] - b'0') as i64 * 10 + (b[18] - b'0') as i64;
-    if h > 23 || m > 59 || s > 59 {
-        return None;
-    }
-    Some((h * 3600 + m * 60 + s) * 1000)
+fn val8(w: u64) -> u64 {
+    val8x(w.wrapping_sub(ZEROS))
 }
 
-/// Caches `YYYY-MM-DD` -> days since the epoch. A dataset's window spans a
-/// couple of weeks, so a handful of dates cover almost every row.
+const HI_BITS: u64 = 0x8080_8080_8080_8080;
+
+/// `HH:MM:SS` as a word: seconds into the day, and nonzero when it is not a
+/// time. Each byte is checked against its own limit by one carry-free add.
+#[inline(always)]
+fn hms(t: u64) -> (u64, u64) {
+    let x = t ^ 0x3030_3a30_303a_3030;
+    // per byte 0x7f - limit: h 2 9, colon 0, m 5 9, colon 0, s 5 9
+    let bad = (x.wrapping_add(0x767a_7f76_7a7f_767d) | x) & HI_BITS;
+    let y = x.wrapping_mul(0xa01);
+    let h = (y >> 8) & 0xff;
+    let m = (y >> 32) & 0xff;
+    let s = y >> 56;
+    (h * 3600 + m * 60 + s, bad | (h > 23) as u64)
+}
+
+/// `HH:MM` in the low five bytes: the offset in seconds, and nonzero when bad.
+#[inline(always)]
+fn hm(t: u64) -> (u64, u64) {
+    let x = t ^ 0x30_303a_3030;
+    let bad = (x.wrapping_add(0x76_7a7f_767d) | x) & 0x80_8080_8080;
+    let y = x.wrapping_mul(0xa01);
+    let h = (y >> 8) & 0xff;
+    let m = (y >> 32) & 0xff;
+    (h * 3600 + m * 60, bad | (h > 23) as u64)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DateEnt {
+    klo: u64,
+    khi: u64,
+    ms: i64,
+    pad: u64,
+}
+
+/// Caches `YYYY-MM-DD` -> milliseconds at that midnight. A dataset's window
+/// spans a couple of weeks, so a handful of dates cover almost every row.
 pub struct DateCache {
-    klo: [u64; 64],
-    khi: [u16; 64],
-    val: [i64; 64],
+    e: [DateEnt; 64],
 }
 
 const BAD: i64 = i64::MIN;
 
 impl DateCache {
     pub fn new() -> DateCache {
-        DateCache { klo: [1; 64], khi: [0; 64], val: [BAD; 64] }
+        DateCache { e: [DateEnt { klo: 1, khi: 0, ms: BAD, pad: 0 }; 64] }
     }
+    /// Midnight of the date in `b[..10]`, or `BAD`.
     #[inline(always)]
-    fn days(&mut self, b: &[u8]) -> Option<i64> {
+    fn day_ms(&mut self, b: &[u8]) -> i64 {
         let k = rd8(b, 0);
-        let k2 = u16::from_le_bytes([b[8], b[9]]);
-        let i = (((b[8] as usize) << 4) ^ (b[9] as usize)) & 63;
-        unsafe {
-            if *self.klo.get_unchecked(i) == k && *self.khi.get_unchecked(i) == k2 {
-                let v = *self.val.get_unchecked(i);
-                return if v == BAD { None } else { Some(v) };
-            }
+        let k2 = u16::from_le_bytes([b[8], b[9]]) as u64;
+        let i = (((k2 << 4) ^ (k2 >> 8)) & 63) as usize;
+        let e = unsafe { self.e.get_unchecked(i) };
+        if ((e.klo ^ k) | (e.khi ^ k2)) == 0 {
+            return e.ms;
         }
-        let v = date_days(b);
-        self.klo[i] = k;
-        self.khi[i] = k2;
-        self.val[i] = v.unwrap_or(BAD);
-        v
+        self.fill(b, i, k, k2)
+    }
+    #[cold]
+    #[inline(never)]
+    fn fill(&mut self, b: &[u8], i: usize, k: u64, k2: u64) -> i64 {
+        let ms = match date_days(b) {
+            Some(d) => d * DAY_MS,
+            None => BAD,
+        };
+        self.e[i] = DateEnt { klo: k, khi: k2, ms, pad: 0 };
+        ms
     }
 }
 
@@ -422,9 +445,30 @@ fn date_days(b: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, mo, d))
 }
 
-/// Digits-only epoch milliseconds, fast path for up to 18 digits.
+const POW10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
+/// Digits-only epoch milliseconds. Eight to sixteen digits, which is every
+/// one the generator writes, take two overlapping words and no loop.
 #[inline(always)]
 fn epoch_fast(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n.wrapping_sub(8) <= 8 {
+        let k = n - 8;
+        let hi = rd8(b, 0);
+        let lo = rd8(b, k);
+        if !(digits8(hi) & digits8(lo)) {
+            return None;
+        }
+        // the low word repeats 8 - k digits of the high one
+        let fresh = !((!0u64 >> (4 * k)) >> (4 * k));
+        let low = val8x(lo.wrapping_sub(ZEROS) & fresh);
+        return Some((val8(hi) * unsafe { *POW10.get_unchecked(k) } + low) as i64);
+    }
+    epoch_slow(b)
+}
+
+#[inline(never)]
+fn epoch_slow(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 {
         return None;
@@ -433,22 +477,12 @@ fn epoch_fast(b: &[u8]) -> Option<i64> {
         return parse_epoch_ms(b);
     }
     let mut v: u64 = 0;
-    let mut i = 0usize;
-    while i + 8 <= n {
-        let w = rd8(b, i);
-        if !digits8(w) {
-            return None;
-        }
-        v = v * 100_000_000 + val8(w);
-        i += 8;
-    }
-    while i < n {
-        let d = unsafe { *b.get_unchecked(i) }.wrapping_sub(b'0');
+    for &c in b {
+        let d = c.wrapping_sub(b'0');
         if d > 9 {
             return None;
         }
         v = v * 10 + d as u64;
-        i += 1;
     }
     Some(v as i64)
 }
@@ -458,24 +492,28 @@ fn epoch_fast(b: &[u8]) -> Option<i64> {
 pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = b.len();
     if n == 20 {
-        if b[19] != b'Z' || b[10] != b'T' {
-            return epoch_fast(b);
+        if (b[19] ^ b'Z') | (b[10] ^ b'T') != 0 {
+            return epoch_slow(b);
         }
-        let days = dc.days(b)?;
-        Some(days * DAY_MS + time_ms(b)?)
-    } else if n == 25 && (b[19] == b'+' || b[19] == b'-') {
-        if b[10] != b'T' || b[22] != b':' {
+        let day = dc.day_ms(b);
+        let (s, bad) = hms(rd8(b, 11));
+        if (bad != 0) | (day == BAD) {
             return None;
         }
-        let days = dc.days(b)?;
-        let base = days * DAY_MS + time_ms(b)?;
-        let oh = d2(b, 20)?;
-        let om = d2(b, 23)?;
-        if oh > 23 || om > 59 {
+        Some(day + s as i64 * 1000)
+    } else if n == 25 {
+        let neg = b[19] == b'-';
+        if !(neg | (b[19] == b'+')) {
+            return epoch_slow(b);
+        }
+        let day = dc.day_ms(b);
+        let (s, bad) = hms(rd8(b, 11));
+        let (off, obad) = hm(rd4(b, 20) | ((b[24] as u64) << 32));
+        if ((bad | obad) != 0) | (day == BAD) | (b[10] != b'T') {
             return None;
         }
-        let off = (oh as i64 * 3600 + om as i64 * 60) * 1000;
-        Some(if b[19] == b'+' { base - off } else { base + off })
+        let off = off as i64 * 1000;
+        Some(day + s as i64 * 1000 + if neg { off } else { -off })
     } else {
         epoch_fast(b)
     }
@@ -691,6 +729,164 @@ mod tests {
         for c in cases {
             let (a, b) = both(c);
             assert_eq!(a, b, "mismatch for {:?}: slow {:?} fast {:?}", c, a, b);
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            (self.next() >> 11) % n
+        }
+    }
+
+    const SHAPES: [&str; 12] = [
+        "2026-10-03T23:58:10Z",
+        "2026-10-03T19:58:10-04:00",
+        "2028-02-29T00:00:00+12:00",
+        "2027-12-31T23:59:59-00:00",
+        "1791071890000",
+        "0001791071890000",
+        "17910718",
+        "1791071",
+        "179107189000012345",
+        "12345678901234567890",
+        "1234567890123456789012345",
+        "9223372036854775807",
+    ];
+
+    #[test]
+    fn timestamps_agree_for_every_byte_at_every_position() {
+        let mut dc = DateCache::new();
+        for s in SHAPES {
+            let mut v = s.as_bytes().to_vec();
+            for i in 0..v.len() {
+                let keep = v[i];
+                for c in 0..=255u8 {
+                    v[i] = c;
+                    assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                }
+                v[i] = keep;
+            }
+        }
+    }
+
+    #[test]
+    fn timestamps_agree_for_every_two_digit_field() {
+        let mut dc = DateCache::new();
+        let put = |v: &mut Vec<u8>, at: usize, x: usize| {
+            v[at] = b'0' + (x / 10) as u8;
+            v[at + 1] = b'0' + (x % 10) as u8;
+        };
+        for y in ["1900", "2000", "2024", "2025", "2026", "2027", "2028", "2100"] {
+            let mut v = format!("{}-01-01T00:00:00+00:00", y).into_bytes();
+            for mo in 0..100 {
+                for d in 0..100 {
+                    put(&mut v, 5, mo);
+                    put(&mut v, 8, d);
+                    assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                    assert_eq!(parse_ts(&v[..19]), parse_ts_c(&v[..19], &mut dc));
+                    v[19] = b'Z';
+                    assert_eq!(parse_ts(&v[..20]), parse_ts_c(&v[..20], &mut dc));
+                    v[19] = b'+';
+                }
+            }
+        }
+        for sign in [b'+', b'-'] {
+            for at in [11usize, 14, 17, 20, 23] {
+                let mut v = b"2027-06-15T12:34:56+05:30".to_vec();
+                v[19] = sign;
+                for a in 0..100 {
+                    put(&mut v, at, a);
+                    for at2 in [11usize, 14, 17, 20, 23] {
+                        if at2 == at {
+                            continue;
+                        }
+                        let keep = [v[at2], v[at2 + 1]];
+                        for b in 0..100 {
+                            put(&mut v, at2, b);
+                            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                            let mut z = v[..20].to_vec();
+                            z[19] = b'Z';
+                            assert_eq!(parse_ts(&z), parse_ts_c(&z, &mut dc), "{:?}", String::from_utf8_lossy(&z));
+                        }
+                        v[at2] = keep[0];
+                        v[at2 + 1] = keep[1];
+                    }
+                }
+            }
+        }
+    }
+
+    fn civil_text(ms: i64, off_min: i64, rng: &mut Rng) -> String {
+        let local = ms + off_min * 60_000;
+        let (y, m, d) = civil_from_days(local.div_euclid(DAY_MS));
+        let s = local.rem_euclid(DAY_MS) / 1000;
+        let head = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, s / 3600, s / 60 % 60, s % 60);
+        if off_min == 0 && rng.below(2) == 0 {
+            format!("{}Z", head)
+        } else {
+            let a = off_min.abs();
+            format!("{}{}{:02}:{:02}", head, if off_min < 0 { '-' } else { '+' }, a / 60, a % 60)
+        }
+    }
+
+    #[test]
+    fn timestamps_round_trip() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut dc = DateCache::new();
+        for _ in 0..400_000 {
+            let ms = (rng.below(4_000_000_000) as i64) * 1000;
+            let off = if rng.below(3) == 0 { 0 } else { rng.below(24 * 60) as i64 - 12 * 60 };
+            let s = civil_text(ms, off, &mut rng);
+            assert_eq!(parse_ts_c(s.as_bytes(), &mut dc), Some(ms), "{}", s);
+            assert_eq!(parse_ts(s.as_bytes()), Some(ms), "{}", s);
+            let ms = ms + rng.below(1000) as i64;
+            let pad = rng.below(4) as usize;
+            let s = format!("{}{}", "0".repeat(pad), ms);
+            assert_eq!(parse_ts_c(s.as_bytes(), &mut dc), Some(ms), "{}", s);
+        }
+    }
+
+    #[test]
+    fn timestamps_agree_under_random_damage() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut dc = DateCache::new();
+        let pool = b"0123456789-+:TZtz ,.\"e\r\x00\xff/";
+        for it in 0..3_000_000u32 {
+            let mut v: Vec<u8> = if it % 3 == 0 {
+                SHAPES[rng.below(SHAPES.len() as u64) as usize].as_bytes().to_vec()
+            } else if it % 3 == 1 {
+                let ms = (rng.below(4_000_000_000) as i64) * 1000;
+                let off = if rng.below(2) == 0 { 0 } else { rng.below(24 * 60) as i64 - 12 * 60 };
+                civil_text(ms, off, &mut rng).into_bytes()
+            } else {
+                let n = rng.below(22) as usize;
+                (0..n).map(|_| b'0' + rng.below(10) as u8).collect()
+            };
+            for _ in 0..rng.below(4) {
+                match rng.below(8) {
+                    0 if !v.is_empty() => {
+                        let at = rng.below(v.len() as u64) as usize;
+                        v.remove(at);
+                    }
+                    1 => {
+                        let at = rng.below(v.len() as u64 + 1) as usize;
+                        v.insert(at, pool[rng.below(pool.len() as u64) as usize]);
+                    }
+                    _ if !v.is_empty() => {
+                        let at = rng.below(v.len() as u64) as usize;
+                        v[at] = pool[rng.below(pool.len() as u64) as usize];
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
         }
     }
 
