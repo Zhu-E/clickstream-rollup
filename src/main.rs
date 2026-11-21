@@ -5,6 +5,7 @@
 //   dedup  -> per event-id bucket, keep the earliest ingest; emit person buckets
 //   fold   -> per person bucket: sort, sessionize, attribute, aggregate
 //   write  -> Parquet
+mod cols;
 mod fast;
 mod genid;
 mod pq;
@@ -788,16 +789,12 @@ struct CD {
     rev: u64,
 }
 
-/// sessions credited to one campaign on one day
-#[derive(Copy, Clone, Default)]
-struct Cred {
-    sessions: u32,
-    purch: u32,
-    rev: u64,
-}
-
 struct Out {
-    cd: Vec<Cred>,
+    /// sessions credited per (campaign, day); those with purchases and their
+    /// revenue apart, as few sessions have any
+    cs: Vec<u32>,
+    cp: Vec<u32>,
+    cr: Vec<u64>,
     /// assisted sessions, apart: a campaign's days share a cache line
     asst: Vec<u32>,
     uid: Vec<u8>,
@@ -813,7 +810,9 @@ struct Out {
 impl Out {
     fn new(rows: usize, cd_len: usize) -> Out {
         Out {
-            cd: vec![Cred::default(); cd_len],
+            cs: vec![0; cd_len],
+            cp: vec![0; cd_len],
+            cr: vec![0; cd_len],
             asst: vec![0; cd_len],
             uid: Vec::with_capacity(rows * 16),
             day: Vec::with_capacity(rows),
@@ -824,12 +823,35 @@ impl Out {
             all_bits: 0,
         }
     }
+    /// room for `n` more rows written in place: a name is at most 9 bytes behind its length
+    fn reserve_rows(&mut self, n: usize) {
+        self.uid.reserve(n * 13 + 16);
+        self.day.reserve(n);
+        self.sessions.reserve(n);
+        self.events.reserve(n);
+        self.rev.reserve(n);
+        self.cat.reserve(n);
+    }
+    fn peek_campaign_days(&self) -> Vec<CD> {
+        (0..self.cs.len()).map(|i| CD { sessions: self.cs[i], purch: self.cp[i], assist: self.asst[i], rev: self.cr[i] }).collect()
+    }
     /// the campaign counts, taken out
     fn campaign_days(&mut self) -> Vec<CD> {
-        let v = self.cd.iter().zip(&self.asst).map(|(c, &a)| CD { sessions: c.sessions, purch: c.purch, assist: a, rev: c.rev }).collect();
-        self.cd = Vec::new();
+        let v = self.peek_campaign_days();
+        self.cs = Vec::new();
+        self.cp = Vec::new();
+        self.cr = Vec::new();
         self.asst = Vec::new();
         v
+    }
+    /// one session with (revenue << 1 | purchased) `v` to a (campaign, day) cell
+    #[inline(always)]
+    fn credit(&mut self, cell: usize, v: u64) {
+        self.cs[cell] += 1;
+        if v != 0 {
+            self.cp[cell] += 1;
+            self.cr[cell] += v >> 1;
+        }
     }
     fn fits_i32(all_bits: u64) -> bool {
         all_bits <= i32::MAX as u64
@@ -955,7 +977,9 @@ impl Tmp {
     }
 }
 
-fn emit_user(ctx: &Ctx, o: &mut Out, t: &mut Tmp, name: &[u8], day: u32, ns: u64, ne: u64, rev: u64, ntouch: usize) {
+/// the category with the most revenue among the touched, which are cleared
+#[inline]
+fn top_cat(t: &mut Tmp, ntouch: usize) -> u8 {
     let mut best = CAT_NONE;
     let mut bestv = 0u64;
     for x in 0..ntouch {
@@ -967,13 +991,18 @@ fn emit_user(ctx: &Ctx, o: &mut Out, t: &mut Tmp, name: &[u8], day: u32, ns: u64
         }
         t.catrev[c] = 0;
     }
+    best as u8
+}
+
+fn emit_user(ctx: &Ctx, o: &mut Out, t: &mut Tmp, name: &[u8], day: u32, ns: u64, ne: u64, rev: u64, ntouch: usize) {
+    let best = top_cat(t, ntouch);
     pq::push_str(&mut o.uid, name);
     o.day.push((ctx.day0 + day as i64) as i32);
     o.sessions.push(ns as i64);
     o.events.push(ne as i64);
     o.rev.push(rev as i64);
     o.all_bits |= ns | ne | rev;
-    o.cat.push(best as u8);
+    o.cat.push(best);
 }
 
 /// Cut `ev`, in time order, into sessions: the user's row for each day goes
@@ -1272,11 +1301,7 @@ fn attribute_small<C: Click>(ctx: &Ctx, cl: &[C], at: usize, t: &mut Tmp, o: &mu
     for i in 0..ns {
         let b = t.bidx[i];
         let camp = if b != NO_CLICK && t.ss[i] - t.bkey[i] <= WEEK { cl[b as usize].camp() } else { organic };
-        let v = sv[i];
-        let e = &mut o.cd[camp * stride + sd[i] as usize];
-        e.sessions += 1;
-        e.purch += (v & 1) as u32;
-        e.rev += v >> 1;
+        o.credit(camp * stride + sd[i] as usize, sv[i]);
     }
     // the next person starts with no clicks
     for b in t.bidx[..groups * 8].iter_mut() {
@@ -1371,11 +1396,7 @@ fn attribute_any(ctx: &Ctx, cl: &[CRec], t: &mut Tmp, o: &mut Out) {
                 organic
             }
         };
-        let v = sv[i];
-        let e = &mut o.cd[camp * stride + sd[i] as usize];
-        e.sessions += 1;
-        e.purch += (v & 1) as u32;
-        e.rev += v >> 1;
+        o.credit(camp * stride + sd[i] as usize, sv[i]);
     }
 
     // assists: click k reaches sessions a..b, and both ends only move forward,
@@ -1430,11 +1451,7 @@ fn attribute_any(ctx: &Ctx, cl: &[CRec], t: &mut Tmp, o: &mut Out) {
 fn attribute_none(ctx: &Ctx, t: &mut Tmp, o: &mut Out) {
     let row = ctx.ncamp * (ctx.ndays + 2);
     for i in 0..t.ss.len() {
-        let v = t.sv[i];
-        let e = &mut o.cd[row + t.sd[i] as usize];
-        e.sessions += 1;
-        e.purch += (v & 1) as u32;
-        e.rev += v >> 1;
+        o.credit(row + t.sd[i] as usize, t.sv[i]);
     }
 }
 
@@ -2759,7 +2776,8 @@ mod tests {
     fn cells_of(ctx: &Ctx, o: &Out) -> Cells {
         let stride = ctx.ndays + 2;
         let mut cells = Cells::new();
-        for (i, (c, &a)) in o.cd.iter().zip(&o.asst).enumerate() {
+        for (i, c) in o.peek_campaign_days().iter().enumerate() {
+            let a = c.assist;
             if c.sessions != 0 || c.purch != 0 || c.rev != 0 || a != 0 {
                 cells.insert((i / stride, i % stride), (c.sessions, c.purch, c.rev, a));
             }
