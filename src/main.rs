@@ -12,6 +12,7 @@ mod tbl;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use sys::*;
 use tbl::*;
 
@@ -73,9 +74,10 @@ struct Ctx {
     base: i64, // window_start - 7 days, the zero point for ts offsets
     day0: i64,
     ndays: usize,
-    link: Map64,
-    lbloom: Bloom,
-    names: Map64,
+    links: OnceLock<Links>,
+    no_links: Links, // empty: every user is its own person
+    links_gate: Mutex<()>,
+    links_cv: Condvar,
     prod: Vec<u8>, // product number -> cat + 1
     prod_extra: Option<Map64>,
     camp: Vec<u32>, // campaign number -> index + 1
@@ -99,6 +101,25 @@ impl Ctx {
         let off = (s & 0xff_ffff_ffff) as usize;
         let m = &self.maps[fi];
         unsafe { std::slice::from_raw_parts(m.ptr.add(off), len) }
+    }
+    #[inline(always)]
+    fn links(&self) -> &Links {
+        self.links.get().expect("links not built yet")
+    }
+    fn set_links(&self, l: Links) {
+        let _ = self.links.set(l);
+        let _g = self.links_gate.lock().unwrap();
+        self.links_cv.notify_all();
+    }
+    // blocks until the link map is published
+    fn wait_links(&self) {
+        if self.links.get().is_some() {
+            return;
+        }
+        let mut g = self.links_gate.lock().unwrap();
+        while self.links.get().is_none() {
+            g = self.links_cv.wait(g).unwrap();
+        }
     }
 }
 
@@ -412,11 +433,12 @@ impl Ctx {
     }
     #[inline(always)]
     fn person_of(&self, user: &[u8], hits: &mut usize) -> u64 {
+        let lk = self.links();
         let k = person_key(user);
-        if !self.lbloom.maybe(k) {
+        if !lk.lbloom.maybe(k) {
             return k;
         }
-        match self.link.get(k) {
+        match lk.link.get(k) {
             Some(r) => {
                 *hits += 1;
                 r
@@ -464,6 +486,7 @@ static ACC: AtomicUsize = AtomicUsize::new(0);
 /// code survives in the shipping call.
 fn parse_events<const ABL: u32>(
     ctx: &Ctx,
+    lk: &Links,
     fi: usize,
     from: usize,
     to: usize,
@@ -507,9 +530,9 @@ fn parse_events<const ABL: u32>(
         let mut linked = false;
         if has_user && (ABL == 0 || ABL >= 6) {
             pk = person_key(user);
-            linked = ctx.lbloom.maybe(pk);
+            linked = lk.lbloom.maybe(pk);
             if linked {
-                ctx.link.prefetch(pk);
+                lk.link.prefetch(pk);
             }
         }
 
@@ -566,7 +589,7 @@ fn parse_events<const ABL: u32>(
                 break;
             }
             person = if linked {
-                match ctx.link.get(pk) {
+                match lk.link.get(pk) {
                     Some(r) => {
                         lkh += 1;
                         r
@@ -576,7 +599,7 @@ fn parse_events<const ABL: u32>(
             } else {
                 pk
             };
-            if person & PTAG != 0 && ctx.names.get(person).is_none() {
+            if person & PTAG != 0 && lk.names.get(person).is_none() {
                 // An id too long or too odd to encode, and in no link: keep
                 // track of where its bytes are so the name can be written out.
                 xn.push((person, sref_of(fi, lp + s[1] as usize, (e[1] - s[1]) as usize)));
@@ -637,6 +660,46 @@ fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CR
 #[inline(always)]
 fn person_bucket(person: u64, bits: u32) -> usize {
     (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - bits)) as usize
+}
+
+const RESOLVE_LAG: usize = 8;
+
+// events parsed before the link map existed: turn their users into people
+fn resolve_written(lk: &Links, sink: &mut Sink<ERec>) -> usize {
+    let mut ring = [std::ptr::null_mut::<ERec>(); RESOLVE_LAG];
+    let mut at = 0usize;
+    let mut hits = 0usize;
+    sink.each_mut(|rec| {
+        let r = unsafe { &*rec };
+        if r.tsf & 0x8000_0000 == 0 || !lk.lbloom.maybe(r.person) {
+            return;
+        }
+        // the record waits in the ring while its link-map line is fetched
+        lk.link.prefetch(r.person);
+        let due = std::mem::replace(&mut ring[at], rec);
+        at = (at + 1) & (RESOLVE_LAG - 1);
+        hits += resolve_one(lk, due);
+    });
+    for due in ring {
+        hits += resolve_one(lk, due);
+    }
+    hits
+}
+
+#[inline(always)]
+fn resolve_one(lk: &Links, rec: *mut ERec) -> usize {
+    if rec.is_null() {
+        return 0;
+    }
+    unsafe {
+        match lk.link.get((*rec).person) {
+            Some(p) => {
+                (*rec).person = p;
+                1
+            }
+            None => 0,
+        }
+    }
 }
 
 // --------------------------------------------------------------- dedup stage
@@ -1290,7 +1353,7 @@ fn fold_bucket(ctx: &Ctx, xn: &Map64, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Bl
             &nbuf[..n]
         } else {
             // Hashed key: the bytes are in the link names or the side table.
-            match ctx.names.get(pkey).or_else(|| xn.get(pkey)) {
+            match ctx.links().names.get(pkey).or_else(|| xn.get(pkey)) {
                 Some(x) => ctx.bytes(x),
                 None => b"",
             }
@@ -1385,167 +1448,198 @@ struct Links {
     names: Map64,
 }
 
-fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links {
-    let mut parts: Vec<Vec<(u64, u64, u64, u64)>> = Vec::new();
-    let next = AtomicUsize::new(0);
-    let chunks: Vec<(usize, usize, usize)> = {
-        let mut v = Vec::new();
-        const C: usize = 1 << 20;
-        for fi in range.clone() {
-            let n = maps[fi].len;
-            let mut a = 0;
-            while a < n {
-                v.push((fi, a, (a + C).min(n)));
-                a += C;
-            }
-        }
-        v
-    };
-    std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nt)
-            .map(|_| {
-                let next = &next;
-                let chunks = &chunks;
-                s.spawn(move || {
-                    let mut out: Vec<(u64, u64, u64, u64)> = Vec::new();
-                    let simd = SIMD_OK.load(Ordering::Relaxed);
-                    loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        if k >= chunks.len() {
-                            break;
-                        }
-                        let (fi, a, b) = chunks[k];
-                        let d = maps[fi].as_slice();
-                        let mut p = first_line_start(d, a);
-                        while p < b {
-                            let sc = scan_line(d, p, simd);
-                            let line = &d[p..sc.nl];
-                            let lp = p;
-                            p = sc.nl + 1;
-                            if let Some(f) = fields::<2>(line, &sc) {
-                                if f[0].0 == f[0].1 || f[1].0 == f[1].1 {
-                                    continue;
-                                }
-                                let a1 = &line[f[0].0 as usize..f[0].1 as usize];
-                                let b1 = &line[f[1].0 as usize..f[1].1 as usize];
-                                out.push((
-                                    person_key(a1),
-                                    sref_of(fi, lp + f[0].0 as usize, a1.len()),
-                                    person_key(b1),
-                                    sref_of(fi, lp + f[1].0 as usize, b1.len()),
-                                ));
-                            }
-                        }
-                    }
-                    out
-                })
-            })
-            .collect();
-        for h in hs {
-            parts.push(h.join().unwrap());
-        }
-    });
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct LinkNode {
+    key: u64,
+    parent: u32,
+}
 
-    let t_rows = std::time::Instant::now();
-    let total: usize = parts.iter().map(|p| p.len()).sum();
-    let mut keys: Vec<u64> = Vec::with_capacity(total * 2 / 3 + 16);
-    let mut srefs: Vec<u64> = Vec::with_capacity(total * 2 / 3 + 16);
-    let mut parent: Vec<u32> = Vec::with_capacity(total * 2 / 3 + 16);
-    let mut rank: Vec<u8> = Vec::with_capacity(total * 2 / 3 + 16);
-    // Grows as needed: the number of distinct ids is not known yet.
-    let mut idx = Map64::with_capacity(total + 16);
+// union-find where the smaller id is the root, so a root names its person
+struct Joiner<'a> {
+    maps: &'a [Map],
+    idx: Map64, // id key -> node
+    nodes: Blob<LinkNode>,
+    srefs: Blob<u64>, // only filled for hashed keys
+    n: usize,
+}
 
-    #[inline]
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
-
-    let mut intern = |h: u64, s: u64, keys: &mut Vec<u64>, srefs: &mut Vec<u64>, parent: &mut Vec<u32>, rank: &mut Vec<u8>| -> u32 {
-        let want = keys.len() as u64;
-        let got = idx.get_or_insert(h, want);
+impl<'a> Joiner<'a> {
+    #[inline(always)]
+    fn node(&mut self, key: u64, sref: u64) -> u32 {
+        let want = self.n as u64;
+        let got = self.idx.get_or_insert(key, want);
         if got == want {
-            keys.push(h);
-            srefs.push(s);
-            parent.push(want as u32);
-            rank.push(0);
+            self.nodes[self.n] = LinkNode { key, parent: want as u32 };
+            if key & PTAG != 0 {
+                self.srefs[self.n] = sref;
+            }
+            self.n += 1;
         }
         got as u32
-    };
-
-    for p in &parts {
-        for &(ha, sa, hb, sb) in p {
-            let a = intern(ha, sa, &mut keys, &mut srefs, &mut parent, &mut rank);
-            let b = intern(hb, sb, &mut keys, &mut srefs, &mut parent, &mut rank);
-            let mut ra = find(&mut parent, a);
-            let mut rb = find(&mut parent, b);
-            if ra == rb {
-                continue;
-            }
-            if rank[ra as usize] < rank[rb as usize] {
-                std::mem::swap(&mut ra, &mut rb);
-            }
-            parent[rb as usize] = ra;
-            if rank[ra as usize] == rank[rb as usize] {
-                rank[ra as usize] += 1;
+    }
+    #[inline(always)]
+    fn find(&mut self, mut x: u32) -> u32 {
+        // every index stored in a node is below n
+        unsafe {
+            loop {
+                let p = self.nodes.get_unchecked(x as usize).parent;
+                if p == x {
+                    return x;
+                }
+                let g = self.nodes.get_unchecked(p as usize).parent;
+                self.nodes.get_unchecked_mut(x as usize).parent = g;
+                x = g;
             }
         }
     }
-    drop(parts);
-    let t_uf = t_rows.elapsed();
-
-    let n = keys.len();
-    let mut minnode: Vec<u32> = (0..n as u32).collect();
-    let getb = |s: u64| -> &[u8] {
+    // decoded from the key, or read back from the file
+    fn id_bytes<'b>(&'b self, node: u32, buf: &'b mut [u8; MAXENC]) -> &'b [u8] {
+        let key = self.nodes[node as usize].key;
+        if key & PTAG == 0 {
+            let n = dec_name(key, buf);
+            return &buf[..n];
+        }
+        let s = self.srefs[node as usize];
         let len = (s >> 56) as usize;
         let fi = ((s >> 40) & 0xffff) as usize;
         let off = (s & 0xff_ffff_ffff) as usize;
-        unsafe { std::slice::from_raw_parts(maps[fi].ptr.add(off), len) }
-    };
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        let cur = minnode[r] as usize;
-        if cur == i {
-            continue;
+        unsafe { std::slice::from_raw_parts(self.maps[fi].ptr.add(off), len) }
+    }
+    // encoded keys sort like their bytes
+    #[inline(always)]
+    fn id_less(&self, a: u32, b: u32) -> bool {
+        let (ka, kb) = (self.nodes[a as usize].key, self.nodes[b as usize].key);
+        if (ka | kb) & PTAG == 0 {
+            return ka < kb;
         }
-        // Encoded keys compare like their bytes do, so the common case needs
-        // no reads back into the mapped files.
-        let smaller = if (keys[i] | keys[cur]) & PTAG == 0 {
-            keys[i] < keys[cur]
+        self.mixed_less(a, b)
+    }
+    #[cold]
+    fn mixed_less(&self, a: u32, b: u32) -> bool {
+        let mut ea = [0u8; MAXENC];
+        let mut eb = [0u8; MAXENC];
+        self.id_bytes(a, &mut ea) < self.id_bytes(b, &mut eb)
+    }
+    #[inline(always)]
+    fn union(&mut self, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        if self.id_less(rb, ra) {
+            self.nodes[ra as usize].parent = rb;
         } else {
-            getb(srefs[i]) < getb(srefs[cur])
-        };
-        if smaller {
-            minnode[r] = i as u32;
+            self.nodes[rb as usize].parent = ra;
         }
     }
-    let t_mn = t_rows.elapsed();
+}
+
+const JOIN_LAG: usize = 8;
+const NAME_AHEAD: usize = 16;
+
+// runs on one worker while the others parse events
+fn build_links(maps: &[Map], range: std::ops::Range<usize>) -> Links {
+    let t_start = std::time::Instant::now();
+    let simd = SIMD_OK.load(Ordering::Relaxed);
+    let bytes: usize = range.clone().map(|fi| maps[fi].len).sum();
+    // a row is at least four bytes and names at most two ids
+    let max_nodes = bytes / 2 + 2;
+    let mut j = Joiner {
+        maps,
+        idx: Map64::with_capacity(bytes / 12 + 16),
+        nodes: Blob::reserved(max_nodes),
+        srefs: Blob::reserved(max_nodes),
+        n: 0,
+    };
+
+    // map slots are fetched at read time, nodes at intern time
+    let mut read = [(0u64, 0u64, 0u64, 0u64); JOIN_LAG];
+    let mut interned = [(0u32, 0u32); JOIN_LAG];
+    let mut rows = 0usize;
+    for fi in range {
+        let d = maps[fi].as_slice();
+        let mut p = first_line_start(d, 0);
+        while p < d.len() {
+            let sc = scan_line(d, p, simd);
+            let line = &d[p..sc.nl];
+            let lp = p;
+            p = sc.nl + 1;
+            let f = match fields::<2>(line, &sc) {
+                Some(f) => f,
+                None => continue,
+            };
+            if f[0].0 == f[0].1 || f[1].0 == f[1].1 {
+                continue;
+            }
+            let a = &line[f[0].0 as usize..f[0].1 as usize];
+            let b = &line[f[1].0 as usize..f[1].1 as usize];
+            let row = (
+                person_key(a),
+                sref_of(fi, lp + f[0].0 as usize, a.len()),
+                person_key(b),
+                sref_of(fi, lp + f[1].0 as usize, b.len()),
+            );
+            j.idx.prefetch(row.0);
+            j.idx.prefetch(row.2);
+            let at = rows & (JOIN_LAG - 1);
+            rows += 1;
+            let due = std::mem::replace(&mut read[at], row);
+            if due.0 == 0 {
+                continue;
+            }
+            let pair = (j.node(due.0, due.1), j.node(due.2, due.3));
+            prefetch(unsafe { j.nodes.as_ptr().add(pair.0 as usize) } as *const u8);
+            prefetch(unsafe { j.nodes.as_ptr().add(pair.1 as usize) } as *const u8);
+            let due = std::mem::replace(&mut interned[at], pair);
+            j.union(due.0, due.1);
+        }
+    }
+    for due in read {
+        if due.0 != 0 {
+            let pair = (j.node(due.0, due.1), j.node(due.2, due.3));
+            j.union(pair.0, pair.1);
+        }
+    }
+    for due in interned {
+        j.union(due.0, due.1);
+    }
+    let t_join = t_start.elapsed();
+
+    // the intern map becomes the link map; a root maps to itself
+    let n = j.n;
     let mut lbloom = Bloom::new(n + 16);
-    let mut link = Map64::with_capacity(n + 16);
     let mut names = Map64::with_capacity(n / 2 + 16);
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        let mn = minnode[r] as usize;
-        if mn != i {
-            lbloom.insert(keys[i]);
-            link.insert(keys[i], keys[mn]);
-        } else if keys[mn] & PTAG != 0 {
-            // Only ids that do not fit the encoding need their bytes kept.
-            names.insert(keys[mn], srefs[mn]);
+    let mut link = std::mem::replace(&mut j.idx, Map64::with_capacity(0));
+    let cap = link.slots.len();
+    for s in 0..cap {
+        // slots behind s already hold keys, so never look back around
+        let ahead = if s + NAME_AHEAD < cap { link.slots[s + NAME_AHEAD].1 } else { 0 };
+        prefetch(j.nodes.as_ptr().wrapping_add(ahead as usize) as *const u8);
+        let (key, node) = link.slots[s];
+        if key == 0 {
+            continue;
+        }
+        let root = j.find(node as u32);
+        link.slots[s].1 = j.nodes[root as usize].key;
+        if root != node as u32 {
+            lbloom.insert(key);
+        } else if key & PTAG != 0 {
+            // only unencodable names need their bytes kept
+            names.insert(key, j.srefs[root as usize]);
         }
     }
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!(
-            "  links: rows {} nodes {} intern+uf {:?} minnode {:?} maps {:?}",
-            total,
+            "  links: rows {} nodes {} join {:?} maps {:?}",
+            rows,
             n,
-            t_uf,
-            t_mn - t_uf,
-            t_rows.elapsed() - t_mn
+            t_join,
+            t_start.elapsed() - t_join
         );
     }
     Links { link, lbloom, names }
@@ -1834,14 +1928,9 @@ fn main() {
         Some(m)
     };
 
-    // ---- links
     let t_pre = t0.elapsed();
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  pre: maps {:?} meta {:?}", t_maps, t_pre - t_maps);
-    }
-    let links = build_links(&maps, i_lk.clone(), nt);
-    if std::env::var("SS_TIMING").is_ok() {
-        eprintln!("  pre {:?} links {:?}", t_pre, t0.elapsed() - t_pre);
     }
 
     let ev_bytes: usize = i_ev.clone().map(|i| maps[i].len).sum();
@@ -1874,9 +1963,14 @@ fn main() {
         base: ws - WEEK_MS,
         day0,
         ndays,
-        link: links.link,
-        lbloom: links.lbloom,
-        names: links.names,
+        links: OnceLock::new(),
+        no_links: Links {
+            link: Map64::with_capacity(0),
+            lbloom: Bloom::new(0),
+            names: Map64::with_capacity(0),
+        },
+        links_gate: Mutex::new(()),
+        links_cv: Condvar::new(),
         prod,
         prod_extra,
         camp,
@@ -1898,6 +1992,7 @@ fn main() {
     // ---- optional parse micro-benchmark: SS_BENCH=<ablation level>
     if let Ok(lv) = std::env::var("SS_BENCH") {
         let lv: u32 = lv.parse().unwrap_or(0);
+        ctx.set_links(build_links(&ctx.maps, i_lk.clone()));
         const CH: usize = 1 << 20;
         let mut cks: Vec<(usize, usize, usize)> = Vec::new();
         let mut nb = 0usize;
@@ -1921,6 +2016,7 @@ fn main() {
                     let ctx = &ctx;
                     let ar = &ar;
                     s.spawn(move || {
+                        let lk = ctx.links();
                         let mut es = Sink::<ERec>::new(ar, nb_eid, BLK_E);
                         let mut dc = DateCache::new();
                         let mut xn: Vec<(u64, u64)> = Vec::new();
@@ -1931,13 +2027,13 @@ fn main() {
                             }
                             let (fi, a, b) = cks[k];
                             match lv {
-                                1 => parse_events::<1>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                2 => parse_events::<2>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                3 => parse_events::<3>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                4 => parse_events::<4>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                5 => parse_events::<5>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                6 => parse_events::<6>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                _ => parse_events::<0>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                1 => parse_events::<1>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                2 => parse_events::<2>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                3 => parse_events::<3>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                4 => parse_events::<4>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                5 => parse_events::<5>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                6 => parse_events::<6>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                _ => parse_events::<0>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
                             }
                         }
                         std::mem::forget(es);
@@ -1953,7 +2049,8 @@ fn main() {
         return;
     }
 
-    // ---- parse
+    // ---- links + parse: worker 0 joins links while the rest parse events
+    let link_delay: u64 = std::env::var("SS_LINK_DELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     const CHUNK: usize = 1 << 20;
     let mut chunks: Vec<(u8, u32, usize, usize)> = Vec::new();
     for fi in i_ev.clone() {
@@ -1978,13 +2075,25 @@ fn main() {
     let mut xraw: Vec<(u64, u64)> = Vec::new();
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
-            .map(|_| {
+            .map(|t| {
                 let next = &next;
                 let chunks = &chunks;
                 let ctx = &ctx;
                 let arena = &arena;
                 let arena_e = &arena_e;
+                let i_lk = i_lk.clone();
                 s.spawn(move || {
+                    if t == 0 {
+                        // test hook: makes the others parse everything first
+                        std::thread::sleep(std::time::Duration::from_millis(link_delay));
+                        let links = build_links(&ctx.maps, i_lk);
+                        ctx.set_links(links);
+                        if std::env::var("SS_TIMING").is_ok() {
+                            eprintln!("  pre {:?} links {:?} (overlapped)", t_pre, t0.elapsed() - t_pre);
+                        }
+                    }
+                    // until the link map exists, events are written as users
+                    let mut as_users = t != 0;
                     let mut es = Sink::<ERec>::new(arena_e, nb_eid, BLK_E);
                     let mut cs = Sink::<CRec>::new(arena, nb_per, BLK_P);
                     let mut dc = DateCache::new();
@@ -1997,12 +2106,24 @@ fn main() {
                         let (kind, fi, a, b) = chunks[k];
                         let tc = std::time::Instant::now();
                         if kind == 0 {
-                            parse_events::<0>(ctx, fi as usize, a, b, &mut es, &mut dc, &mut xn);
+                            if as_users && ctx.links.get().is_some() {
+                                LKH.fetch_add(resolve_written(ctx.links(), &mut es), Ordering::Relaxed);
+                                as_users = false;
+                            }
+                            let lk = if as_users { &ctx.no_links } else { ctx.links() };
+                            parse_events::<0>(ctx, lk, fi as usize, a, b, &mut es, &mut dc, &mut xn);
                             NS_EV.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         } else {
+                            // clicks are scattered by person
+                            ctx.wait_links();
+                            let tc = std::time::Instant::now();
                             parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc);
                             NS_CL.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         }
+                    }
+                    if as_users {
+                        ctx.wait_links();
+                        LKH.fetch_add(resolve_written(ctx.links(), &mut es), Ordering::Relaxed);
                     }
                     (es.finish(), cs.finish(), xn)
                 })

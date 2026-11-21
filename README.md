@@ -13,8 +13,12 @@ is one ~500 KB binary; it needs no network at run time and no files outside
 Five passes, each spread over all eight threads, over one bump-allocated arena
 backed by transparent huge pages.
 
-1. **Links.** Every `links/*.csv` row is parsed in parallel, then a union-find
-   joins the ids into people. A person is named by the byte-wise smallest of
+1. **Links.** One worker scans every `links/*.csv` row and joins the ids into
+   people with a union-find, while the other seven are already parsing
+   events. A union always hangs the larger id under the smaller, so a root is
+   the byte-wise smallest id of its person and no pass has to go looking for
+   it; the id -> node map built on the way is rewritten in place into the
+   id -> person map. A person is named by the byte-wise smallest of
    its ids, and that name *is* the person key: ids that fit ten bytes of the
    63-symbol alphabet are packed six bits to a byte into a u64, which is
    injective and keeps byte order, so comparing two keys compares two ids and
@@ -51,6 +55,12 @@ backed by transparent huge pages.
    probe misses the TLB as well as the cache.
    Each event is scattered into one of up to 8192 buckets by its `event_id`,
    each click into a bucket by person.
+   Events parsed before the link map exists are written with the user in
+   place of the person. The first time a worker sees the map it rewrites what
+   it has written so far, in place and behind an eight-entry prefetch ring,
+   and resolves at parse time from then on. Resolving twice is harmless: a
+   person's name maps to itself. Click chunks sit at the end of the queue and
+   wait for the map, because a click is scattered by person.
 3. **Dedup.** An event-id bucket is sized to dedup in cache: one
    open-addressing table keyed on a 96-bit event-id key — exact, not a hash,
    for ids up to eleven bytes — keeps the copy with the smallest `ingest_ts`.
@@ -142,6 +152,10 @@ and `SS_SPLIT_DIR=<dataset> cargo test --release rows_match_on_files` does it
 over real files. Twelve deliberate breaks of the first pass (a carry dropped,
 a rule left out, the chunk end ignored) were each caught by the unit tests
 and by the startup check.
+
+`SS_LINK_DELAY=<ms>` holds link building back so that every other worker
+parses all of its events first, which is how the rewrite-in-place path gets
+checked against the same answers; `NCPU=1` never takes it.
 
 `SS_TIMING=1` prints a per-stage breakdown on stderr, including the share of
 rows that pass validation (97.8% on the dev set, which is why the person key
