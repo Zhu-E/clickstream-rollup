@@ -70,6 +70,7 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     link: Map64,
+    lbloom: Bloom,
     names: Map64,
     prod: Vec<u8>, // product number -> cat + 1
     prod_extra: Option<Map64>,
@@ -302,10 +303,16 @@ impl Ctx {
         None
     }
     #[inline(always)]
-    fn person_of(&self, user: &[u8]) -> u64 {
+    fn person_of(&self, user: &[u8], hits: &mut usize) -> u64 {
         let k = person_key(user);
+        if !self.lbloom.maybe(k) {
+            return k;
+        }
         match self.link.get(k) {
-            Some(r) => r,
+            Some(r) => {
+                *hits += 1;
+                r
+            }
             None => k,
         }
     }
@@ -333,6 +340,8 @@ fn first_line_start(d: &[u8], start: usize) -> usize {
     (i + 1).min(d.len())
 }
 
+static LKH: AtomicUsize = AtomicUsize::new(0);
+static NROW: AtomicUsize = AtomicUsize::new(0);
 static NS_EV: AtomicUsize = AtomicUsize::new(0);
 static NS_CL: AtomicUsize = AtomicUsize::new(0);
 static ACC: AtomicUsize = AtomicUsize::new(0);
@@ -352,11 +361,14 @@ fn parse_events<const ABL: u32>(
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
     let mut acc = 0usize;
+    let mut lkh = 0usize;
+    let mut nrow = 0usize;
     while p < to {
         let sc = scan_line(d, p);
         let line = &d[p..sc.nl];
         let lp = p;
         p = sc.nl + 1;
+        nrow += 1;
         if ABL == 1 {
             acc += sc.nc ^ sc.nl ^ (sc.qm as usize);
             continue;
@@ -434,7 +446,7 @@ fn parse_events<const ABL: u32>(
                 acc += pid.len() ^ pc as usize;
                 break;
             }
-            person = ctx.person_of(user);
+            person = ctx.person_of(user, &mut lkh);
             if person & PTAG != 0 && ctx.names.get(person).is_none() {
                 // An id too long or too odd to encode, and in no link: keep
                 // track of where its bytes are so the name can be written out.
@@ -453,11 +465,14 @@ fn parse_events<const ABL: u32>(
     if ABL != 0 {
         ACC.fetch_add(acc, Ordering::Relaxed);
     }
+    LKH.fetch_add(lkh, Ordering::Relaxed);
+    NROW.fetch_add(nrow, Ordering::Relaxed);
 }
 
 fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CRec>, dc: &mut DateCache) {
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
+    let mut lkh = 0usize;
     while p < to {
         let sc = scan_line(d, p);
         let line = &d[p..sc.nl];
@@ -485,11 +500,12 @@ fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CR
             Some(c) => c,
             None => continue,
         };
-        let person = ctx.person_of(user);
+        let person = ctx.person_of(user, &mut lkh);
         let sref = sref_of(fi, lp + f[0].0 as usize, (f[0].1 - f[0].0) as usize);
         let b = (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - ctx.per_bits)) as usize;
         sink.push(b, CRec { person, sref, ts: (ts - ctx.base) as u32, camp });
     }
+    LKH.fetch_add(lkh, Ordering::Relaxed);
 }
 
 #[inline(always)]
@@ -1159,6 +1175,7 @@ fn each_line<const N: usize, F: FnMut(&[u8], [(u32, u32); N])>(d: &[u8], mut f: 
 
 struct Links {
     link: Map64,
+    lbloom: Bloom,
     names: Map64,
 }
 
@@ -1222,12 +1239,14 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
         }
     });
 
+    let t_rows = std::time::Instant::now();
     let total: usize = parts.iter().map(|p| p.len()).sum();
     let mut keys: Vec<u64> = Vec::with_capacity(total * 2 / 3 + 16);
     let mut srefs: Vec<u64> = Vec::with_capacity(total * 2 / 3 + 16);
     let mut parent: Vec<u32> = Vec::with_capacity(total * 2 / 3 + 16);
     let mut rank: Vec<u8> = Vec::with_capacity(total * 2 / 3 + 16);
-    let mut idx = Map64::with_capacity(total * 2 + 16);
+    // Grows as needed: the number of distinct ids is not known yet.
+    let mut idx = Map64::with_capacity(total + 16);
 
     #[inline]
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -1270,6 +1289,7 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
         }
     }
     drop(parts);
+    let t_uf = t_rows.elapsed();
 
     let n = keys.len();
     let mut minnode: Vec<u32> = (0..n as u32).collect();
@@ -1282,23 +1302,46 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
         let cur = minnode[r] as usize;
-        if cur != i && getb(srefs[i]) < getb(srefs[cur]) {
+        if cur == i {
+            continue;
+        }
+        // Encoded keys compare like their bytes do, so the common case needs
+        // no reads back into the mapped files.
+        let smaller = if (keys[i] | keys[cur]) & PTAG == 0 {
+            keys[i] < keys[cur]
+        } else {
+            getb(srefs[i]) < getb(srefs[cur])
+        };
+        if smaller {
             minnode[r] = i as u32;
         }
     }
+    let t_mn = t_rows.elapsed();
+    let mut lbloom = Bloom::new(n + 16);
     let mut link = Map64::with_capacity(n + 16);
     let mut names = Map64::with_capacity(n / 2 + 16);
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
         let mn = minnode[r] as usize;
         if mn != i {
+            lbloom.insert(keys[i]);
             link.insert(keys[i], keys[mn]);
         } else if keys[mn] & PTAG != 0 {
             // Only ids that do not fit the encoding need their bytes kept.
             names.insert(keys[mn], srefs[mn]);
         }
     }
-    Links { link, names }
+    if std::env::var("SS_TIMING").is_ok() {
+        eprintln!(
+            "  links: rows {} nodes {} intern+uf {:?} minnode {:?} maps {:?}",
+            total,
+            n,
+            t_uf,
+            t_mn - t_uf,
+            t_rows.elapsed() - t_mn
+        );
+    }
+    Links { link, lbloom, names }
 }
 
 fn main() {
@@ -1334,10 +1377,56 @@ fn main() {
     let lk_n = lk_files.len();
     paths.push(data.join("products.csv"));
     paths.push(data.join("campaigns.csv"));
-    let maps: Vec<Map> = paths
-        .iter()
-        .map(|p| Map::open(p).unwrap_or(Map { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 }))
-        .collect();
+    // Opening and advising 80-odd files is slow enough to be worth threads:
+    // MADV_WILLNEED starts the readahead for a couple of gigabytes.
+    let maps: Vec<Map> = {
+        let next = AtomicUsize::new(0);
+        let raw: Vec<(usize, usize)> = {
+            let mut got: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+            std::thread::scope(|s| {
+                let hs: Vec<_> = (0..nt.min(paths.len().max(1)))
+                    .map(|_| {
+                        let next = &next;
+                        let paths = &paths;
+                        s.spawn(move || {
+                            let mut out: Vec<(usize, usize, usize)> = Vec::new();
+                            loop {
+                                let k = next.fetch_add(1, Ordering::Relaxed);
+                                if k >= paths.len() {
+                                    break;
+                                }
+                                match Map::open(&paths[k]) {
+                                    Ok(m) => out.push((k, m.ptr as usize, m.len)),
+                                    Err(_) => out.push((k, 0, 0)),
+                                }
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                for h in hs {
+                    got.push(h.join().unwrap());
+                }
+            });
+            let mut v = vec![(0usize, 0usize); paths.len()];
+            for g in got {
+                for (k, p, l) in g {
+                    v[k] = (p, l);
+                }
+            }
+            v
+        };
+        raw.into_iter()
+            .map(|(p, l)| {
+                if l == 0 {
+                    Map { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 }
+                } else {
+                    Map { ptr: p as *mut u8, len: l }
+                }
+            })
+            .collect()
+    };
+    let t_maps = t0.elapsed();
     let i_ev = 0..ev_n;
     let i_cl = ev_n..ev_n + cl_n;
     let i_lk = ev_n + cl_n..ev_n + cl_n + lk_n;
@@ -1499,6 +1588,9 @@ fn main() {
 
     // ---- links
     let t_pre = t0.elapsed();
+    if std::env::var("SS_TIMING").is_ok() {
+        eprintln!("  pre: maps {:?} meta {:?}", t_maps, t_pre - t_maps);
+    }
     let links = build_links(&maps, i_lk.clone(), nt);
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  pre {:?} links {:?}", t_pre, t0.elapsed() - t_pre);
@@ -1532,6 +1624,7 @@ fn main() {
         day0,
         ndays,
         link: links.link,
+        lbloom: links.lbloom,
         names: links.names,
         prod,
         prod_extra,
@@ -1683,12 +1776,14 @@ fn main() {
     let t_parse = t0.elapsed();
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!(
-            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {}",
+            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {} rows {} linkhits {}",
             t_pp,
             t_parse - t_pp,
             NS_EV.load(Ordering::Relaxed) / 1_000_000,
             NS_CL.load(Ordering::Relaxed) / 1_000_000,
-            xraw.len()
+            xraw.len(),
+            NROW.load(Ordering::Relaxed),
+            LKH.load(Ordering::Relaxed)
         );
     }
 

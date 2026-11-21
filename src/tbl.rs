@@ -230,15 +230,36 @@ pub fn parse_epoch_ms(b: &[u8]) -> Option<i64> {
 pub struct Map64 {
     pub slots: Vec<(u64, u64)>,
     mask: u64,
+    len: usize,
+    limit: usize,
 }
 
 impl Map64 {
+    /// Sized for `n` entries at a 0.75 load factor: a smaller table means
+    /// fewer cache misses, and at 16 bytes an entry a short probe chain
+    /// usually stays inside the line already fetched.
     pub fn with_capacity(n: usize) -> Map64 {
         let mut cap = 16usize;
-        while cap < n * 2 {
+        while cap * 3 < n * 4 {
             cap <<= 1;
         }
-        Map64 { slots: vec![(0u64, 0u64); cap], mask: (cap - 1) as u64 }
+        Map64 { slots: vec![(0u64, 0u64); cap], mask: (cap - 1) as u64, len: 0, limit: cap * 3 / 4 }
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![(0u64, 0u64); cap]);
+        self.mask = (cap - 1) as u64;
+        self.limit = cap * 3 / 4;
+        for (k, v) in old {
+            if k != 0 {
+                let mut i = self.home(k);
+                while unsafe { self.slots.get_unchecked(i) }.0 != 0 {
+                    i = (i + 1) & self.mask as usize;
+                }
+                self.slots[i] = (k, v);
+            }
+        }
     }
     #[inline(always)]
     fn home(&self, k: u64) -> usize {
@@ -270,6 +291,10 @@ impl Map64 {
             }
             if s.0 == 0 {
                 self.slots[i] = (k, v);
+                self.len += 1;
+                if self.len > self.limit {
+                    self.grow();
+                }
                 return;
             }
             i = (i + 1) & self.mask as usize;
@@ -286,6 +311,10 @@ impl Map64 {
             }
             if s.0 == 0 {
                 self.slots[i] = (k, v);
+                self.len += 1;
+                if self.len > self.limit {
+                    self.grow();
+                }
                 return v;
             }
             i = (i + 1) & self.mask as usize;
@@ -447,66 +476,39 @@ pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
 
 // --------------------------------------------- invertible short-id encoding
 //
-// Ids in this dataset are short strings over a small alphabet. Encoding one
-// into a u64 means a record can carry the id itself instead of a pointer to
-// where it was read from, which is 8 bytes less to shuffle per event.
+// Ids here are short strings over a small alphabet, so one fits in a u64 and
+// a record can carry the id itself instead of a pointer to the bytes it was
+// read from: 8 bytes less to shuffle per event.
 //
-//   key = 1 + S(len) + sum d_i * 64^i,   S(len) = (64^len - 1) / 63
+// Each byte becomes a 6-bit code, packed most significant first and padded
+// with zeros to ten symbols, plus one so that no id encodes to 0:
 //
-// The per-length ranges are disjoint, so the map is injective, and `1 +`
-// keeps the key away from 0, which the hash tables use for "empty".
-// Ids that are too long or use other bytes fall back to a hashed key with
-// the top bit set; their names live in a side table.
+//     key = 1 + sum code(b[i]) << (6 * (9 - i))
+//
+// Codes run 1..=63 in byte order and 0 is only ever padding, which makes the
+// map injective *and* order preserving: comparing two keys compares the two
+// ids byte-wise, the comparison the rules ask for. Ids that are longer than
+// ten bytes or use other bytes get a hashed key with the top bit set, and
+// their names live in a side table.
 
 /// Set on keys that are hashes rather than encodings.
 pub const PTAG: u64 = 1 << 63;
 pub const MAXENC: usize = 10;
 
+/// The 63 symbols, in byte order; '-' is left out so that 0 can mean padding.
+const ALPHA: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+
 const fn enc_tbl() -> [u8; 256] {
-    let mut t = [0xffu8; 256];
-    let mut i = 0u8;
-    while i < 10 {
-        t[(b'0' + i) as usize] = i;
-        i += 1;
-    }
-    let mut i = 0u8;
-    while i < 26 {
-        t[(b'a' + i) as usize] = 10 + i;
-        t[(b'A' + i) as usize] = 36 + i;
-        i += 1;
-    }
-    t[b'_' as usize] = 62;
-    t[b'-' as usize] = 63;
-    t
-}
-
-const fn dec_tbl() -> [u8; 64] {
-    let mut t = [0u8; 64];
-    let e = enc_tbl();
-    let mut c = 0usize;
-    while c < 256 {
-        let d = e[c];
-        if d != 0xff {
-            t[d as usize] = c as u8;
-        }
-        c += 1;
-    }
-    t
-}
-
-const fn sum_tbl() -> [u64; MAXENC + 2] {
-    let mut t = [0u64; MAXENC + 2];
-    let mut i = 1usize;
-    while i < MAXENC + 2 {
-        t[i] = t[i - 1] * 64 + 1;
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < ALPHA.len() {
+        t[ALPHA[i] as usize] = (i + 1) as u8;
         i += 1;
     }
     t
 }
 
 static ENC: [u8; 256] = enc_tbl();
-static DEC: [u8; 64] = dec_tbl();
-static SUM: [u64; MAXENC + 2] = sum_tbl();
 
 /// The id itself as a u64, or None if it does not fit the alphabet.
 #[inline(always)]
@@ -515,19 +517,17 @@ pub fn enc_name(b: &[u8]) -> Option<u64> {
         return None;
     }
     let mut acc = 0u64;
-    let mut mul = 1u64;
     for &c in b {
         let d = unsafe { *ENC.get_unchecked(c as usize) };
-        if d == 0xff {
+        if d == 0 {
             return None;
         }
-        acc += (d as u64) * mul;
-        mul <<= 6;
+        acc = (acc << 6) | d as u64;
     }
-    Some(1 + SUM[b.len()] + acc)
+    Some((acc << (6 * (MAXENC - b.len()))) + 1)
 }
 
-/// The person key for a user id: the id itself when it fits, else a hash.
+/// The person key for an id: the id itself when it fits, else a hash.
 #[inline(always)]
 pub fn person_key(b: &[u8]) -> u64 {
     match enc_name(b) {
@@ -539,14 +539,17 @@ pub fn person_key(b: &[u8]) -> u64 {
 /// Writes the id back out; only valid for keys without PTAG.
 pub fn dec_name(k: u64, out: &mut [u8; MAXENC]) -> usize {
     debug_assert_eq!(k & PTAG, 0);
+    let mut acc = k - 1;
     let mut len = 0usize;
-    while len < MAXENC && k >= 1 + SUM[len + 1] {
-        len += 1;
-    }
-    let mut r = k - 1 - SUM[len];
-    for i in 0..len {
-        out[i] = DEC[(r & 63) as usize];
-        r >>= 6;
+    for i in (0..MAXENC).rev() {
+        let c = (acc & 63) as usize;
+        acc >>= 6;
+        if c != 0 {
+            out[i] = ALPHA[c - 1];
+            if len == 0 {
+                len = i + 1;
+            }
+        }
     }
     len
 }
@@ -562,49 +565,49 @@ mod tests {
 
 
     #[test]
-    fn name_encoding_round_trips() {
-        let mut seen: Vec<u64> = Vec::new();
-        let mut names: Vec<Vec<u8>> = Vec::new();
-        names.push(Vec::new());
+    fn name_encoding_round_trips_and_keeps_byte_order() {
+        let mut names: Vec<Vec<u8>> = vec![Vec::new()];
         for n in 1..=12usize {
-            for seed in 0..64u64 {
+            for seed in 0..96u64 {
                 let mut v = Vec::new();
                 let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (n as u64);
                 for _ in 0..n {
-                    v.push(DEC[(x & 63) as usize]);
+                    v.push(ALPHA[(x % 63) as usize]);
                     x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
                 }
                 names.push(v);
             }
         }
-        names.push(b"u8w84o3T".to_vec());
-        names.push(b"u8w84o3t".to_vec());
-        names.push(b"-".to_vec());
-        names.push(b"_".to_vec());
-        names.push(b"0".to_vec());
-        names.push(b"00".to_vec());
-        names.push(b"000000000".to_vec());
-        names.push(b"\xffbad".to_vec());
-        names.push(b"has space".to_vec());
-        names.push(b"u.dot".to_vec());
+        for extra in [
+            &b"u8w84o3T"[..], b"u8w84o3t", b"u", b"U", b"_", b"0", b"00", b"000000000",
+            b"0000000000", b"zzzzzzzzzz", b"a", b"ab", b"abc", b"b", b"-", b"u-1",
+            b"has space", b"u.dot", b"\x00", b"\xff",
+        ] {
+            names.push(extra.to_vec());
+        }
         names.sort();
         names.dedup();
+        let enc: Vec<(Vec<u8>, u64)> = names
+            .iter()
+            .filter(|v| v.len() <= MAXENC && v.iter().all(|&c| ENC[c as usize] != 0))
+            .map(|v| (v.clone(), person_key(v)))
+            .collect();
         for v in &names {
             let k = person_key(v);
             assert_ne!(k, 0, "{:?}", v);
-            let encodable = v.len() <= MAXENC && v.iter().all(|&c| ENC[c as usize] != 0xff);
-            assert_eq!(k & PTAG == 0, encodable, "{:?}", v);
-            if encodable {
+            let ok = v.len() <= MAXENC && v.iter().all(|&c| ENC[c as usize] != 0);
+            assert_eq!(k & PTAG == 0, ok, "{:?}", v);
+            if ok {
                 let mut out = [0u8; MAXENC];
                 let n = dec_name(k, &mut out);
                 assert_eq!(&out[..n], &v[..], "round trip {:?} -> {:x}", v, k);
-                seen.push(k);
             }
         }
-        seen.sort_unstable();
-        let before = seen.len();
-        seen.dedup();
-        assert_eq!(before, seen.len(), "encoding is not injective");
+        for (a, ka) in &enc {
+            for (b, kb) in &enc {
+                assert_eq!(ka.cmp(kb), a.cmp(b), "order: {:?} vs {:?}", a, b);
+            }
+        }
     }
 
     #[test]
@@ -720,5 +723,53 @@ mod tests {
                 assert_eq!(a == b, i == j, "{:?} vs {:?}", ids[i], ids[j]);
             }
         }
+    }
+}
+
+// ------------------------------------------------------------ bloom prefilter
+//
+// Most events belong to users that appear in no link, and the link map is far
+// too big to stay in cache. A blocked Bloom filter answers "no link" from one
+// cache line, so only the events that may be linked pay for the real lookup.
+// False positives cost a map lookup that returns None, which is the same
+// answer, so only the no-false-negatives property matters here.
+
+pub struct Bloom {
+    w: Vec<u64>,   // 8 words = one 64-byte block
+    blocks: usize, // power of two
+}
+
+impl Bloom {
+    /// Sized at 16 bits per key, which gives a false positive rate of a few
+    /// parts in a thousand with four probes.
+    pub fn new(n: usize) -> Bloom {
+        let mut blocks = 1usize;
+        while blocks * 512 < n * 16 {
+            blocks <<= 1;
+        }
+        Bloom { w: vec![0u64; blocks * 8], blocks }
+    }
+    #[inline(always)]
+    pub fn insert(&mut self, k: u64) {
+        let h = mix(k, 0x9e37_79b9_7f4a_7c15);
+        let b = (((h >> 40) as usize) & (self.blocks - 1)) * 8;
+        let g = mix(k, 0xff51_afd7_ed55_8ccd);
+        let w0 = b + (g & 7) as usize;
+        let w1 = b + ((g >> 3) & 7) as usize;
+        self.w[w0] |= 1u64 << ((g >> 6) & 63);
+        self.w[w0] |= 1u64 << ((g >> 12) & 63);
+        self.w[w1] |= 1u64 << ((g >> 18) & 63);
+        self.w[w1] |= 1u64 << ((g >> 24) & 63);
+    }
+    #[inline(always)]
+    pub fn maybe(&self, k: u64) -> bool {
+        let h = mix(k, 0x9e37_79b9_7f4a_7c15);
+        let b = (((h >> 40) as usize) & (self.blocks - 1)) * 8;
+        let g = mix(k, 0xff51_afd7_ed55_8ccd);
+        let w0 = unsafe { *self.w.get_unchecked(b + (g & 7) as usize) };
+        let w1 = unsafe { *self.w.get_unchecked(b + ((g >> 3) & 7) as usize) };
+        let m0 = (1u64 << ((g >> 6) & 63)) | (1u64 << ((g >> 12) & 63));
+        let m1 = (1u64 << ((g >> 18) & 63)) | (1u64 << ((g >> 24) & 63));
+        (w0 & m0) == m0 && (w1 & m1) == m1
     }
 }
