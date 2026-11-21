@@ -102,8 +102,9 @@ unlike wall time do not move when a laptop throttles.
 ## Numbers
 
 Best of five on an M3 MacBook Air (8 threads), which is not the scorer:
-1.32 s for 20M events / 5M clicks (1.8 GB), of which 0.21 s is startup and
-link building, 0.87 s parse, 0.12 s dedup, 0.20 s fold. Peak RSS is about
+1.12 s for 20M events / 5M clicks (1.8 GB), of which about 0.2 s is startup
+and link building, 0.6 s parse, 0.15 s dedup, 0.2 s fold. The same code and
+machine took 2.3 s before this round of work. Peak RSS is about
 2.3× the input size and the 60M-event case fits in well under the scorer's
 24 GB. Work per row is flat with scale: 1074 instructions per event row at
 20M, 1102 at 40M.
