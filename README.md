@@ -74,12 +74,16 @@ backed by transparent huge pages.
    Survivors that pass validation are scattered again, now by person, as
    16-byte rows.
 4. **Fold.** A person bucket is grouped by a counting sort, each person's rows
-   are ordered by timestamp, and one pass sessionizes, picks the credited
-   campaign with a sliding window over that person's clicks, and accumulates
-   per-day totals. Assists are not counted per session: each campaign's clicks
-   are merged into `[click, click + 7 days]` intervals and the sessions in an
-   interval are counted per day from a prefix sum, which keeps the shared
-   devices that merge thousands of people linear instead of quadratic.
+   are ordered by timestamp, and one pass cuts the sessions and accumulates
+   per-day totals. A person of at most 64 sessions is attributed with bit
+   masks: each click is compared with the session starts eight at a time,
+   which gives the sessions it reaches and makes it the latest click of the
+   sessions it precedes, so neither credit nor assists branch on how clicks
+   and sessions interleave, and the clicks need no order. A larger person
+   walks the clicks in time order: credit with a sliding window, and assists
+   by merging each campaign's reach into runs of sessions that are counted
+   per day from a prefix sum, which keeps the shared devices that merge
+   thousands of people linear instead of quadratic.
 5. **Write.** Each thread writes its own `user_daily` file once every thread
    has folded, and `campaign_daily`, a dense `(campaign, day)` array reduced
    across threads, is written at the same time. The Parquet writer is about

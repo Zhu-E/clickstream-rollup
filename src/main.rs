@@ -1235,11 +1235,12 @@ fn attribute_small<C: Click>(ctx: &Ctx, cl: &[C], at: usize, t: &mut Tmp, o: &mu
     }
 
     // credit: the latest click, if it is within 7 days of the start
+    let (sv, sd) = (&t.sv[..ns], &t.sd[..ns]);
     for i in 0..ns {
         let b = t.bidx[i];
         let camp = if b != NO_CLICK && t.ss[i] - t.bkey[i] <= WEEK { cl[b as usize].camp() } else { organic };
-        let v = t.sv[i];
-        let e = &mut o.cd[camp * stride + t.sd[i] as usize];
+        let v = sv[i];
+        let e = &mut o.cd[camp * stride + sd[i] as usize];
         e.sessions += 1;
         e.purch += (v & 1) as u32;
         e.rev += v >> 1;
@@ -1265,8 +1266,8 @@ fn attribute_small<C: Click>(ctx: &Ctx, cl: &[C], at: usize, t: &mut Tmp, o: &mu
         let row = &mut o.asst[c * stride..(c + 1) * stride];
         let first = sx[reach.trailing_zeros() as usize] as usize;
         let last = sx[63 - reach.leading_zeros() as usize] as usize;
-        for x in first..=last {
-            row[pd[x] as usize] += (reach & dmask[x]).count_ones();
+        for (d, m) in pd[first..last + 1].iter().zip(&dmask[first..last + 1]) {
+            row[*d as usize] += (reach & m).count_ones();
         }
     }
 }

@@ -924,6 +924,43 @@ fn crec_of(cl0: usize, f: &FC, person: u64) -> CRec {
     }
 }
 
+/// `v` in time order through `tmp`: three counting passes over the bits of
+/// the timestamp. Clicks at one time end up in any order, as from a sort.
+fn sort_clicks(v: &mut Vec<CRec>, tmp: &mut Vec<CRec>) {
+    const BITS: [u32; 3] = [11, 11, 10];
+    let n = v.len();
+    if n < 256 {
+        v.sort_unstable_by_key(|r| r.ts);
+        return;
+    }
+    let mut at = vec![0u32; 3 << 11];
+    for r in v.iter() {
+        at[(r.ts & 2047) as usize] += 1;
+        at[2048 + ((r.ts >> 11) & 2047) as usize] += 1;
+        at[4096 + (r.ts >> 22) as usize] += 1;
+    }
+    tmp.clear();
+    tmp.resize(n, CRec { person: 0, sref: 0, ts: 0, camp: 0 });
+    let mut shift = 0;
+    for (pass, bits) in BITS.into_iter().enumerate() {
+        let at = &mut at[pass << 11..(pass + 1) << 11];
+        let mut sum = 0u32;
+        for a in at.iter_mut() {
+            let c = *a;
+            *a = sum;
+            sum += c;
+        }
+        let mask = (1u32 << bits) - 1;
+        for r in v.iter() {
+            let a = &mut at[((r.ts >> shift) & mask) as usize];
+            tmp[*a as usize] = *r;
+            *a += 1;
+        }
+        std::mem::swap(v, tmp);
+        shift += bits;
+    }
+}
+
 /// part of one user's events: a run cut by a bucket edge, or odd-id events
 struct Frag {
     ui: u32,
@@ -932,6 +969,7 @@ struct Frag {
 }
 
 struct Wk<'a> {
+    cl2: Vec<CRec>,
     slots: Blob<FRec>,
     /// a bucket's events in counter order: room for every slot
     ev: Blob<PRec>,
@@ -960,6 +998,7 @@ impl<'a> Wk<'a> {
     fn new(sh: &Sh, arena: &'a Arena) -> Wk<'a> {
         let nbg = 1usize << sh.gbits;
         Wk {
+            cl2: Vec::new(),
             slots: Blob::zeroed(1 << sh.k.shift),
             ev: Blob::zeroed(1 << sh.k.shift),
             run: Vec::new(),
@@ -1045,7 +1084,7 @@ impl<'a> Wk<'a> {
             for f in fcs {
                 self.cl.push(sh.crec(f, 0));
             }
-            self.cl.sort_unstable_by_key(|r| r.ts);
+            sort_clicks(&mut self.cl, &mut self.cl2);
             attribute_any(sh.ctx, &self.cl, &mut self.t, &mut self.o);
         }
     }
@@ -1815,6 +1854,36 @@ mod tests {
             assert_eq!((Click::ts(&f), Click::camp(&f)), (c.ts, c.camp as usize));
             let (len, fi, off) = (c.sref >> 56, (c.sref >> 40) & 0xffff, c.sref & 0xff_ffff_ffff);
             assert_eq!((len, fi, off), (f.b & 15, 5 + ((f.b >> 40) & 255), (f.b >> 4) & ((1 << 36) - 1)));
+        }
+    }
+
+    #[test]
+    fn clicks_sort_by_time() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let (mut v, mut tmp) = (Vec::new(), Vec::new());
+        for round in 0..300u64 {
+            let n = [0, 1, 255, 256, 257, 1000, 5000][(round % 7) as usize];
+            v.clear();
+            for i in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let ts = match round % 3 {
+                    0 => x as u32,
+                    1 => (x % 50) as u32 * 2048 + (x >> 40) as u32 % 3,
+                    _ => u32::MAX - (x % 5000) as u32,
+                };
+                v.push(CRec { person: 0, sref: i as u64, ts, camp: (x >> 33) as u32 % 7 });
+            }
+            let mut want = v.clone();
+            want.sort_by_key(|c| (c.ts, c.sref));
+            sort_clicks(&mut v, &mut tmp);
+            assert!(v.windows(2).all(|w| w[0].ts <= w[1].ts), "round {}", round);
+            // the same clicks, whatever the order inside one timestamp
+            let mut got = v.clone();
+            got.sort_by_key(|c| (c.ts, c.sref));
+            let key = |c: &CRec| (c.ts, c.sref, c.camp, c.person);
+            assert_eq!(got.iter().map(key).collect::<Vec<_>>(), want.iter().map(key).collect::<Vec<_>>(), "round {}", round);
         }
     }
 
