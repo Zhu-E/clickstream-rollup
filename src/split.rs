@@ -98,7 +98,8 @@ mod fast {
     use super::*;
     use core::arch::x86_64::*;
 
-    /// Commas, quotes and newlines in 64 bytes, one bit per byte.
+    /// Delimiters, quotes and newlines in 64 bytes, one bit per byte.
+    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vl")))]
     #[inline(always)]
     unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
         let a = _mm256_loadu_si256(p as *const __m256i);
@@ -109,7 +110,27 @@ mod fast {
             let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, k)) as u32 as u64;
             lo | (hi << 32)
         };
-        (m(b','), m(b'"'), m(b'\n'))
+        let n = m(b'\n');
+        (m(b',') | n, m(b'"'), n)
+    }
+
+    /// The same with compares that write mask registers, still 256 bits
+    /// wide: the halves are joined there and cross to a general register once.
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vl"))]
+    #[inline(always)]
+    unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let (kc, kq, kn) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
+        let (n0, n1) = (_mm256_cmpeq_epi8_mask(a, kn), _mm256_cmpeq_epi8_mask(b, kn));
+        let d0 = _kor_mask32(_mm256_cmpeq_epi8_mask(a, kc), n0);
+        let d1 = _kor_mask32(_mm256_cmpeq_epi8_mask(b, kc), n1);
+        let (q0, q1) = (_mm256_cmpeq_epi8_mask(a, kq), _mm256_cmpeq_epi8_mask(b, kq));
+        (
+            _cvtmask64_u64(_mm512_kunpackd(d1 as __mmask64, d0 as __mmask64)),
+            _cvtmask64_u64(_mm512_kunpackd(q1 as __mmask64, q0 as __mmask64)),
+            _cvtmask64_u64(_mm512_kunpackd(n1 as __mmask64, n0 as __mmask64)),
+        )
     }
 
     /// Index `nblk` blocks from `base`, which must follow a newline. Reads
@@ -128,17 +149,17 @@ mod fast {
         // block finishes the newline that precedes `base`, as a block with
         // only its last byte set: that writes the sentinel and the first
         // field's quote bit with no code of its own.
-        let (mut c, mut q, mut n) = (0u64, 0u64, 1u64 << 63);
+        let (mut d, mut q, mut n) = (1u64 << 63, 0u64, 1u64 << 63);
         let mut open = 0u64; // the last delimiter is followed by a quote
         let mut dprev = 0u64; // the byte before this block is a delimiter
         let mut qprev = 0u64; // ... is a quote
         let mut nd = 0usize;
         let mut nbad = 0usize;
-        for t in 0..=nblk {
-            let (c1, q1, n1) = masks(base.add(t * 64));
-            let off = (t as u32).wrapping_sub(1).wrapping_mul(64);
-            let d = c | n;
-            let d1 = c1 | n1;
+        let mut at = base;
+        let end = base.add(nblk * 64);
+        let mut off = 0u32.wrapping_sub(64);
+        loop {
+            let (d1, q1, n1) = masks(at);
             let opens = d & ((q >> 1) | (q1 << 63));
             let closes = d & ((q << 1) | qprev);
             let after = (d << 1) | dprev;
@@ -151,9 +172,12 @@ mod fast {
             let a = _pext_u64(opens, d);
             let b = _pext_u64(closes, d);
             let nlb = _pext_u64(n, d);
-            let unpaired = _bzhi_u64(((a << 1) | open) ^ b, cnt as u32);
-            if cnt != 0 {
-                open = (a >> (cnt - 1)) & 1;
+            // bit cnt of x is the last delimiter's, or the old one with none
+            let x = (a << 1) | open;
+            let unpaired = _bzhi_u64(x ^ b, cnt as u32);
+            open = x >> (cnt & 63);
+            if cnt == 64 {
+                open = a >> 63;
             }
             let w = nd >> 6;
             let sh = nd & 63;
@@ -182,9 +206,14 @@ mod fast {
                 }
             }
             nd += cnt;
-            c = c1;
+            d = d1;
             q = q1;
             n = n1;
+            if at == end {
+                break;
+            }
+            at = at.add(64);
+            off = off.wrapping_add(64);
         }
         // rows read the streams eight bytes at a time, a little past the end
         let w = nd >> 6;
@@ -261,9 +290,19 @@ mod fast {
             let pv = _mm256_loadu_si256(pos.add(i) as *const __m256i);
             let ev = _mm256_loadu_si256(pos.add(i + 1) as *const __m256i);
             let qw = (std::ptr::read_unaligned(qs.add(o) as *const u64) >> sh) as i32;
-            let qm = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(qw), bits), bits);
-            let sv = _mm256_sub_epi32(_mm256_sub_epi32(pv, ones), qm);
-            let ee = _mm256_add_epi32(ev, qm);
+            // one past the delimiter before, two past it behind a quote
+            #[cfg(all(target_feature = "avx512f", target_feature = "avx512vl"))]
+            let (sv, ee) = {
+                let _ = bits;
+                let k = qw as u8;
+                let sv = _mm256_sub_epi32(pv, ones);
+                (_mm256_mask_sub_epi32(sv, k, sv, ones), _mm256_mask_add_epi32(ev, k, ev, ones))
+            };
+            #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512vl")))]
+            let (sv, ee) = {
+                let qm = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(qw), bits), bits);
+                (_mm256_sub_epi32(_mm256_sub_epi32(pv, ones), qm), _mm256_add_epi32(ev, qm))
+            };
             _mm256_storeu_si256(st.as_mut_ptr() as *mut __m256i, sv);
             _mm256_storeu_si256(en.as_mut_ptr() as *mut __m256i, ee);
             f(p, &st, &en);
@@ -463,6 +502,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Not a test: `SS_SPLIT_DIR=<dataset> SS_KIND=events|clicks SS_N=<passes>`
+    /// under `perf stat`, differenced between two pass counts, gives the
+    /// splitter's instructions per row with a callback that only adds.
+    #[test]
+    #[ignore]
+    fn bench_split() {
+        let dir = std::env::var("SS_SPLIT_DIR").unwrap();
+        let kind = std::env::var("SS_KIND").unwrap_or("events".to_string());
+        let n: usize = std::env::var("SS_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let mut names: Vec<_> = std::fs::read_dir(format!("{}/{}", dir, kind)).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        let files: Vec<Vec<u8>> = names.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let mut ix = Box::new(Index::new());
+        let (mut rows, mut acc) = (0usize, 0usize);
+        for _ in 0..n {
+            for d in &files {
+                let mut from = 0usize;
+                while from < d.len() {
+                    let to = (from + (1 << 20)).min(d.len());
+                    let p = crate::first_line_start(d, from);
+                    if kind == "events" {
+                        each_row::<7, _>(d, p, to, true, &mut ix, #[inline(always)] |lp, s, e| {
+                            rows += 1;
+                            acc += lp + (s[0] ^ e[0] ^ s[1] ^ e[1] ^ s[2] ^ e[2] ^ s[3] ^ e[3] ^ s[4] ^ e[4] ^ s[5] ^ e[5] ^ s[6] ^ e[6]) as usize;
+                        });
+                    } else {
+                        each_row::<4, _>(d, p, to, true, &mut ix, #[inline(always)] |lp, s, e| {
+                            rows += 1;
+                            acc += lp + (s[0] ^ e[0] ^ s[1] ^ e[1] ^ s[2] ^ e[2] ^ s[3] ^ e[3]) as usize;
+                        });
+                    }
+                    from = to;
+                }
+            }
+        }
+        println!("rows {} acc {}", rows, std::hint::black_box(acc));
     }
 
     #[test]

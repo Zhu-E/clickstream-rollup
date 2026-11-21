@@ -5,7 +5,8 @@ track: it reads tens of millions of messy click-stream rows from `/data` and
 writes the two daily Parquet tables to `/output`.
 
 No third-party crates and nothing but the Rust standard library, so the image
-is one ~500 KB binary; it needs no network at run time and no files outside
+is one binary of under 2 MB (half of it lookup tables for the time of day);
+it needs no network at run time and no files outside
 `/data` and `/output`.
 
 ## How it works
@@ -39,11 +40,17 @@ backed by transparent huge pages.
    that scanner stays the definition of the dialect. The second pass takes a
    row off the index with one test ("six commas, then a newline") and one
    vector add for all seven spans.
-   Timestamps go through a 64-entry cache keyed on `YYYY-MM-DD`, so the
+   Timestamps go through a 128-entry cache keyed on `YYYY-MM-DDT`, so the
    calendar arithmetic runs about twenty times per thread instead of 120
-   million. The time of day is one 64-bit word: every byte is checked against
-   its own limit by a single carry-free add and one multiply pairs the digits.
-   Epoch digits and the ten-symbol id encoding use `pmaddubsw`/`pmaddwd`.
+   million; only real dates get in, so a hit needs no further check. The time
+   of day is read two bytes at a time as `HH`, `:M`, `M:` and `SS`, each pair
+   indexing its own 64K table of seconds in which every pair that should not
+   be there holds a poison value: four loads and three adds validate and
+   convert at once, and no separator goes unchecked. Whatever those two steps
+   do not accept is handed to the plain reference parser, which is therefore
+   still the definition of a timestamp. `ingest_ts` has its own entry point
+   with no choice of form. Epoch digits and the ten-symbol id encoding use
+   `pmaddubsw`/`pmaddwd`.
    Resolving a user to a person
    would be a miss in a 30-130 MB link map, so a blocked Bloom filter at 16
    bits per linked id answers "no link" from one cache line and keeps the
