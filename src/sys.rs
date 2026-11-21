@@ -109,6 +109,9 @@ impl<T: Copy> Blob<T> {
         // boundary; without that the kernel has nowhere to put a huge page.
         let pad = if want >= HUGE { HUGE } else { 0 };
         let bytes = want + pad;
+        if bytes == 0 {
+            return Blob { ptr: std::ptr::NonNull::<T>::dangling().as_ptr(), len: 0, base: std::ptr::null_mut(), bytes: 0 };
+        }
         let base = unsafe {
             mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | flags, -1, 0)
         };
@@ -129,7 +132,9 @@ impl<T: Copy> Blob<T> {
 
 impl<T: Copy> Drop for Blob<T> {
     fn drop(&mut self) {
-        unsafe { munmap(self.base, self.bytes) };
+        if self.bytes > 0 {
+            unsafe { munmap(self.base, self.bytes) };
+        }
     }
 }
 
@@ -525,7 +530,7 @@ impl<'a, T: Copy> Sink<'a, T> {
             blk_items,
             cur: vec![std::ptr::null_mut(); nb],
             rem: vec![0u32; nb],
-            stg: Blob::zeroed(if WC { nb * Self::LINE } else { 1 }),
+            stg: Blob::zeroed(if WC { nb * Self::LINE } else { 0 }),
             sn: vec![0u8; nb],
             blocks: (0..nb).map(|_| Vec::new()).collect(),
         }
@@ -632,14 +637,26 @@ impl<'a, T: Copy> Sink<'a, T> {
 
 /// Merge per-thread bucket lists into one list per bucket.
 pub fn merge_blocks<T: Copy>(parts: Vec<Vec<Vec<Blk<T>>>>, nb: usize) -> Vec<Vec<Blk<T>>> {
-    let mut out: Vec<Vec<Blk<T>>> = (0..nb).map(|_| Vec::new()).collect();
-    for p in parts {
-        for (b, list) in p.into_iter().enumerate() {
-            if !list.is_empty() {
-                out[b].extend_from_slice(&list);
+    let mut out: Vec<Vec<Blk<T>>> = Vec::with_capacity(nb);
+    for b in 0..nb {
+        let mut n = 0;
+        for p in &parts {
+            // written on other cores and not read since
+            if let Some(l) = p.get(b + 1) {
+                prefetch(l.as_ptr() as *const u8);
+            }
+            n += p.get(b).map_or(0, |l| l.len());
+        }
+        let mut v = Vec::with_capacity(n);
+        for p in &parts {
+            if let Some(l) = p.get(b) {
+                v.extend_from_slice(l);
             }
         }
+        out.push(v);
     }
+    // thousands of small frees into other threads' heaps: exit does it for nothing
+    std::mem::forget(parts);
     out
 }
 
