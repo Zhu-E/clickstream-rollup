@@ -375,7 +375,10 @@ struct Run {
 }
 
 fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> Run {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/app/shopsess"));
+    // PROBE_EXE picks another build of the pipeline to run
+    let exe = std::env::var_os("PROBE_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/app/shopsess")));
     let mut c = Command::new(exe);
     c.arg(data).arg(out).env("SS_CHILD", "1").env("SS_TIMING", "1");
     for (k, v) in envs {
@@ -801,8 +804,118 @@ fn write_rows(out: &Path, rows: &[(String, String, i64, i64, i64)]) {
     }
 }
 
-/// Second probe: where the time goes in this build, on the scorer.
+fn median(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if s.is_empty() { -1.0 } else { s[s.len() / 2] }
+}
+
+/// A/B probe: several builds of the same source, interleaved on one generated dataset.
 pub fn parent() {
+    let t0 = Instant::now();
+    let age0 = age_ms();
+    let left = |lim: f64| t0.elapsed().as_secs_f64() < lim;
+    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
+    let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
+    let scr = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
+
+    let real = timed(&data, &out, &[]);
+    say(&format!("real run: wall {:.1} ms ok {} | {}", real.r.wall, real.r.ok, stages(&real.r.err)));
+
+    let big = scr.join("big");
+    let bout = scr.join("bigout");
+    let events = std::env::var("PROBE_EVENTS").unwrap_or_else(|_| "20000000".into());
+    let clicks = std::env::var("PROBE_CLICKS").unwrap_or_else(|_| "5000000".into());
+    let t = Instant::now();
+    let made = Command::new("/app/gen/generate")
+        .args(["--seed", "21", "--events", &events, "--clicks", &clicks, "--output"])
+        .arg(&big)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let gen_ms = ms(t) as i64;
+    say(&format!("generated {} events: {} in {} ms", events, made, gen_ms));
+
+    let builds = [
+        ("base", "/app/shopsess"),
+        ("jcc", "/app/v-jcc"),
+        ("wc", "/app/v-wc"),
+        ("avx2", "/app/v-avx2"),
+    ];
+    let mut walls: Vec<Vec<f64>> = vec![Vec::new(); builds.len()];
+    let mut best: Vec<Option<Timed>> = builds.iter().map(|_| None).collect();
+    if made {
+        for round in 0..7 {
+            for (i, (name, exe)) in builds.iter().enumerate() {
+                if !left(150.0) || !Path::new(exe).exists() {
+                    continue;
+                }
+                std::env::set_var("PROBE_EXE", exe);
+                let _ = std::fs::remove_dir_all(&bout);
+                let t = timed(&big, &bout, &[]);
+                say(&format!(
+                    "round {} {}: wall {:.1} ms ok {} user {} sys {} | {} | {} | {}",
+                    round, name, t.r.wall, t.r.ok, t.user_ms, t.sys_ms, stages(&t.r.err), fast_a(&t.r.err), fast_b(&t.r.err)
+                ));
+                if t.r.ok {
+                    walls[i].push(t.r.wall);
+                    if best[i].as_ref().map(|b| t.r.wall < b.r.wall).unwrap_or(true) {
+                        best[i] = Some(t);
+                    }
+                }
+            }
+        }
+        std::env::remove_var("PROBE_EXE");
+    }
+    let _ = std::fs::remove_dir_all(&big);
+    let _ = std::fs::remove_dir_all(&bout);
+
+    let per = |f: &dyn Fn(&Timed) -> f64| -> String {
+        best.iter()
+            .map(|b| b.as_ref().map(|t| format!("{:.0}", f(t))).unwrap_or_else(|| "-".into()))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let med = walls.iter().map(|w| format!("{:.0}", median(w))).collect::<Vec<_>>().join("/");
+    let int = |i: usize, f: &dyn Fn(&Timed) -> i64| best[i].as_ref().map(f).unwrap_or(-1);
+    let rows = [
+        (format!("!0{}", per(&|t| t.r.wall)), med, age0, real.r.wall as i64, gen_ms),
+        (
+            format!("!1{}", per(&|t| stage(&t.r.err, "total"))),
+            per(&|t| kv(&t.r.err, "FAST_MS", "parse")),
+            walls[0].len() as i64,
+            made as i64,
+            t0.elapsed().as_millis() as i64,
+        ),
+        (
+            format!("!2{}", per(&|t| kv(&t.r.err, "FAST_MS", "walk"))),
+            per(&|t| t.user_ms as f64),
+            int(0, &|t| t.sys_ms),
+            int(2, &|t| t.sys_ms),
+            int(3, &|t| t.sys_ms),
+        ),
+        (
+            format!("!3{}", per(&|t| kv(&t.r.err, "FAST_MS", "clicks"))),
+            per(&|t| stage(&t.r.err, "write")),
+            int(0, &|t| t.faults),
+            int(2, &|t| t.faults),
+            int(3, &|t| t.faults),
+        ),
+        (
+            format!("!4{}", per(&|t| kv(&t.r.err, "FAST_MS", "links"))),
+            per(&|t| kv(&t.r.err, "FAST_KEYS_MS", "keys")),
+            int(1, &|t| t.sys_ms),
+            int(1, &|t| t.faults),
+            0,
+        ),
+    ];
+    write_rows(&out, &rows);
+}
+
+/// Second probe: where the time goes in this build, on the scorer.
+pub fn parent_fast() {
     let t0 = Instant::now();
     let age0 = age_ms();
     let left = |lim: f64| t0.elapsed().as_secs_f64() < lim;
