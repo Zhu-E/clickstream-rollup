@@ -911,24 +911,6 @@ struct SendWk<'a>(Wk<'a>);
 unsafe impl<'a> Send for SendWk<'a> {}
 unsafe impl<'a> Sync for SendWk<'a> {}
 
-fn new_tmp(ctx: &Ctx) -> Tmp {
-    let stride = ctx.ndays + 2;
-    Tmp {
-        ss: Vec::new(),
-        sd: Vec::new(),
-        sr: Vec::new(),
-        sp: Vec::new(),
-        cum: vec![0; stride + 2],
-        cnt: vec![0; stride + 2],
-        iv: vec![(0, 0); ctx.ncamp + 1],
-        mark: vec![0; ctx.ncamp + 1],
-        tc: vec![0; ctx.ncamp + 1],
-        gen: 0,
-        catrev: vec![0; ctx.cats.len() + 1],
-        touch: vec![0; ctx.cats.len() + 1],
-    }
-}
-
 impl<'a> Wk<'a> {
     fn new(sh: &Sh, arena: &'a Arena) -> Wk<'a> {
         let nbg = 1usize << sh.gbits;
@@ -936,7 +918,7 @@ impl<'a> Wk<'a> {
             slots: Blob::zeroed(1 << sh.k.shift),
             run: Vec::new(),
             cl: Vec::new(),
-            t: new_tmp(sh.ctx),
+            t: Tmp::new(sh.ctx),
             o: Out::new(sh.out_rows, (sh.ctx.ncamp + 1) * (sh.ctx.ndays + 2)),
             gp: Sink::new(arena, nbg, 64),
             gc: Sink::new(arena, nbg, 64),
