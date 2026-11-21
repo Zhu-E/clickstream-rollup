@@ -476,7 +476,7 @@ fn parse_events<const ABL: u32>(
     let mut nrow = 0usize;
     let mut nval = 0usize;
     let mut ix = split::Index::new();
-    split::each_row::<7, _>(d, p, to, simd, &mut ix, |lp, s, e| {
+    split::each_row::<7, _>(d, p, to, simd, &mut ix, #[inline(always)] |lp, s, e| {
         let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
         nrow += 1;
         if ABL == 1 || ABL == 2 {
@@ -603,7 +603,7 @@ fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CR
     let p = first_line_start(d, from);
     let mut lkh = 0usize;
     let mut ix = split::Index::new();
-    split::each_row::<4, _>(d, p, to, simd, &mut ix, |lp, s, e| {
+    split::each_row::<4, _>(d, p, to, simd, &mut ix, #[inline(always)] |lp, s, e| {
         let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
         if s[0] == e[0] {
             return; // empty click_id

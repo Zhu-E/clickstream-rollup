@@ -112,26 +112,30 @@ mod fast {
     }
 
     /// Index `nblk` blocks from `base`, which must follow a newline. Reads
-    /// one block further.
-    #[inline(always)]
+    /// one block further. Kept out of line so its vector constants are not
+    /// live, and reloaded, across the row loop.
+    #[inline(never)]
     pub unsafe fn index(base: *const u8, nblk: usize, ix: &mut Index) {
         let pos = ix.pos.as_mut_ptr();
-        *pos = u32::MAX;
-        let pos = pos.add(1);
         let qs = ix.qs.as_mut_ptr();
         let ns = ix.ns.as_mut_ptr();
         let bad = ix.bad.as_mut_ptr();
-        let first = (*base == b'"') as u64;
-        *qs = first;
+        *qs = 0;
         *ns = 0;
-        let mut open = first; // the last delimiter is followed by a quote
-        let mut dprev = 1u64; // the byte before this block is a delimiter
+        // Each turn loads one block and finishes the one before it, which
+        // needs the first bit of its successor. The turn before the first
+        // block finishes the newline that precedes `base`, as a block with
+        // only its last byte set: that writes the sentinel and the first
+        // field's quote bit with no code of its own.
+        let (mut c, mut q, mut n) = (0u64, 0u64, 1u64 << 63);
+        let mut open = 0u64; // the last delimiter is followed by a quote
+        let mut dprev = 0u64; // the byte before this block is a delimiter
         let mut qprev = 0u64; // ... is a quote
         let mut nd = 0usize;
         let mut nbad = 0usize;
-        let (mut c, mut q, mut n) = masks(base);
-        for t in 0..nblk {
-            let (c1, q1, n1) = masks(base.add((t + 1) * 64));
+        for t in 0..=nblk {
+            let (c1, q1, n1) = masks(base.add(t * 64));
+            let off = (t as u32).wrapping_sub(1).wrapping_mul(64);
             let d = c | n;
             let d1 = c1 | n1;
             let opens = d & ((q >> 1) | (q1 << 63));
@@ -150,22 +154,22 @@ mod fast {
             if cnt != 0 {
                 open = (a >> (cnt - 1)) & 1;
             }
-            let o = nd + 1;
-            let w = o >> 6;
-            let sh = o & 63;
+            let w = nd >> 6;
+            let sh = nd & 63;
             *qs.add(w) |= a << sh;
             *qs.add(w + 1) = (a >> 1) >> (63 - sh);
             *ns.add(w) |= nlb << sh;
             *ns.add(w + 1) = (nlb >> 1) >> (63 - sh);
-            let off = (t * 64) as u32;
             if (stray | unpaired) != 0 {
                 *bad.add(nbad) = off;
                 nbad += 1;
             }
+            // volatile keeps these eight scalar: left alone they are packed
+            // into a 512-bit vector, which costs more and lowers the clock
             let out = pos.add(nd);
             let mut m = d;
             for k in 0..8 {
-                *out.add(k) = off + m.trailing_zeros();
+                out.add(k).write_volatile(off.wrapping_add(m.trailing_zeros()));
                 m &= m.wrapping_sub(1);
             }
             if cnt > 8 {
@@ -182,11 +186,11 @@ mod fast {
             n = n1;
         }
         // rows read the streams eight bytes at a time, a little past the end
-        let w = (nd + 1) >> 6;
+        let w = nd >> 6;
         *qs.add(w + 1) = 0;
         *ns.add(w + 1) = 0;
         *bad.add(nbad) = u32::MAX;
-        ix.nd = nd;
+        ix.nd = nd - 1;
     }
 
     /// The first newline at or after delimiter `i`.

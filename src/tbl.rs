@@ -72,6 +72,11 @@ fn hash_long(b: &[u8]) -> u64 {
 #[inline(always)]
 pub fn key96(b: &[u8]) -> (u64, u32) {
     let n = b.len();
+    if n.wrapping_sub(8) <= 3 {
+        // the usual length: the tail comes out of the last four bytes
+        let tail = (rd4(b, n - 4) >> (8 * (12 - n))) as u32;
+        return (rd8(b, 0), tail | ((n as u32) << 24));
+    }
     if n <= 11 {
         // Pack the bytes with plain loads; a variable-length copy_from_slice
         // would call memcpy once per row.
@@ -406,7 +411,9 @@ impl DateCache {
     #[inline(always)]
     fn day_ms(&mut self, b: &[u8]) -> i64 {
         let k = rd8(b, 0);
-        let k2 = u16::from_le_bytes([b[8], b[9]]) as u64;
+        let mut t = [0u8; 2];
+        t.copy_from_slice(&b[8..10]);
+        let k2 = u16::from_le_bytes(t) as u64;
         let i = (((k2 << 4) ^ (k2 >> 8)) & 63) as usize;
         let e = unsafe { self.e.get_unchecked(i) };
         if ((e.klo ^ k) | (e.khi ^ k2)) == 0 {
@@ -447,6 +454,69 @@ fn date_days(b: &[u8]) -> Option<i64> {
 
 const POW10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
 
+/// For sixteen bytes read as `b[..8]` then `b[k..k + 8]`: all of the first
+/// word and the last `k` bytes of the second, which repeats the rest.
+const fn fresh_tbl() -> [[u8; 16]; 9] {
+    let mut t = [[0u8; 16]; 9];
+    let mut k = 0;
+    while k < 9 {
+        let mut i = 0;
+        while i < 16 {
+            if i < 8 || i >= 16 - k {
+                t[k][i] = 0xff;
+            }
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+}
+
+static FRESH: [[u8; 16]; 9] = fresh_tbl();
+
+/// Eight to sixteen digits, `k = len - 8`: the first eight as one number and
+/// the remaining `k` as another, or None if any byte is not a digit.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn split_digits(b: &[u8], k: usize) -> Option<(u64, u64)> {
+    use core::arch::x86_64::*;
+    debug_assert!(b.len() == k + 8 && k <= 8);
+    unsafe {
+        let hi = _mm_loadl_epi64(b.as_ptr() as *const __m128i);
+        let lo = _mm_loadl_epi64(b.as_ptr().add(k) as *const __m128i);
+        let x = _mm_sub_epi8(_mm_unpacklo_epi64(hi, lo), _mm_set1_epi8(0x30));
+        let over = _mm_subs_epu8(x, _mm_set1_epi8(9));
+        if _mm_testz_si128(over, over) == 0 {
+            return None;
+        }
+        let x = _mm_and_si128(x, _mm_loadu_si128(FRESH.get_unchecked(k).as_ptr() as *const __m128i));
+        // pairs, then fours, then eights
+        let a = _mm_maddubs_epi16(x, _mm_set1_epi16(0x010a));
+        let c = _mm_madd_epi16(a, _mm_set1_epi32(0x0001_0064));
+        let e = _mm_madd_epi16(_mm_packus_epi32(c, c), _mm_set1_epi32(0x0001_2710));
+        let r = _mm_cvtsi128_si64(e) as u64;
+        Some((r & 0xffff_ffff, r >> 32))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+fn split_digits(b: &[u8], k: usize) -> Option<(u64, u64)> {
+    split_digits_sw(b, k)
+}
+
+/// The same with 64-bit words only.
+#[inline(always)]
+fn split_digits_sw(b: &[u8], k: usize) -> Option<(u64, u64)> {
+    let hi = rd8(b, 0);
+    let lo = rd8(b, k);
+    if !(digits8(hi) & digits8(lo)) {
+        return None;
+    }
+    let fresh = rd8(&FRESH[k], 8);
+    Some((val8(hi), val8x(lo.wrapping_sub(ZEROS) & fresh)))
+}
+
 /// Digits-only epoch milliseconds. Eight to sixteen digits, which is every
 /// one the generator writes, take two overlapping words and no loop.
 #[inline(always)]
@@ -454,15 +524,8 @@ fn epoch_fast(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n.wrapping_sub(8) <= 8 {
         let k = n - 8;
-        let hi = rd8(b, 0);
-        let lo = rd8(b, k);
-        if !(digits8(hi) & digits8(lo)) {
-            return None;
-        }
-        // the low word repeats 8 - k digits of the high one
-        let fresh = !((!0u64 >> (4 * k)) >> (4 * k));
-        let low = val8x(lo.wrapping_sub(ZEROS) & fresh);
-        return Some((val8(hi) * unsafe { *POW10.get_unchecked(k) } + low) as i64);
+        let (hi, lo) = split_digits(b, k)?;
+        return Some((hi * unsafe { *POW10.get_unchecked(k) } + lo) as i64);
     }
     epoch_slow(b)
 }
@@ -887,6 +950,49 @@ mod tests {
                 }
             }
             assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn digit_words_agree() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for it in 0..2_000_000u32 {
+            let n = 8 + rng.below(9) as usize;
+            let mut v: Vec<u8> = (0..n).map(|_| b'0' + rng.below(10) as u8).collect();
+            if it % 4 == 0 {
+                let at = rng.below(n as u64) as usize;
+                v[at] = rng.next() as u8;
+            }
+            let want = if v.iter().all(|c| c.is_ascii_digit()) {
+                let s = std::str::from_utf8(&v).unwrap();
+                Some((s[..8].parse::<u64>().unwrap(), s[8..].parse::<u64>().unwrap_or(0)))
+            } else {
+                None
+            };
+            assert_eq!(split_digits(&v, n - 8), want, "{:?}", String::from_utf8_lossy(&v));
+            assert_eq!(split_digits_sw(&v, n - 8), want, "{:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn key96_matches_the_byte_loop() {
+        let slow = |b: &[u8]| -> (u64, u32) {
+            let mut lo = 0u64;
+            let mut hi = 0u32;
+            for (i, &c) in b.iter().enumerate() {
+                if i < 8 {
+                    lo |= (c as u64) << (8 * i);
+                } else {
+                    hi |= (c as u32) << (8 * (i - 8));
+                }
+            }
+            (lo, hi | ((b.len() as u32) << 24))
+        };
+        let mut rng = Rng(0x0f0f_1234_5678_9abd);
+        for _ in 0..200_000 {
+            let n = rng.below(12) as usize;
+            let v: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+            assert_eq!(key96(&v), slow(&v), "{:?}", v);
         }
     }
 
