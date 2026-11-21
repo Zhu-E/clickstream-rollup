@@ -654,6 +654,7 @@ pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
     }
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!("  fast: keys {:#x} {:#x} in {:?}, ncap {} ucap {} shift {}", ek, uk, t0.elapsed(), ncap, ucap, shift);
+        eprintln!("FAST_KEYS_MS keys={:.1} shift={}", t0.elapsed().as_secs_f64() * 1e3, shift);
     }
     Some(Keys { ek, uk, ncap, ucap, shift })
 }
@@ -2266,6 +2267,22 @@ pub(crate) fn run(
             n_inline,
             n_general,
             groups.len()
+        );
+        let m = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "FAST_MS links={:.1} parse={:.1} merge={:.1} clicks={:.1} odd={:.1} walk={:.1} regroup={:.1} tail={:.1} whale={:.1} general={} oddrows={} esc={}",
+            m(t_links),
+            m(t_rows),
+            m(t_merged - t_parse),
+            m(t_cg - t_merged),
+            m(t_odd - t_cg),
+            m(t_walk - t_odd),
+            m(t_stitch - t_walk),
+            m(t0.elapsed() - t_stitch),
+            slowest.0 as f64 / 1e6,
+            n_general,
+            odd.len(),
+            esc.len()
         );
     }
     // nothing below needs more than these links

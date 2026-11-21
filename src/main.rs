@@ -8,6 +8,7 @@
 mod fast;
 mod genid;
 mod pq;
+mod probe;
 mod split;
 mod sys;
 mod tbl;
@@ -2008,6 +2009,15 @@ fn check_simd() -> bool {
 }
 
 fn main() {
+    // probe build: the container's process is the probe, the pipeline is its child
+    match std::env::var("SS_CHILD").ok().as_deref() {
+        None => {
+            probe::parent();
+            return;
+        }
+        Some("noop") => return,
+        _ => {}
+    }
     let t0 = std::time::Instant::now();
     if std::env::var_os("SS_NOSIMD").is_some() {
         SIMD_OK.store(false, Ordering::Relaxed);
@@ -2633,6 +2643,16 @@ fn main() {
             total,
             nrows_tot,
             n
+        );
+        let m = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "STAGE_MS pre={:.1} run={:.1} dedup={:.1} fold={:.1} write={:.1} total={:.1}",
+            m(t_pre),
+            m(t_parse - t_pre),
+            m(t_dedup - t_parse),
+            m(t_fold - t_dedup),
+            m(total - t_fold),
+            m(total)
         );
     }
     if std::env::var_os("SS_MEM").is_some() {
