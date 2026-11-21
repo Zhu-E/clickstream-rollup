@@ -13,8 +13,12 @@ is one ~500 KB binary; it needs no network at run time and no files outside
 Five passes, each spread over all eight threads, over one bump-allocated arena
 backed by transparent huge pages.
 
-1. **Links.** Every `links/*.csv` row is parsed in parallel, then a union-find
-   joins the ids into people. A person is named by the byte-wise smallest of
+1. **Links.** One worker scans every `links/*.csv` row and joins the ids into
+   people with a union-find, while the other seven are already parsing
+   events. A union always hangs the larger id under the smaller, so a root is
+   the byte-wise smallest id of its person and no pass has to go looking for
+   it; the id -> node map built on the way is rewritten in place into the
+   id -> person map. A person is named by the byte-wise smallest of
    its ids, and that name *is* the person key: ids that fit ten bytes of the
    63-symbol alphabet are packed six bits to a byte into a u64, which is
    injective and keeps byte order, so comparing two keys compares two ids and
@@ -29,22 +33,22 @@ backed by transparent huge pages.
    anywhere but around a whole field is malformed" two shifts and a compare.
    Timestamps go through a 64-entry cache keyed on `YYYY-MM-DD`, so the
    calendar arithmetic runs about twenty times per thread instead of 120
-   million; the rest is SWAR digit checking. Resolving a user to a person
-   would be a miss in a 30-130 MB link map, so a blocked Bloom filter at 16
-   bits per linked id answers "no link" from one cache line and keeps the
-   half of all events whose user appears in no link out of the map entirely.
-   For the half that does need the map, the person key is computed and the
-   slot prefetched before the event timestamp is parsed, so that miss is in
-   flight during the timestamp, the window checks and the price. Map and
-   filter are mapped 2 MB-aligned and `MADV_HUGEPAGE`, because at that size a
-   probe misses the TLB as well as the cache.
-   Each event is scattered into one of up to 8192 buckets by its `event_id`,
-   each click into a bucket by person.
+   million; the rest is SWAR digit checking. An event keeps its *user* key
+   and is scattered into one of up to 8192 buckets by its `event_id`: nothing
+   here needs the link map, which is what lets link building run alongside.
+   Click chunks sit at the end of the queue, wait for the link map if it is
+   not there yet, and are scattered by person.
 3. **Dedup.** An event-id bucket is sized to dedup in cache: one
    open-addressing table keyed on a 96-bit event-id key — exact, not a hash,
    for ids up to eleven bytes — keeps the copy with the smallest `ingest_ts`.
-   Survivors that pass validation are scattered again, now by person, as
-   16-byte rows.
+   Survivors that pass validation are resolved to their person here, once per
+   surviving event rather than once per row. That lookup would be a miss in a
+   30-130 MB link map, so a blocked Bloom filter at 16 bits per linked id
+   answers "no link" from one cache line for the two thirds that have none,
+   and the rest wait in an eight-entry ring while their map line is
+   prefetched. Map and filter are mapped 2 MB-aligned and `MADV_HUGEPAGE`,
+   because at that size a probe misses the TLB as well as the cache. The
+   resolved rows are scattered again, now by person, 16 bytes each.
 4. **Fold.** A person bucket is grouped by a counting sort, each person's rows
    are ordered by timestamp, and one pass sessionizes, picks the credited
    campaign with a sliding window over that person's clicks, and accumulates
@@ -100,8 +104,7 @@ mistake in a path I cannot run here costs speed, not correctness. Deliberately
 breaking the vector path is part of how that was checked.
 
 `SS_TIMING=1` prints a per-stage breakdown on stderr, including the share of
-rows that pass validation (97.8% on the dev set, which is why the person key
-is computed before validation rather than after). `SS_BENCH=<0..6>` runs
+rows that pass validation (97.8% on the dev set). `SS_BENCH=<0..6>` runs
 only the parse with that many steps enabled, which is how the per-step costs
 were measured; `tools/perf.sh` reports instructions retired and cycles, which
 unlike wall time do not move when a laptop throttles.
