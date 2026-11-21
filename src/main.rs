@@ -698,47 +698,47 @@ fn dedup_bucket(
             }
         }
     }
-    // Survivors wait in a short ring while their link-map line is fetched.
-    let mut ring = [(PRec { person: 0, ts: 0, pc: 0 }, false); RESOLVE_LAG];
+    // Unlinked survivors go straight out. The rest wait in a short ring
+    // while their link-map line is fetched.
+    let mut ring = [PRec { person: 0, ts: 0, pc: 0 }; RESOLVE_LAG];
     let mut at = 0usize;
     let mut hits = 0usize;
     for e in tbl.iter() {
         if e.khi != 0 {
             let r = unsafe { &*e.ptr };
             if r.tsf & 0x8000_0000 != 0 {
-                let linked = lk.lbloom.maybe(r.user);
-                if linked {
-                    lk.link.prefetch(r.user);
+                let rec = PRec { person: r.user, ts: r.tsf & 0x7fff_ffff, pc: r.pc };
+                if !lk.lbloom.maybe(r.user) {
+                    sink.push(person_bucket(rec.person, per_bits), rec);
+                    continue;
                 }
-                let fresh = (PRec { person: r.user, ts: r.tsf & 0x7fff_ffff, pc: r.pc }, linked);
-                let due = std::mem::replace(&mut ring[at], fresh);
+                lk.link.prefetch(r.user);
+                let due = std::mem::replace(&mut ring[at], rec);
                 at = (at + 1) & (RESOLVE_LAG - 1);
-                emit_resolved(lk, sink, per_bits, due, &mut hits);
+                hits += emit_linked(lk, sink, per_bits, due);
             }
         }
     }
     for due in ring {
-        emit_resolved(lk, sink, per_bits, due, &mut hits);
+        hits += emit_linked(lk, sink, per_bits, due);
     }
     hits
 }
 
-const RESOLVE_LAG: usize = 16;
+const RESOLVE_LAG: usize = 8;
 
-/// Pushes one surviving event under its person; a zero key is an empty ring slot.
+/// Pushes one event under its person; a zero key is an empty ring slot.
 #[inline(always)]
-fn emit_resolved(lk: &Links, sink: &mut Sink<PRec>, per_bits: u32, due: (PRec, bool), hits: &mut usize) {
-    let (mut rec, linked) = due;
+fn emit_linked(lk: &Links, sink: &mut Sink<PRec>, per_bits: u32, mut rec: PRec) -> usize {
     if rec.person == 0 {
-        return;
+        return 0;
     }
-    if linked {
-        if let Some(p) = lk.link.get(rec.person) {
-            *hits += 1;
-            rec.person = p;
-        }
+    let found = lk.link.get(rec.person);
+    if let Some(p) = found {
+        rec.person = p;
     }
     sink.push(person_bucket(rec.person, per_bits), rec);
+    found.is_some() as usize
 }
 
 // ---------------------------------------------------------------- fold stage
