@@ -1323,7 +1323,7 @@ mod tests {
         }
     }
 
-    /// Not a test: `SS_KIND=f1|f2|f3|ing|pair|none SS_N=<calls>` under
+    /// Not a test: `SS_KIND=f1|f2|f3|ing|old_ing|cnum|cloop|none SS_N=<calls>` under
     /// `perf stat`, differenced against `SS_N=0`, gives instructions a call.
     #[test]
     #[ignore]
@@ -1383,6 +1383,28 @@ mod tests {
                 let sec = if ms <= 0 { 0u32 } else { (ms / 1000).min(u32::MAX as i64) as u32 };
                 ms ^ sec as i64
             }),
+            // campaign ids: the digit loop `camp_of` used, and what it uses now
+            "cloop" | "cnum" => {
+                let ids: Vec<(String, String)> = (0..1024).map(|_| (format!("c_{}", 1 + rng.below(2000)), String::new())).collect();
+                if kind == "cnum" {
+                    run(&ids, n, |t, _| c_num(t).unwrap_or(0) as i64)
+                } else {
+                    run(&ids, n, |t, _| {
+                        if t.len() < 3 || t[0] != b'c' || t[1] != b'_' || (t.len() > 3 && t[2] == b'0') || t.len() > 11 {
+                            return 0;
+                        }
+                        let mut v = 0u32;
+                        for &c in &t[2..] {
+                            let d = c.wrapping_sub(b'0');
+                            if d > 9 {
+                                return 0;
+                            }
+                            v = v * 10 + d as u32;
+                        }
+                        v as i64
+                    })
+                }
+            }
             _ => run(&rows, n, |t, _| parse_ts_c(t, &mut dc).unwrap_or(0)),
         };
         println!("acc {}", std::hint::black_box(acc));
