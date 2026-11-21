@@ -775,6 +775,13 @@ impl Bloom {
         self.w[w1] |= 1u64 << ((g >> 18) & 63);
         self.w[w1] |= 1u64 << ((g >> 24) & 63);
     }
+    /// Start the fetch of the one line `maybe` will read.
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        let h = mix(k, 0x9e37_79b9_7f4a_7c15);
+        let b = (((h >> 40) as usize) & (self.blocks - 1)) * 8;
+        prefetch(unsafe { self.w.as_ptr().add(b) } as *const u8);
+    }
     #[inline(always)]
     pub fn maybe(&self, k: u64) -> bool {
         let h = mix(k, 0x9e37_79b9_7f4a_7c15);

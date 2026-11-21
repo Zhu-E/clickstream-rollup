@@ -84,10 +84,33 @@ impl<T: Copy> std::ops::DerefMut for Blob<T> {
     }
 }
 
-/// Pull a line into cache well before it is needed. A discarded volatile read
-/// rather than a prefetch intrinsic: it does the same job here, and it
-/// compiles on every target, which matters for code paths this machine cannot
-/// execute.
+/// Pull a line into L1 well before it is needed. A real prefetch rather than a
+/// discarded load, because a load has to land in a register and the extra
+/// pressure across the parse loop cost more than the miss it hid: swapping the
+/// two took 32 instructions per row back off.
+///
+/// `_mm_prefetch` has been stable since 1.27 and takes its hint positionally
+/// under `rustc_legacy_const_generics`; `prfm` is plain aarch64. Anything else
+/// gets the load, which is correct everywhere and merely slower.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn prefetch(p: *const u8) {
+    unsafe { core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn prefetch(p: *const u8) {
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{x}]",
+            x = in(reg) p,
+            options(nostack, readonly, preserves_flags),
+        )
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
 pub fn prefetch(p: *const u8) {
     unsafe {

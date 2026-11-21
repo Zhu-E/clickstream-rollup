@@ -450,6 +450,7 @@ static SIMD_OK: AtomicBool = AtomicBool::new(true);
 
 static LKH: AtomicUsize = AtomicUsize::new(0);
 static NROW: AtomicUsize = AtomicUsize::new(0);
+static NVAL: AtomicUsize = AtomicUsize::new(0);
 static NS_EV: AtomicUsize = AtomicUsize::new(0);
 static NS_CL: AtomicUsize = AtomicUsize::new(0);
 static ACC: AtomicUsize = AtomicUsize::new(0);
@@ -472,6 +473,7 @@ fn parse_events<const ABL: u32>(
     let mut acc = 0usize;
     let mut lkh = 0usize;
     let mut nrow = 0usize;
+    let mut nval = 0usize;
     while p < to {
         let sc = scan_line(d, p, simd);
         let line = &d[p..sc.nl];
@@ -502,12 +504,26 @@ fn parse_events<const ABL: u32>(
         let ing_ms = parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc).unwrap_or(0);
         let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
 
+        // Resolving a user to a person ends in a line of a link map far too
+        // big to cache. The probe is started here and read after validation,
+        // so the event timestamp covers the miss instead of waiting on it.
+        let user = &line[f[1].0 as usize..f[1].1 as usize];
+        let has_user = !user.is_empty();
+        let mut pk = 0u64;
+        let mut linked = false;
+        if has_user && (ABL == 0 || ABL >= 6) {
+            pk = person_key(user);
+            linked = ctx.lbloom.maybe(pk);
+            if linked {
+                ctx.link.prefetch(pk);
+            }
+        }
+
         let mut tsf = 0u32;
         let mut pc = 0u32;
         let mut person = 0u64;
         loop {
-            let user = &line[f[1].0 as usize..f[1].1 as usize];
-            if user.is_empty() {
+            if !has_user {
                 break;
             }
             let ts = match parse_ts_c(&line[f[2].0 as usize..f[2].1 as usize], dc) {
@@ -555,13 +571,24 @@ fn parse_events<const ABL: u32>(
                 acc += pid.len() ^ pc as usize;
                 break;
             }
-            person = ctx.person_of(user, &mut lkh);
+            person = if linked {
+                match ctx.link.get(pk) {
+                    Some(r) => {
+                        lkh += 1;
+                        r
+                    }
+                    None => pk,
+                }
+            } else {
+                pk
+            };
             if person & PTAG != 0 && ctx.names.get(person).is_none() {
                 // An id too long or too odd to encode, and in no link: keep
                 // track of where its bytes are so the name can be written out.
                 xn.push((person, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
             }
             tsf = (ts - ctx.base) as u32 | 0x8000_0000;
+            nval += 1;
             break;
         }
         let b = (mix(klo ^ (khi as u64), 0x9e37_79b9_7f4a_7c15) >> (64 - ctx.eid_bits)) as usize;
@@ -576,6 +603,7 @@ fn parse_events<const ABL: u32>(
     }
     LKH.fetch_add(lkh, Ordering::Relaxed);
     NROW.fetch_add(nrow, Ordering::Relaxed);
+    NVAL.fetch_add(nval, Ordering::Relaxed);
 }
 
 fn parse_clicks(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<CRec>, dc: &mut DateCache) {
@@ -1932,13 +1960,14 @@ fn main() {
     let t_parse = t0.elapsed();
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!(
-            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {} rows {} linkhits {}",
+            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {} rows {} valid {} linkhits {}",
             t_pp,
             t_parse - t_pp,
             NS_EV.load(Ordering::Relaxed) / 1_000_000,
             NS_CL.load(Ordering::Relaxed) / 1_000_000,
             xraw.len(),
             NROW.load(Ordering::Relaxed),
+            NVAL.load(Ordering::Relaxed),
             LKH.load(Ordering::Relaxed)
         );
     }
