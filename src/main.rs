@@ -1355,167 +1355,198 @@ struct Links {
     names: Map64,
 }
 
-fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links {
-    let mut parts: Vec<Vec<(u64, u64, u64, u64)>> = Vec::new();
-    let next = AtomicUsize::new(0);
-    let chunks: Vec<(usize, usize, usize)> = {
-        let mut v = Vec::new();
-        const C: usize = 1 << 20;
-        for fi in range.clone() {
-            let n = maps[fi].len;
-            let mut a = 0;
-            while a < n {
-                v.push((fi, a, (a + C).min(n)));
-                a += C;
-            }
-        }
-        v
-    };
-    std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nt)
-            .map(|_| {
-                let next = &next;
-                let chunks = &chunks;
-                s.spawn(move || {
-                    let mut out: Vec<(u64, u64, u64, u64)> = Vec::new();
-                    let simd = SIMD_OK.load(Ordering::Relaxed);
-                    loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        if k >= chunks.len() {
-                            break;
-                        }
-                        let (fi, a, b) = chunks[k];
-                        let d = maps[fi].as_slice();
-                        let mut p = first_line_start(d, a);
-                        while p < b {
-                            let sc = scan_line(d, p, simd);
-                            let line = &d[p..sc.nl];
-                            let lp = p;
-                            p = sc.nl + 1;
-                            if let Some(f) = fields::<2>(line, &sc) {
-                                if f[0].0 == f[0].1 || f[1].0 == f[1].1 {
-                                    continue;
-                                }
-                                let a1 = &line[f[0].0 as usize..f[0].1 as usize];
-                                let b1 = &line[f[1].0 as usize..f[1].1 as usize];
-                                out.push((
-                                    person_key(a1),
-                                    sref_of(fi, lp + f[0].0 as usize, a1.len()),
-                                    person_key(b1),
-                                    sref_of(fi, lp + f[1].0 as usize, b1.len()),
-                                ));
-                            }
-                        }
-                    }
-                    out
-                })
-            })
-            .collect();
-        for h in hs {
-            parts.push(h.join().unwrap());
-        }
-    });
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct LinkNode {
+    key: u64,
+    parent: u32,
+}
 
-    let t_rows = std::time::Instant::now();
-    let total: usize = parts.iter().map(|p| p.len()).sum();
-    let mut keys: Vec<u64> = Vec::with_capacity(total * 2 / 3 + 16);
-    let mut srefs: Vec<u64> = Vec::with_capacity(total * 2 / 3 + 16);
-    let mut parent: Vec<u32> = Vec::with_capacity(total * 2 / 3 + 16);
-    let mut rank: Vec<u8> = Vec::with_capacity(total * 2 / 3 + 16);
-    // Grows as needed: the number of distinct ids is not known yet.
-    let mut idx = Map64::with_capacity(total + 16);
+/// Union-find over the linked ids. The smaller id always becomes the root,
+/// so a component's root is the person's name and no second pass looks for it.
+struct Joiner<'a> {
+    maps: &'a [Map],
+    idx: Map64, // id key -> node
+    nodes: Blob<LinkNode>,
+    srefs: Blob<u64>, // only filled for hashed keys
+    n: usize,
+}
 
-    #[inline]
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
-
-    let mut intern = |h: u64, s: u64, keys: &mut Vec<u64>, srefs: &mut Vec<u64>, parent: &mut Vec<u32>, rank: &mut Vec<u8>| -> u32 {
-        let want = keys.len() as u64;
-        let got = idx.get_or_insert(h, want);
+impl<'a> Joiner<'a> {
+    #[inline(always)]
+    fn node(&mut self, key: u64, sref: u64) -> u32 {
+        let want = self.n as u64;
+        let got = self.idx.get_or_insert(key, want);
         if got == want {
-            keys.push(h);
-            srefs.push(s);
-            parent.push(want as u32);
-            rank.push(0);
+            self.nodes[self.n] = LinkNode { key, parent: want as u32 };
+            if key & PTAG != 0 {
+                self.srefs[self.n] = sref;
+            }
+            self.n += 1;
         }
         got as u32
-    };
-
-    for p in &parts {
-        for &(ha, sa, hb, sb) in p {
-            let a = intern(ha, sa, &mut keys, &mut srefs, &mut parent, &mut rank);
-            let b = intern(hb, sb, &mut keys, &mut srefs, &mut parent, &mut rank);
-            let mut ra = find(&mut parent, a);
-            let mut rb = find(&mut parent, b);
-            if ra == rb {
-                continue;
-            }
-            if rank[ra as usize] < rank[rb as usize] {
-                std::mem::swap(&mut ra, &mut rb);
-            }
-            parent[rb as usize] = ra;
-            if rank[ra as usize] == rank[rb as usize] {
-                rank[ra as usize] += 1;
+    }
+    #[inline(always)]
+    fn find(&mut self, mut x: u32) -> u32 {
+        // every index stored in a node is below n
+        unsafe {
+            loop {
+                let p = self.nodes.get_unchecked(x as usize).parent;
+                if p == x {
+                    return x;
+                }
+                let g = self.nodes.get_unchecked(p as usize).parent;
+                self.nodes.get_unchecked_mut(x as usize).parent = g;
+                x = g;
             }
         }
     }
-    drop(parts);
-    let t_uf = t_rows.elapsed();
-
-    let n = keys.len();
-    let mut minnode: Vec<u32> = (0..n as u32).collect();
-    let getb = |s: u64| -> &[u8] {
+    fn bytes(&self, node: u32) -> &[u8] {
+        let s = self.srefs[node as usize];
         let len = (s >> 56) as usize;
         let fi = ((s >> 40) & 0xffff) as usize;
         let off = (s & 0xff_ffff_ffff) as usize;
-        unsafe { std::slice::from_raw_parts(maps[fi].ptr.add(off), len) }
-    };
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        let cur = minnode[r] as usize;
-        if cur == i {
-            continue;
+        unsafe { std::slice::from_raw_parts(self.maps[fi].ptr.add(off), len) }
+    }
+    /// Byte order of the two ids; encoded keys already sort that way.
+    #[inline(always)]
+    fn id_less(&self, a: u32, b: u32) -> bool {
+        let (ka, kb) = (self.nodes[a as usize].key, self.nodes[b as usize].key);
+        if (ka | kb) & PTAG == 0 {
+            return ka < kb;
         }
-        // Encoded keys compare like their bytes do, so the common case needs
-        // no reads back into the mapped files.
-        let smaller = if (keys[i] | keys[cur]) & PTAG == 0 {
-            keys[i] < keys[cur]
+        self.mixed_less(a, b)
+    }
+    #[cold]
+    fn mixed_less(&self, a: u32, b: u32) -> bool {
+        let mut ea = [0u8; MAXENC];
+        let mut eb = [0u8; MAXENC];
+        let (ka, kb) = (self.nodes[a as usize].key, self.nodes[b as usize].key);
+        let ba = if ka & PTAG == 0 { let n = dec_name(ka, &mut ea); &ea[..n] } else { self.bytes(a) };
+        let bb = if kb & PTAG == 0 { let n = dec_name(kb, &mut eb); &eb[..n] } else { self.bytes(b) };
+        ba < bb
+    }
+    #[inline(always)]
+    fn union(&mut self, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        if self.id_less(rb, ra) {
+            self.nodes[ra as usize].parent = rb;
         } else {
-            getb(srefs[i]) < getb(srefs[cur])
-        };
-        if smaller {
-            minnode[r] = i as u32;
+            self.nodes[rb as usize].parent = ra;
         }
     }
-    let t_mn = t_rows.elapsed();
+}
+
+const JOIN_LAG: usize = 8;
+const NAME_AHEAD: usize = 16;
+
+/// Runs on one thread: the others are parsing events meanwhile.
+fn build_links(maps: &[Map], range: std::ops::Range<usize>) -> Links {
+    let t_start = std::time::Instant::now();
+    let simd = SIMD_OK.load(Ordering::Relaxed);
+    let bytes: usize = range.clone().map(|fi| maps[fi].len).sum();
+    // a row is at least four bytes and names at most two ids
+    let max_nodes = bytes / 2 + 2;
+    let mut j = Joiner {
+        maps,
+        idx: Map64::with_capacity(bytes / 12 + 16),
+        nodes: Blob::zeroed(max_nodes),
+        srefs: Blob::zeroed(max_nodes),
+        n: 0,
+    };
+
+    // Two short rings keep the misses in flight: a row's map slots are
+    // fetched when it is read, its nodes when its ids are interned.
+    let mut read = [(0u64, 0u64, 0u64, 0u64); JOIN_LAG];
+    let mut interned = [(0u32, 0u32); JOIN_LAG];
+    let mut rows = 0usize;
+    for fi in range {
+        let d = maps[fi].as_slice();
+        let mut p = first_line_start(d, 0);
+        while p < d.len() {
+            let sc = scan_line(d, p, simd);
+            let line = &d[p..sc.nl];
+            let lp = p;
+            p = sc.nl + 1;
+            let f = match fields::<2>(line, &sc) {
+                Some(f) => f,
+                None => continue,
+            };
+            if f[0].0 == f[0].1 || f[1].0 == f[1].1 {
+                continue;
+            }
+            let a = &line[f[0].0 as usize..f[0].1 as usize];
+            let b = &line[f[1].0 as usize..f[1].1 as usize];
+            let row = (
+                person_key(a),
+                sref_of(fi, lp + f[0].0 as usize, a.len()),
+                person_key(b),
+                sref_of(fi, lp + f[1].0 as usize, b.len()),
+            );
+            j.idx.prefetch(row.0);
+            j.idx.prefetch(row.2);
+            let at = rows & (JOIN_LAG - 1);
+            rows += 1;
+            let due = std::mem::replace(&mut read[at], row);
+            if due.0 == 0 {
+                continue;
+            }
+            let pair = (j.node(due.0, due.1), j.node(due.2, due.3));
+            prefetch(unsafe { j.nodes.as_ptr().add(pair.0 as usize) } as *const u8);
+            prefetch(unsafe { j.nodes.as_ptr().add(pair.1 as usize) } as *const u8);
+            let due = std::mem::replace(&mut interned[at], pair);
+            j.union(due.0, due.1);
+        }
+    }
+    for due in read {
+        if due.0 != 0 {
+            let pair = (j.node(due.0, due.1), j.node(due.2, due.3));
+            j.union(pair.0, pair.1);
+        }
+    }
+    for due in interned {
+        j.union(due.0, due.1);
+    }
+    let t_join = t_start.elapsed();
+
+    // The intern map becomes the link map in place: each id's node number
+    // is overwritten with its person's key. A root maps to itself.
+    let n = j.n;
     let mut lbloom = Bloom::new(n + 16);
-    let mut link = Map64::with_capacity(n + 16);
     let mut names = Map64::with_capacity(n / 2 + 16);
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        let mn = minnode[r] as usize;
-        if mn != i {
-            lbloom.insert(keys[i]);
-            link.insert(keys[i], keys[mn]);
-        } else if keys[mn] & PTAG != 0 {
+    let mut link = std::mem::replace(&mut j.idx, Map64::with_capacity(0));
+    let cap = link.slots.len();
+    for s in 0..cap {
+        // slots behind s already hold keys, so never look back around
+        let ahead = if s + NAME_AHEAD < cap { link.slots[s + NAME_AHEAD].1 } else { 0 };
+        prefetch(j.nodes.as_ptr().wrapping_add(ahead as usize) as *const u8);
+        let (key, node) = link.slots[s];
+        if key == 0 {
+            continue;
+        }
+        let root = j.find(node as u32);
+        link.slots[s].1 = j.nodes[root as usize].key;
+        if root != node as u32 {
+            lbloom.insert(key);
+        } else if key & PTAG != 0 {
             // Only ids that do not fit the encoding need their bytes kept.
-            names.insert(keys[mn], srefs[mn]);
+            names.insert(key, j.srefs[root as usize]);
         }
     }
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!(
-            "  links: rows {} nodes {} intern+uf {:?} minnode {:?} maps {:?}",
-            total,
+            "  links: rows {} nodes {} join {:?} maps {:?}",
+            rows,
             n,
-            t_uf,
-            t_mn - t_uf,
-            t_rows.elapsed() - t_mn
+            t_join,
+            t_start.elapsed() - t_join
         );
     }
     Links { link, lbloom, names }
@@ -1954,7 +1985,7 @@ fn main() {
                 let i_lk = i_lk.clone();
                 s.spawn(move || {
                     if t == 0 {
-                        let links = build_links(&ctx.maps, i_lk, 1);
+                        let links = build_links(&ctx.maps, i_lk);
                         ctx.set_links(links);
                         if std::env::var("SS_TIMING").is_ok() {
                             eprintln!("  pre {:?} links {:?} (overlapped)", t_pre, t0.elapsed() - t_pre);
