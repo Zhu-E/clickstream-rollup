@@ -46,6 +46,23 @@ pub fn tune_malloc() {
     }
 }
 
+// glibc reads its tunables once, at load: start again with huge pages asked for its heaps
+pub fn huge_heaps() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::os::unix::process::CommandExt;
+        const WANT: &str = "glibc.malloc.hugetlb=1";
+        let have = std::env::var("GLIBC_TUNABLES").unwrap_or_default();
+        if have.contains("glibc.malloc.hugetlb") || std::env::var_os("SS_NOREEXEC").is_some() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let tun = if have.is_empty() { WANT.to_string() } else { format!("{}:{}", have, WANT) };
+        // returns only if the exec failed: carry on as we are
+        let _ = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("GLIBC_TUNABLES", tun).env("SS_NOREEXEC", "1").exec();
+    }
+}
+
 // SS_TIMING: wall, user, kernel and page faults since the last call
 pub fn stage(name: &str) {
     extern "C" {

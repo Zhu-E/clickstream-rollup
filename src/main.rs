@@ -2008,6 +2008,7 @@ fn check_scan() -> bool {
 }
 
 fn main() {
+    sys::huge_heaps();
     let t0 = std::time::Instant::now();
     sys::stage("start");
     sys::tune_malloc();
