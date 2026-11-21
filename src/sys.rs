@@ -380,6 +380,28 @@ impl<'a, T: Copy> Sink<'a, T> {
             *self.rem.get_unchecked_mut(b) -= Self::SREC as u32;
         }
     }
+    // visits every record pushed so far, in place
+    pub fn each_mut(&mut self, mut f: impl FnMut(*mut T)) {
+        for b in 0..self.nb {
+            for blk in &self.blocks[b] {
+                for i in 0..blk.len as usize {
+                    f(unsafe { (blk.ptr as *mut T).add(i) });
+                }
+            }
+            if !self.cur[b].is_null() {
+                let used = self.blk_items - self.rem[b] as usize;
+                let first = unsafe { self.cur[b].sub(used) };
+                for i in 0..used {
+                    f(unsafe { first.add(i) });
+                }
+            }
+            // records still staged; only with SS_WC
+            let line = unsafe { self.stg.as_mut_ptr().add(b * Self::LINE * WC as usize) } as *mut T;
+            for i in 0..self.sn[b] as usize {
+                f(unsafe { line.add(i) });
+            }
+        }
+    }
     #[cold]
     fn grow(&mut self, b: usize) {
         let p = self.bump.alloc(self.blk_items * std::mem::size_of::<T>()) as *mut T;

@@ -34,7 +34,7 @@ struct ERec {
     klo: u64,
     khi: u32,
     ing: u32,
-    user: u64, // the user id itself when it fits in 63 bits, else a hash
+    person: u64, // the user id itself when it fits in 63 bits, else a hash
     tsf: u32,    // ts offset from base, bit 31 = valid
     pc: u32,     // (cat << 24) | price, 0 when not a purchase
 }
@@ -71,6 +71,7 @@ struct Ctx {
     day0: i64,
     ndays: usize,
     links: OnceLock<Links>,
+    no_links: Links, // empty: every user is its own person
     links_gate: Mutex<()>,
     links_cv: Condvar,
     prod: Vec<u8>, // product number -> cat + 1
@@ -481,6 +482,7 @@ static ACC: AtomicUsize = AtomicUsize::new(0);
 /// code survives in the shipping call.
 fn parse_events<const ABL: u32>(
     ctx: &Ctx,
+    lk: &Links,
     fi: usize,
     from: usize,
     to: usize,
@@ -492,6 +494,7 @@ fn parse_events<const ABL: u32>(
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
     let mut acc = 0usize;
+    let mut lkh = 0usize;
     let mut nrow = 0usize;
     let mut nval = 0usize;
     while p < to {
@@ -524,12 +527,24 @@ fn parse_events<const ABL: u32>(
         let ing_ms = parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc).unwrap_or(0);
         let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
 
+        // Resolving a user to a person ends in a line of a link map far too
+        // big to cache. The probe is started here and read after validation,
+        // so the event timestamp covers the miss instead of waiting on it.
         let user = &line[f[1].0 as usize..f[1].1 as usize];
         let has_user = !user.is_empty();
+        let mut pk = 0u64;
+        let mut linked = false;
+        if has_user && (ABL == 0 || ABL >= 6) {
+            pk = person_key(user);
+            linked = lk.lbloom.maybe(pk);
+            if linked {
+                lk.link.prefetch(pk);
+            }
+        }
 
         let mut tsf = 0u32;
         let mut pc = 0u32;
-        let mut ukey = 0u64;
+        let mut person = 0u64;
         loop {
             if !has_user {
                 break;
@@ -579,11 +594,21 @@ fn parse_events<const ABL: u32>(
                 acc += pid.len() ^ pc as usize;
                 break;
             }
-            // dedup resolves the user to a person once links are built
-            ukey = person_key(user);
-            if ukey & PTAG != 0 {
-                // unencodable id: remember where its bytes are
-                xn.push((ukey, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
+            person = if linked {
+                match lk.link.get(pk) {
+                    Some(r) => {
+                        lkh += 1;
+                        r
+                    }
+                    None => pk,
+                }
+            } else {
+                pk
+            };
+            if person & PTAG != 0 && lk.names.get(person).is_none() {
+                // An id too long or too odd to encode, and in no link: keep
+                // track of where its bytes are so the name can be written out.
+                xn.push((person, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
             }
             tsf = (ts - ctx.base) as u32 | 0x8000_0000;
             nval += 1;
@@ -591,14 +616,15 @@ fn parse_events<const ABL: u32>(
         }
         let b = (mix(klo ^ (khi as u64), 0x9e37_79b9_7f4a_7c15) >> (64 - ctx.eid_bits)) as usize;
         if ABL == 6 {
-            acc += b ^ tsf as usize ^ pc as usize ^ ukey as usize ^ ing as usize;
+            acc += b ^ tsf as usize ^ pc as usize ^ person as usize ^ ing as usize;
             continue;
         }
-        sink.push(b, ERec { klo, khi, ing, user: ukey, tsf, pc });
+        sink.push(b, ERec { klo, khi, ing, person, tsf, pc });
     }
     if ABL != 0 {
         ACC.fetch_add(acc, Ordering::Relaxed);
     }
+    LKH.fetch_add(lkh, Ordering::Relaxed);
     NROW.fetch_add(nrow, Ordering::Relaxed);
     NVAL.fetch_add(nval, Ordering::Relaxed);
 }
@@ -648,6 +674,46 @@ fn person_bucket(person: u64, bits: u32) -> usize {
     (mix(person, 0xff51_afd7_ed55_8ccd) >> (64 - bits)) as usize
 }
 
+const RESOLVE_LAG: usize = 8;
+
+// events parsed before the link map existed: turn their users into people
+fn resolve_written(lk: &Links, sink: &mut Sink<ERec>) -> usize {
+    let mut ring = [std::ptr::null_mut::<ERec>(); RESOLVE_LAG];
+    let mut at = 0usize;
+    let mut hits = 0usize;
+    sink.each_mut(|rec| {
+        let r = unsafe { &*rec };
+        if r.tsf & 0x8000_0000 == 0 || !lk.lbloom.maybe(r.person) {
+            return;
+        }
+        // the record waits in the ring while its link-map line is fetched
+        lk.link.prefetch(r.person);
+        let due = std::mem::replace(&mut ring[at], rec);
+        at = (at + 1) & (RESOLVE_LAG - 1);
+        hits += resolve_one(lk, due);
+    });
+    for due in ring {
+        hits += resolve_one(lk, due);
+    }
+    hits
+}
+
+#[inline(always)]
+fn resolve_one(lk: &Links, rec: *mut ERec) -> usize {
+    if rec.is_null() {
+        return 0;
+    }
+    unsafe {
+        match lk.link.get((*rec).person) {
+            Some(p) => {
+                (*rec).person = p;
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
 // --------------------------------------------------------------- dedup stage
 
 #[repr(C)]
@@ -659,13 +725,7 @@ struct DEnt {
     ptr: *const ERec,
 }
 
-fn dedup_bucket(
-    blocks: &[Blk<ERec>],
-    tbl: &mut Vec<DEnt>,
-    sink: &mut Sink<PRec>,
-    per_bits: u32,
-    lk: &Links,
-) {
+fn dedup_bucket(blocks: &[Blk<ERec>], tbl: &mut Vec<DEnt>, sink: &mut Sink<PRec>, per_bits: u32) {
     let n: usize = blocks.iter().map(|b| b.len as usize).sum();
     if n == 0 {
         return;
@@ -694,42 +754,17 @@ fn dedup_bucket(
             }
         }
     }
-    // linked survivors wait while their link-map line is fetched
-    let mut ring = [PRec { person: 0, ts: 0, pc: 0 }; RESOLVE_LAG];
-    let mut at = 0usize;
     for e in tbl.iter() {
         if e.khi != 0 {
             let r = unsafe { &*e.ptr };
             if r.tsf & 0x8000_0000 != 0 {
-                let rec = PRec { person: r.user, ts: r.tsf & 0x7fff_ffff, pc: r.pc };
-                if !lk.lbloom.maybe(r.user) {
-                    sink.push(person_bucket(rec.person, per_bits), rec);
-                    continue;
-                }
-                lk.link.prefetch(r.user);
-                let due = std::mem::replace(&mut ring[at], rec);
-                at = (at + 1) & (RESOLVE_LAG - 1);
-                emit_linked(lk, sink, per_bits, due);
+                sink.push(
+                    person_bucket(r.person, per_bits),
+                    PRec { person: r.person, ts: r.tsf & 0x7fff_ffff, pc: r.pc },
+                );
             }
         }
     }
-    for due in ring {
-        emit_linked(lk, sink, per_bits, due);
-    }
-}
-
-const RESOLVE_LAG: usize = 8;
-
-// a zero key is an empty ring slot
-#[inline(always)]
-fn emit_linked(lk: &Links, sink: &mut Sink<PRec>, per_bits: u32, mut rec: PRec) {
-    if rec.person == 0 {
-        return;
-    }
-    if let Some(p) = lk.link.get(rec.person) {
-        rec.person = p;
-    }
-    sink.push(person_bucket(rec.person, per_bits), rec);
 }
 
 // ---------------------------------------------------------------- fold stage
@@ -1862,6 +1897,11 @@ fn main() {
         day0,
         ndays,
         links: OnceLock::new(),
+        no_links: Links {
+            link: Map64::with_capacity(0),
+            lbloom: Bloom::new(0),
+            names: Map64::with_capacity(0),
+        },
         links_gate: Mutex::new(()),
         links_cv: Condvar::new(),
         prod,
@@ -1885,6 +1925,7 @@ fn main() {
     // ---- optional parse micro-benchmark: SS_BENCH=<ablation level>
     if let Ok(lv) = std::env::var("SS_BENCH") {
         let lv: u32 = lv.parse().unwrap_or(0);
+        ctx.set_links(build_links(&ctx.maps, i_lk.clone()));
         const CH: usize = 1 << 20;
         let mut cks: Vec<(usize, usize, usize)> = Vec::new();
         let mut nb = 0usize;
@@ -1908,6 +1949,7 @@ fn main() {
                     let ctx = &ctx;
                     let ar = &ar;
                     s.spawn(move || {
+                        let lk = ctx.links();
                         let mut es = Sink::<ERec>::new(ar, nb_eid, BLK_E);
                         let mut dc = DateCache::new();
                         let mut xn: Vec<(u64, u64)> = Vec::new();
@@ -1918,13 +1960,13 @@ fn main() {
                             }
                             let (fi, a, b) = cks[k];
                             match lv {
-                                1 => parse_events::<1>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                2 => parse_events::<2>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                3 => parse_events::<3>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                4 => parse_events::<4>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                5 => parse_events::<5>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                6 => parse_events::<6>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
-                                _ => parse_events::<0>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                1 => parse_events::<1>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                2 => parse_events::<2>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                3 => parse_events::<3>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                4 => parse_events::<4>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                5 => parse_events::<5>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                6 => parse_events::<6>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
+                                _ => parse_events::<0>(ctx, lk, fi, a, b, &mut es, &mut dc, &mut xn),
                             }
                         }
                         std::mem::forget(es);
@@ -1941,6 +1983,7 @@ fn main() {
     }
 
     // ---- links + parse: worker 0 joins links while the rest parse events
+    let link_delay: u64 = std::env::var("SS_LINK_DELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     const CHUNK: usize = 1 << 20;
     let mut chunks: Vec<(u8, u32, usize, usize)> = Vec::new();
     for fi in i_ev.clone() {
@@ -1974,12 +2017,16 @@ fn main() {
                 let i_lk = i_lk.clone();
                 s.spawn(move || {
                     if t == 0 {
+                        // test hook: makes the others parse everything first
+                        std::thread::sleep(std::time::Duration::from_millis(link_delay));
                         let links = build_links(&ctx.maps, i_lk);
                         ctx.set_links(links);
                         if std::env::var("SS_TIMING").is_ok() {
                             eprintln!("  pre {:?} links {:?} (overlapped)", t_pre, t0.elapsed() - t_pre);
                         }
                     }
+                    // until the link map exists, events are written as users
+                    let mut as_users = t != 0;
                     let mut es = Sink::<ERec>::new(arena_e, nb_eid, BLK_E);
                     let mut cs = Sink::<CRec>::new(arena, nb_per, BLK_P);
                     let mut dc = DateCache::new();
@@ -1992,7 +2039,12 @@ fn main() {
                         let (kind, fi, a, b) = chunks[k];
                         let tc = std::time::Instant::now();
                         if kind == 0 {
-                            parse_events::<0>(ctx, fi as usize, a, b, &mut es, &mut dc, &mut xn);
+                            if as_users && ctx.links.get().is_some() {
+                                LKH.fetch_add(resolve_written(ctx.links(), &mut es), Ordering::Relaxed);
+                                as_users = false;
+                            }
+                            let lk = if as_users { &ctx.no_links } else { ctx.links() };
+                            parse_events::<0>(ctx, lk, fi as usize, a, b, &mut es, &mut dc, &mut xn);
                             NS_EV.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         } else {
                             // clicks are scattered by person
@@ -2001,6 +2053,10 @@ fn main() {
                             parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc);
                             NS_CL.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         }
+                    }
+                    if as_users {
+                        ctx.wait_links();
+                        LKH.fetch_add(resolve_written(ctx.links(), &mut es), Ordering::Relaxed);
                     }
                     (es.finish(), cs.finish(), xn)
                 })
@@ -2025,7 +2081,7 @@ fn main() {
     let t_parse = t0.elapsed();
     if std::env::var("SS_TIMING").is_ok() {
         eprintln!(
-            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {} rows {} valid {} click-linkhits {}",
+            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {} rows {} valid {} linkhits {}",
             t_pp,
             t_parse - t_pp,
             NS_EV.load(Ordering::Relaxed) / 1_000_000,
@@ -2049,7 +2105,6 @@ fn main() {
                 let ebuckets = &ebuckets;
                 let eorder = &eorder;
                 let arena = &arena;
-                let lk = ctx.links();
                 s.spawn(move || {
                     let mut sink = Sink::<PRec>::new(arena, nb_per, BLK_P);
                     let mut tbl: Vec<DEnt> = Vec::new();
@@ -2059,7 +2114,7 @@ fn main() {
                         if k >= nb_eid {
                             break;
                         }
-                        dedup_bucket(&ebuckets[eorder[k]], &mut tbl, &mut sink, pb, lk);
+                        dedup_bucket(&ebuckets[eorder[k]], &mut tbl, &mut sink, pb);
                     }
                     sink.finish()
                 })
