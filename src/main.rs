@@ -25,8 +25,7 @@ const ROWS_PER_BUCKET: usize = 24_000;
 const BLK_E: usize = 512;
 const BLK_P: usize = 512;
 
-// one past the last category index: there are at most 255
-const CAT_NONE: u32 = 255;
+const CAT_NONE: u32 = pq::NO_CODE as u32;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -722,9 +721,41 @@ struct Out {
     sessions: Vec<i64>,
     events: Vec<i64>,
     rev: Vec<i64>,
-    tcval: Vec<u8>,
-    tcdef: Vec<u8>,
-    tcn: i64,
+    cat: Vec<u8>,
+    // every count and sum or-ed together: they all fit an i32 if this does
+    all_bits: u64,
+}
+
+impl Out {
+    fn new(rows: usize, cd_len: usize) -> Out {
+        Out {
+            cd: vec![CD::default(); cd_len],
+            uid: Vec::with_capacity(rows * 16),
+            day: Vec::with_capacity(rows),
+            sessions: Vec::with_capacity(rows),
+            events: Vec::with_capacity(rows),
+            rev: Vec::with_capacity(rows),
+            cat: Vec::with_capacity(rows),
+            all_bits: 0,
+        }
+    }
+    fn fits_i32(all_bits: u64) -> bool {
+        all_bits <= i32::MAX as u64
+    }
+    fn write(&self, path: &Path, cats: &[Vec<u8>], narrow: bool) -> std::io::Result<()> {
+        let n = self.day.len() as i64;
+        let int = if narrow { pq::Kind::I64As32 } else { pq::Kind::I64 };
+        let col = |name, kind, vals| pq::Col { name, kind, vals, defs: &[], nvals: n };
+        let cols = [
+            col("user_id", pq::Kind::Utf8, &self.uid[..]),
+            col("day", pq::Kind::Date, pq::as_bytes(&self.day)),
+            col("sessions", int, pq::as_bytes(&self.sessions)),
+            col("events", int, pq::as_bytes(&self.events)),
+            col("revenue_cents", int, pq::as_bytes(&self.rev)),
+            col("top_category", pq::Kind::Dict(cats), &self.cat[..]),
+        ];
+        pq::write(path, n, &cols)
+    }
 }
 
 struct Tmp {
@@ -833,13 +864,8 @@ fn emit_user(ctx: &Ctx, o: &mut Out, t: &mut Tmp, name: &[u8], day: u32, ns: u64
     o.sessions.push(ns as i64);
     o.events.push(ne as i64);
     o.rev.push(rev as i64);
-    if best == CAT_NONE {
-        o.tcdef.push(0);
-    } else {
-        o.tcdef.push(1);
-        o.tcn += 1;
-        pq::push_str(&mut o.tcval, &ctx.cats[best as usize]);
-    }
+    o.all_bits |= ns | ne | rev;
+    o.cat.push(best as u8);
 }
 
 fn process_person(ctx: &Ctx, ev: &[PRec], cl: &[CRec], t: &mut Tmp, o: &mut Out, name: &[u8]) {
@@ -2017,6 +2043,10 @@ fn main() {
     std::fs::create_dir_all(&cdd).unwrap();
     let stride = ctx.ndays + 2;
     let next = AtomicUsize::new(0);
+    let rows: usize = pbuckets.iter().flatten().map(|b| b.len as usize).sum();
+    let rows_per_thread = rows / nt + 4096;
+    let all_bits = std::sync::atomic::AtomicU64::new(0);
+    let folded = std::sync::Barrier::new(nt);
     let mut cds: Vec<Vec<CD>> = Vec::new();
     let mut nrows_tot: usize = 0;
     std::thread::scope(|s| {
@@ -2028,6 +2058,8 @@ fn main() {
                 let porder = &porder;
                 let ctx = &ctx;
                 let ud = &ud;
+                let all_bits = &all_bits;
+                let folded = &folded;
                 s.spawn(move || {
                     let mut f = Fold {
                         ev: Vec::new(),
@@ -2056,17 +2088,7 @@ fn main() {
                             catrev: vec![0; ctx.cats.len() + 1],
                             touch: vec![0; ctx.cats.len() + 1],
                         },
-                        o: Out {
-                            cd: vec![CD::default(); (ctx.ncamp + 1) * stride],
-                            uid: Vec::new(),
-                            day: Vec::new(),
-                            sessions: Vec::new(),
-                            events: Vec::new(),
-                            rev: Vec::new(),
-                            tcval: Vec::new(),
-                            tcdef: Vec::new(),
-                            tcn: 0,
-                        },
+                        o: Out::new(rows_per_thread, (ctx.ncamp + 1) * stride),
                     };
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
@@ -2076,19 +2098,15 @@ fn main() {
                         let k = porder[k];
                         fold_bucket(ctx, xnames, &mut f, &pbuckets[k], &cbuckets[k]);
                     }
+                    // every file must use the same integer type, so agree on it
+                    all_bits.fetch_or(f.o.all_bits, Ordering::Relaxed);
+                    folded.wait();
                     let n = f.o.day.len();
                     if n > 0 {
-                        let cols = [
-                            pq::Col { name: "user_id", kind: pq::Kind::Utf8, vals: &f.o.uid, defs: &[], nvals: n as i64 },
-                            pq::Col { name: "day", kind: pq::Kind::Date, vals: pq::as_bytes(&f.o.day), defs: &[], nvals: n as i64 },
-                            pq::Col { name: "sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&f.o.sessions), defs: &[], nvals: n as i64 },
-                            pq::Col { name: "events", kind: pq::Kind::I64, vals: pq::as_bytes(&f.o.events), defs: &[], nvals: n as i64 },
-                            pq::Col { name: "revenue_cents", kind: pq::Kind::I64, vals: pq::as_bytes(&f.o.rev), defs: &[], nvals: n as i64 },
-                            pq::Col { name: "top_category", kind: pq::Kind::Utf8Opt, vals: &f.o.tcval, defs: &f.o.tcdef, nvals: f.o.tcn },
-                        ];
-                        pq::write(&ud.join(format!("part-{:02}.parquet", t)), n as i64, &cols).unwrap();
+                        let narrow = Out::fits_i32(all_bits.load(Ordering::Relaxed));
+                        f.o.write(&ud.join(format!("part-{:02}.parquet", t)), &ctx.cats, narrow).unwrap();
                     }
-                    (f.o.cd, n)
+                    (std::mem::take(&mut f.o.cd), n)
                 })
             })
             .collect();
@@ -2149,15 +2167,7 @@ fn main() {
     ];
     pq::write(&cdd.join("part-00.parquet"), n as i64, &cols).unwrap();
     if nrows_tot == 0 {
-        let cols = [
-            pq::Col { name: "user_id", kind: pq::Kind::Utf8, vals: &[], defs: &[], nvals: 0 },
-            pq::Col { name: "day", kind: pq::Kind::Date, vals: &[], defs: &[], nvals: 0 },
-            pq::Col { name: "sessions", kind: pq::Kind::I64, vals: &[], defs: &[], nvals: 0 },
-            pq::Col { name: "events", kind: pq::Kind::I64, vals: &[], defs: &[], nvals: 0 },
-            pq::Col { name: "revenue_cents", kind: pq::Kind::I64, vals: &[], defs: &[], nvals: 0 },
-            pq::Col { name: "top_category", kind: pq::Kind::Utf8Opt, vals: &[], defs: &[], nvals: 0 },
-        ];
-        pq::write(&ud.join("part-00.parquet"), 0, &cols).unwrap();
+        Out::new(0, 0).write(&ud.join("part-00.parquet"), &ctx.cats, true).unwrap();
     }
 
     if std::env::var("SS_TIMING").is_ok() {
