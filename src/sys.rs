@@ -30,6 +30,39 @@ const MREMAP_MAYMOVE: i32 = 1;
 #[cfg(target_os = "linux")]
 const MREMAP_FIXED: i32 = 2;
 
+// glibc: never hand heap back or map blocks one by one, and open a thread's heap whole
+pub fn tune_malloc() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_TRIM_THRESHOLD: i32 = -1;
+        const M_TOP_PAD: i32 = -2;
+        const M_MMAP_THRESHOLD: i32 = -3;
+        mallopt(M_MMAP_THRESHOLD, 32 << 20);
+        mallopt(M_TRIM_THRESHOLD, 1 << 30);
+        mallopt(M_TOP_PAD, 64 << 20);
+    }
+}
+
+// glibc reads its tunables once, at load: start again with huge pages asked for its heaps
+pub fn huge_heaps() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::os::unix::process::CommandExt;
+        const WANT: &str = "glibc.malloc.hugetlb=1";
+        let have = std::env::var("GLIBC_TUNABLES").unwrap_or_default();
+        if have.contains("glibc.malloc.hugetlb") || std::env::var_os("SS_NOREEXEC").is_some() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let tun = if have.is_empty() { WANT.to_string() } else { format!("{}:{}", have, WANT) };
+        // returns only if the exec failed: carry on as we are
+        let _ = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("GLIBC_TUNABLES", tun).env("SS_NOREEXEC", "1").exec();
+    }
+}
+
 // SS_TIMING: wall, user, kernel and page faults since the last call
 pub fn stage(name: &str) {
     extern "C" {
@@ -93,6 +126,9 @@ impl<T: Copy> Blob<T> {
         // boundary; without that the kernel has nowhere to put a huge page.
         let pad = if want >= HUGE { HUGE } else { 0 };
         let bytes = want + pad;
+        if bytes == 0 {
+            return Blob { ptr: std::ptr::NonNull::<T>::dangling().as_ptr(), len: 0, base: std::ptr::null_mut(), bytes: 0 };
+        }
         let base = unsafe {
             mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | flags, -1, 0)
         };
@@ -113,7 +149,9 @@ impl<T: Copy> Blob<T> {
 
 impl<T: Copy> Drop for Blob<T> {
     fn drop(&mut self) {
-        unsafe { munmap(self.base, self.bytes) };
+        if self.bytes > 0 {
+            unsafe { munmap(self.base, self.bytes) };
+        }
     }
 }
 
@@ -509,7 +547,7 @@ impl<'a, T: Copy> Sink<'a, T> {
             blk_items,
             cur: vec![std::ptr::null_mut(); nb],
             rem: vec![0u32; nb],
-            stg: Blob::zeroed(if WC { nb * Self::LINE } else { 1 }),
+            stg: Blob::zeroed(if WC { nb * Self::LINE } else { 0 }),
             sn: vec![0u8; nb],
             blocks: (0..nb).map(|_| Vec::new()).collect(),
         }
@@ -616,14 +654,26 @@ impl<'a, T: Copy> Sink<'a, T> {
 
 /// Merge per-thread bucket lists into one list per bucket.
 pub fn merge_blocks<T: Copy>(parts: Vec<Vec<Vec<Blk<T>>>>, nb: usize) -> Vec<Vec<Blk<T>>> {
-    let mut out: Vec<Vec<Blk<T>>> = (0..nb).map(|_| Vec::new()).collect();
-    for p in parts {
-        for (b, list) in p.into_iter().enumerate() {
-            if !list.is_empty() {
-                out[b].extend_from_slice(&list);
+    let mut out: Vec<Vec<Blk<T>>> = Vec::with_capacity(nb);
+    for b in 0..nb {
+        let mut n = 0;
+        for p in &parts {
+            // written on other cores and not read since
+            if let Some(l) = p.get(b + 1) {
+                prefetch(l.as_ptr() as *const u8);
+            }
+            n += p.get(b).map_or(0, |l| l.len());
+        }
+        let mut v = Vec::with_capacity(n);
+        for p in &parts {
+            if let Some(l) = p.get(b) {
+                v.extend_from_slice(l);
             }
         }
+        out.push(v);
     }
+    // thousands of small frees into other threads' heaps: exit does it for nothing
+    std::mem::forget(parts);
     out
 }
 
