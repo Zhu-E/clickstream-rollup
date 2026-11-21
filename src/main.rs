@@ -470,7 +470,6 @@ fn first_line_start(d: &[u8], start: usize) -> usize {
 static SIMD_OK: AtomicBool = AtomicBool::new(true);
 
 static LKH: AtomicUsize = AtomicUsize::new(0);
-static LKH_EV: AtomicUsize = AtomicUsize::new(0);
 static NROW: AtomicUsize = AtomicUsize::new(0);
 static NVAL: AtomicUsize = AtomicUsize::new(0);
 static NS_EV: AtomicUsize = AtomicUsize::new(0);
@@ -660,17 +659,16 @@ struct DEnt {
     ptr: *const ERec,
 }
 
-// returns how many survivors were linked
 fn dedup_bucket(
     blocks: &[Blk<ERec>],
     tbl: &mut Vec<DEnt>,
     sink: &mut Sink<PRec>,
     per_bits: u32,
     lk: &Links,
-) -> usize {
+) {
     let n: usize = blocks.iter().map(|b| b.len as usize).sum();
     if n == 0 {
-        return 0;
+        return;
     }
     let cap = (n * 2).next_power_of_two().max(32);
     tbl.clear();
@@ -699,7 +697,6 @@ fn dedup_bucket(
     // linked survivors wait while their link-map line is fetched
     let mut ring = [PRec { person: 0, ts: 0, pc: 0 }; RESOLVE_LAG];
     let mut at = 0usize;
-    let mut hits = 0usize;
     for e in tbl.iter() {
         if e.khi != 0 {
             let r = unsafe { &*e.ptr };
@@ -712,30 +709,27 @@ fn dedup_bucket(
                 lk.link.prefetch(r.user);
                 let due = std::mem::replace(&mut ring[at], rec);
                 at = (at + 1) & (RESOLVE_LAG - 1);
-                hits += emit_linked(lk, sink, per_bits, due);
+                emit_linked(lk, sink, per_bits, due);
             }
         }
     }
     for due in ring {
-        hits += emit_linked(lk, sink, per_bits, due);
+        emit_linked(lk, sink, per_bits, due);
     }
-    hits
 }
 
 const RESOLVE_LAG: usize = 8;
 
 // a zero key is an empty ring slot
 #[inline(always)]
-fn emit_linked(lk: &Links, sink: &mut Sink<PRec>, per_bits: u32, mut rec: PRec) -> usize {
+fn emit_linked(lk: &Links, sink: &mut Sink<PRec>, per_bits: u32, mut rec: PRec) {
     if rec.person == 0 {
-        return 0;
+        return;
     }
-    let found = lk.link.get(rec.person);
-    if let Some(p) = found {
+    if let Some(p) = lk.link.get(rec.person) {
         rec.person = p;
     }
     sink.push(person_bucket(rec.person, per_bits), rec);
-    found.is_some() as usize
 }
 
 // ---------------------------------------------------------------- fold stage
@@ -2060,15 +2054,13 @@ fn main() {
                     let mut sink = Sink::<PRec>::new(arena, nb_per, BLK_P);
                     let mut tbl: Vec<DEnt> = Vec::new();
                     let pb = per_bits;
-                    let mut hits = 0usize;
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         if k >= nb_eid {
                             break;
                         }
-                        hits += dedup_bucket(&ebuckets[eorder[k]], &mut tbl, &mut sink, pb, lk);
+                        dedup_bucket(&ebuckets[eorder[k]], &mut tbl, &mut sink, pb, lk);
                     }
-                    LKH_EV.fetch_add(hits, Ordering::Relaxed);
                     sink.finish()
                 })
             })
@@ -2082,9 +2074,6 @@ fn main() {
     drop(arena_e);
     let porder = order_by_size(&pbuckets);
     let t_dedup = t0.elapsed();
-    if std::env::var("SS_TIMING").is_ok() {
-        eprintln!("  dedup: event-linkhits {}", LKH_EV.load(Ordering::Relaxed));
-    }
 
     // ---- fold + write user_daily
     let ud = outdir.join("user_daily");
