@@ -294,10 +294,11 @@ impl Keys {
     fn user_str(&self, un: u64, out: &mut [u8; 9]) -> usize {
         const DIG: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
         let mut x = scramble(un, self.uk);
-        let mut tmp = [0u8; 8];
+        // the last digit taken is the first written: build the word backwards
+        let mut w = 0u64;
         let mut n = 0;
         loop {
-            tmp[n] = DIG[(x % 36) as usize];
+            w = (w << 8) | DIG[(x % 36) as usize] as u64;
             n += 1;
             x /= 36;
             if x == 0 {
@@ -305,9 +306,7 @@ impl Keys {
             }
         }
         out[0] = b'u';
-        for i in 0..n {
-            out[1 + i] = tmp[n - 1 - i];
-        }
+        out[1..].copy_from_slice(&w.to_le_bytes());
         n + 1
     }
 }
@@ -455,6 +454,7 @@ struct PSt<'a> {
     esc: Vec<(u64, Esc)>,
     oddc: Vec<OddCl>,
     dc: DateCache,
+    ix: Box<split::Index>,
     maxc: u64,
     rows: usize,
 }
@@ -473,28 +473,20 @@ struct Parsed {
 fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
-    let mut p = first_line_start(d, from);
+    let p = first_line_start(d, from);
     let low = (1u64 << k.shift) - 1;
-    let dc = &mut st.dc;
+    let PSt { es, odd, esc, dc, ix, .. } = st;
     let mut rows = 0usize;
-    let mut maxc = st.maxc;
-    while p < to {
-        let sc = scan_line(d, p, simd);
-        let line = &d[p..sc.nl];
-        let lp = p;
-        p = sc.nl + 1;
-        let f = match fields::<7>(line, &sc) {
-            Some(f) => f,
-            None => continue,
-        };
-        let eid = &line[f[0].0 as usize..f[0].1 as usize];
-        if eid.is_empty() {
-            continue;
+    let mut maxc = 0u64;
+    split::each_row::<7, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
+        let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
+        if s[0] == e[0] {
+            return;
         }
         rows += 1;
-        let ing_ms = parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc).unwrap_or(0);
+        let ing_ms = parse_ts_c(fld(3), dc).unwrap_or(0);
         let ing = if ing_ms <= 0 { 0u32 } else { (ing_ms / 1000).min(u32::MAX as i64) as u32 };
-        let user = &line[f[1].0 as usize..f[1].1 as usize];
+        let user = fld(1);
         let mut valid = false;
         let mut ts = 0i64;
         let mut pc = 0u32;
@@ -502,7 +494,7 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
             if user.is_empty() {
                 break;
             }
-            ts = match parse_ts_c(&line[f[2].0 as usize..f[2].1 as usize], dc) {
+            ts = match parse_ts_c(fld(2), dc) {
                 Some(t) => t,
                 None => break,
             };
@@ -512,7 +504,7 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
             if ing_ms.saturating_sub(ts) > LATE_MS {
                 break;
             }
-            let ety = &line[f[4].0 as usize..f[4].1 as usize];
+            let ety = fld(4);
             let is_pur = match ety.len() {
                 4 => {
                     if ety != b"view" && ety != b"cart" {
@@ -528,12 +520,12 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
                 }
                 _ => break,
             };
-            let pid = &line[f[5].0 as usize..f[5].1 as usize];
+            let pid = fld(5);
             if pid.is_empty() {
                 break;
             }
             if is_pur {
-                let price = match digits_u32(&line[f[6].0 as usize..f[6].1 as usize]) {
+                let price = match digits_u32(fld(6)) {
                     Some(v) if v >= 1 && v <= 10_000_000 => v,
                     _ => break,
                 };
@@ -543,13 +535,13 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
             break;
         }
         let tsf = if valid { (ts - ctx.base) as u32 } else { 0 };
-        let uspan = Span { fi: fi as u32, len: user.len() as u32, off: (lp + f[1].0 as usize) as u64 };
-        let (c, un) = k.event_at(d, lp + f[0].0 as usize, lp + f[0].1 as usize, lp + f[1].0 as usize, lp + f[1].1 as usize);
+        let uspan = Span { fi: fi as u32, len: user.len() as u32, off: (lp + s[1] as usize) as u64 };
+        let (c, un) = k.event_at(d, lp + s[0] as usize, lp + e[0] as usize, lp + s[1] as usize, lp + e[1] as usize);
         let c = match c {
             Some(c) => c,
             None => {
-                let (klo, khi) = key96(eid);
-                st.odd.push(OddEv {
+                let (klo, khi) = key96(fld(0));
+                odd.push(OddEv {
                     klo,
                     khi,
                     ing,
@@ -557,20 +549,20 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
                     pc: if valid { pc } else { 0 },
                     user: uspan,
                 });
-                continue;
+                return;
             }
         };
         maxc = maxc.max(c);
         let b = (c >> k.shift) as usize;
         let cl = c & low;
         if !valid {
-            st.es.push(b, FRec { a: DEAD, b: ((ing as u64) << 32) | cl });
-            continue;
+            es.push(b, FRec { a: DEAD, b: ((ing as u64) << 32) | cl });
+            return;
         }
         let delta = ing as i64 - ts.div_euclid(1000) + BIAS;
         match un {
             Some(un) if delta >= 0 && delta <= DELTA_MASK as i64 => {
-                st.es.push(
+                es.push(
                     b,
                     FRec {
                         a: ((tsf as u64) << 33) | (un << 2) | LIVE,
@@ -579,12 +571,12 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
                 );
             }
             _ => {
-                st.esc.push(((c << 32) | ing as u64, Esc { ts: tsf, pc, user: uspan }));
-                st.es.push(b, FRec { a: ESC, b: ((ing as u64) << 32) | cl });
+                esc.push(((c << 32) | ing as u64, Esc { ts: tsf, pc, user: uspan }));
+                es.push(b, FRec { a: ESC, b: ((ing as u64) << 32) | cl });
             }
         }
-    }
-    st.maxc = maxc;
+    });
+    st.maxc = st.maxc.max(maxc);
     st.rows += rows;
 }
 
@@ -592,43 +584,36 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
 fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let d = ctx.maps[fi].as_slice();
-    let mut p = first_line_start(d, from);
-    let dc = &mut st.dc;
+    let p = first_line_start(d, from);
+    let PSt { cs, oddc, dc, ix, .. } = st;
     let fr = (fi - cl0) as u64;
-    while p < to {
-        let sc = scan_line(d, p, simd);
-        let line = &d[p..sc.nl];
-        let lp = p;
-        p = sc.nl + 1;
-        let f = match fields::<4>(line, &sc) {
-            Some(f) => f,
-            None => continue,
-        };
-        if f[0].0 == f[0].1 {
-            continue;
+    split::each_row::<4, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
+        let fld = |k: usize| -> &[u8] { unsafe { d.get_unchecked(lp + s[k] as usize..lp + e[k] as usize) } };
+        if s[0] == e[0] {
+            return;
         }
-        let user = &line[f[1].0 as usize..f[1].1 as usize];
+        let user = fld(1);
         if user.is_empty() {
-            continue;
+            return;
         }
-        let ts = match parse_ts_c(&line[f[3].0 as usize..f[3].1 as usize], dc) {
+        let ts = match parse_ts_c(fld(3), dc) {
             Some(t) => t,
-            None => continue,
+            None => return,
         };
         if ts < ctx.cl_lo || ts >= ctx.cl_hi {
-            continue;
+            return;
         }
-        let camp = match ctx.camp_of(&line[f[2].0 as usize..f[2].1 as usize]) {
+        let camp = match ctx.camp_of(fld(2)) {
             Some(c) => c,
-            None => continue,
+            None => return,
         };
         let ts = (ts - ctx.base) as u32;
-        let off = (lp + f[0].0 as usize) as u64;
-        let len = (f[0].1 - f[0].0) as u64;
-        match k.user_at(d, lp + f[1].0 as usize, lp + f[1].1 as usize) {
+        let off = (lp + s[0] as usize) as u64;
+        let len = (e[0] - s[0]) as u64;
+        match k.user_at(d, lp + s[1] as usize, lp + e[1] as usize) {
             Some(un) if len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) => {
                 let ui = un >> 9;
-                st.cs.push(
+                cs.push(
                     (ui >> CSHIFT) as usize,
                     FC {
                         a: (ui << 40) | ((ts as u64) << 9) | (un & ALIAS),
@@ -636,14 +621,14 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
                     },
                 );
             }
-            _ => st.oddc.push(OddCl {
-                user: Span { fi: fi as u32, len: user.len() as u32, off: (lp + f[1].0 as usize) as u64 },
+            _ => oddc.push(OddCl {
+                user: Span { fi: fi as u32, len: user.len() as u32, off: (lp + s[1] as usize) as u64 },
                 sref: sref_of(fi, off as usize, len as usize),
                 ts,
                 camp,
             }),
         }
-    }
+    });
 }
 
 // ---------------------------------------------------------------- user table
@@ -966,8 +951,10 @@ impl<'a> Wk<'a> {
         if unsorted {
             self.run.sort_unstable_by_key(|r| r.ts);
         }
+        let fcs = sh.clicks_of(ui);
         self.cl.clear();
-        for f in sh.clicks_of(ui) {
+        self.cl.reserve(fcs.len());
+        for f in fcs {
             self.cl.push(sh.crec(f, 0));
         }
         if self.cl.len() <= 24 {
@@ -1071,6 +1058,8 @@ impl<'a> Wk<'a> {
     /// every fragment of one user, in counter order
     fn group(&mut self, sh: &Sh, frags: &[Frag]) {
         self.run.clear();
+        // one allocation, not a doubling chain: big ones are mapped afresh
+        self.run.reserve(frags.iter().map(|f| f.ev.len()).sum());
         for f in frags {
             self.run.extend_from_slice(&f.ev);
         }
@@ -1145,6 +1134,7 @@ pub(crate) fn run(
                 esc: Vec::new(),
                 oddc: Vec::new(),
                 dc: DateCache::new(),
+                ix: Box::new(split::Index::new()),
                 maxc: 0,
                 rows: 0,
             };
