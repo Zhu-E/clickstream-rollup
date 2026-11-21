@@ -396,7 +396,7 @@ pub fn tail<const K: u32>(c: u64, q: u64, n: u64) -> Option<(Win, usize)> {
 /// two 32-bit compare masks as one word, the first in the low half
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
 #[inline(always)]
-unsafe fn join(lo: u32, hi: u32) -> u64 {
+pub unsafe fn join(lo: u32, hi: u32) -> u64 {
     // spelled out: left to the compiler the two compares become one on a 512-bit register
     let m: u64;
     core::arch::asm!("kunpckdq {m}, {hi}, {lo}", m = lateout(kreg) m, hi = in(kreg) hi, lo = in(kreg) lo, options(pure, nomem, nostack, preserves_flags));
@@ -415,7 +415,7 @@ unsafe fn eq2(a: core::arch::x86_64::__m256i, b: core::arch::x86_64::__m256i, k:
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2", not(all(target_feature = "avx512bw", target_feature = "avx512vl"))))]
 #[inline(always)]
-unsafe fn join(lo: u32, hi: u32) -> u64 {
+pub unsafe fn join(lo: u32, hi: u32) -> u64 {
     lo as u64 | ((hi as u64) << 32)
 }
 
