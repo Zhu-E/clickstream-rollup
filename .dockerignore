@@ -1,6 +1,7 @@
+.git
 target
 fixtures
 tools
 data
-out
+out*
 *.md

@@ -527,9 +527,16 @@ pub fn enc_name(b: &[u8]) -> Option<u64> {
     Some((acc << (6 * (MAXENC - b.len()))) + 1)
 }
 
+/// Built with SS_NOENC=1, every id takes the hashed path. The two paths must
+/// agree on every output, so this is how the side-table path gets tested.
+const NOENC: bool = option_env!("SS_NOENC").is_some();
+
 /// The person key for an id: the id itself when it fits, else a hash.
 #[inline(always)]
 pub fn person_key(b: &[u8]) -> u64 {
+    if NOENC {
+        return hash(b) | PTAG;
+    }
     match enc_name(b) {
         Some(v) => v,
         None => hash(b) | PTAG,
