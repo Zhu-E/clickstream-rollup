@@ -266,42 +266,6 @@ impl Keys {
             None
         }
     }
-    /// `user` of the id a person key encodes ('0'-'9' are codes 1-10, 'a'-'z' 38-63)
-    fn user_of_key(&self, key: u64) -> Option<u64> {
-        if key & PTAG != 0 || key == 0 {
-            return None;
-        }
-        let acc = key - 1;
-        if acc >> 54 != 58 || acc & 63 != 0 {
-            return None;
-        }
-        let mut v = 0u64;
-        let mut n = 0;
-        while n < 8 {
-            let c = (acc >> (48 - 6 * n)) & 63;
-            let d = match c {
-                0 => break,
-                1..=10 => c - 1,
-                38..=63 => c - 28,
-                _ => return None,
-            };
-            if n == 1 && v == 0 {
-                return None;
-            }
-            v = v * 36 + d;
-            n += 1;
-        }
-        // nothing but padding may follow the digits
-        if n == 0 || acc & ((1u64 << (54 - 6 * n)) - 1) != 0 || v > M40 {
-            return None;
-        }
-        let v = unscramble(v, self.uk);
-        if v < self.ucap << 9 {
-            Some(v)
-        } else {
-            None
-        }
-    }
     fn user_str(&self, un: u64, out: &mut [u8; 9]) -> usize {
         const DIG: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
         let mut x = scramble(un, self.uk);
@@ -466,6 +430,8 @@ struct PSt<'a> {
     oddc: Vec<OddCl>,
     dc: DateCache,
     ix: Box<split::Index>,
+    lloc: Vec<Vec<LocalLink>>,
+    lglob: Vec<GlobalLink>,
     maxc: u64,
     rows: usize,
 }
@@ -476,6 +442,8 @@ struct Parsed {
     odd: Vec<OddEv>,
     esc: Vec<(u64, Esc)>,
     oddc: Vec<OddCl>,
+    lloc: Vec<Vec<LocalLink>>,
+    lglob: Vec<GlobalLink>,
     maxc: u64,
     rows: usize,
 }
@@ -641,74 +609,145 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
 
 // ---------------------------------------------------------------- user table
 
-const HAS: u32 = 1 << 30;
-const UTAB_STEP: usize = 1 << 14;
+const LSHIFT: u32 = 12;
 
-/// one more id of a user's component: root alias `ra`, and its own alias unless it is the root
-#[inline(always)]
-fn utab_step(e: u32, ra: u32, ia: Option<u32>) -> u32 {
-    // scratch: root alias:9, other members:10, max alias:9
-    if e & GENERAL != 0 {
-        return e;
+/// a link whose ids are two aliases of one user: user:22 | alias:9 | alias:9
+type LocalLink = u64;
+/// any other link, as `build_links` reads one: key and bytes of each side
+type GlobalLink = (u64, u64, u64, u64);
+
+/// row rules as in `build_links`; a row is local, global or (a self-link) nothing
+fn parse_lk(ctx: &Ctx, k: &Keys, shared: &[AtomicU64], fi: usize, from: usize, to: usize, st: &mut PSt) {
+    let simd = SIMD_OK.load(Ordering::Relaxed);
+    let d = ctx.maps[fi].as_slice();
+    let p = first_line_start(d, from);
+    let PSt { lloc, lglob, ix, .. } = st;
+    split::each_row::<2, _>(d, p, to, simd, ix, #[inline(always)] |lp, s, e| {
+        let (a0, a1) = (lp + s[0] as usize, lp + e[0] as usize);
+        let (b0, b1) = (lp + s[1] as usize, lp + e[1] as usize);
+        if a0 == a1 || b0 == b1 {
+            return;
+        }
+        let (ua, ub) = (k.user_at(d, a0, a1), k.user_at(d, b0, b1));
+        if ua != NONE && ub != NONE && ua >> 9 == ub >> 9 {
+            if ua != ub {
+                lloc[(ua >> (9 + LSHIFT)) as usize].push((ua << 9) | (ub & ALIAS));
+            }
+            return;
+        }
+        let (a, b) = (&d[a0..a1], &d[b0..b1]);
+        if a == b {
+            return;
+        }
+        // a user that a global link touches is resolved through the link map
+        for v in [ua, ub] {
+            if v != NONE {
+                shared[(v >> 15) as usize].fetch_or(1 << ((v >> 9) & 63), Ordering::Relaxed);
+            }
+        }
+        lglob.push((person_key(a), sref_of(fi, a0, a.len()), person_key(b), sref_of(fi, b0, b.len())));
+    });
+}
+
+/// One range of users from their local links: a table entry each, and the
+/// links of users that need the link map after all.
+fn resolve_local(k: &Keys, rows: &mut [LocalLink], shared: &[AtomicU64], u: &[AtomicU32], moved: &mut Vec<GlobalLink>) {
+    fn find(par: &mut [u16; 512], mut x: u16) -> u16 {
+        while par[x as usize] != x {
+            par[x as usize] = par[par[x as usize] as usize];
+            x = par[x as usize];
+        }
+        x
     }
-    let e = if e & HAS == 0 {
-        HAS | ra | (ra << 19)
-    } else if e & 511 != ra {
-        return GENERAL;
-    } else {
-        e
+    rows.sort_unstable();
+    let mut par = [0u16; 512];
+    let mut seen = [false; 512];
+    let mut list: Vec<u16> = Vec::new();
+    let key_of = |un: u64| {
+        let mut nb = [0u8; 9];
+        let n = k.user_str(un, &mut nb);
+        person_key(&nb[..n])
     };
-    match ia {
-        Some(ia) => HAS | ra | ((((e >> 9) & 1023) + 1) << 9) | (((e >> 19) & 511).max(ia) << 19),
-        None => e,
+    let mut i = 0;
+    while i < rows.len() {
+        let ui = rows[i] >> 18;
+        let mut j = i;
+        while j < rows.len() && rows[j] >> 18 == ui {
+            j += 1;
+        }
+        let mut entry = GENERAL;
+        if shared[(ui >> 6) as usize].load(Ordering::Relaxed) >> (ui & 63) & 1 == 0 {
+            list.clear();
+            for &row in &rows[i..j] {
+                let (a, b) = (((row >> 9) & ALIAS) as u16, (row & ALIAS) as u16);
+                for v in [a, b] {
+                    if !seen[v as usize] {
+                        seen[v as usize] = true;
+                        par[v as usize] = v;
+                        list.push(v);
+                    }
+                }
+                let (ra, rb) = (find(&mut par, a), find(&mut par, b));
+                par[ra as usize] = rb;
+            }
+            let top = *list.iter().max().unwrap();
+            let roots = list.iter().filter(|&&v| par[v as usize] == v).count();
+            // one component, and it is exactly aliases 0..=top
+            if roots == 1 && top as usize + 1 == list.len() {
+                let name = (0..=top as u64).min_by_key(|&a| key_of((ui << 9) | a)).unwrap();
+                entry = top as u32 | ((name as u32) << 9);
+            }
+            for &v in &list {
+                seen[v as usize] = false;
+            }
+        }
+        if entry == GENERAL {
+            for &row in &rows[i..j] {
+                moved.push((key_of((ui << 9) | ((row >> 9) & ALIAS)), 0, key_of((ui << 9) | (row & ALIAS)), 0));
+            }
+        }
+        u[ui as usize].store(entry, Ordering::Relaxed);
+        i = j;
     }
 }
 
-/// link-map slots `lo..hi` into the scratch table; any thread, any order
-fn utab_range(links: &Links, k: &Keys, u: &[AtomicU32], lo: usize, hi: usize) {
-    let slots = &links.link.slots;
-    let hi = hi.min(slots.len());
-    for &(id, root) in &slots[lo.min(hi)..hi] {
-        if id == 0 {
+/// what `build_links` makes, from rows already read
+fn links_from_rows(maps: &[Map], rows: &[GlobalLink]) -> Links {
+    let cap = rows.len() * 2 + 16;
+    let mut j = Joiner { maps, idx: Map64::with_capacity(cap), nodes: Blob::reserved(cap), srefs: Blob::reserved(cap), n: 0 };
+    for &(ka, sa, kb, sb) in rows {
+        let a = j.node(ka, sa);
+        let b = j.node(kb, sb);
+        j.union(a, b);
+    }
+    let n = j.n;
+    let mut lbloom = Bloom::new(n + 16);
+    let mut names = Map64::with_capacity(n / 2 + 16);
+    let mut link = std::mem::replace(&mut j.idx, Map64::with_capacity(0));
+    for s in 0..link.slots.len() {
+        let (key, node) = link.slots[s];
+        if key == 0 {
             continue;
         }
-        let i = k.user_of_key(id);
-        let r = if root == id { i } else { k.user_of_key(root) };
-        match (i, r) {
-            (Some(i), Some(r)) if i >> 9 == r >> 9 => {
-                let a = &u[(i >> 9) as usize];
-                let ia = if i == r { None } else { Some((i & ALIAS) as u32) };
-                let mut cur = a.load(Ordering::Relaxed);
-                loop {
-                    let new = utab_step(cur, (r & ALIAS) as u32, ia);
-                    if new == cur {
-                        break;
-                    }
-                    match a.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
-                        Ok(_) => break,
-                        Err(x) => cur = x,
-                    }
-                }
-            }
-            (i, r) => {
-                for v in [i, r].into_iter().flatten() {
-                    u[(v >> 9) as usize].fetch_or(GENERAL, Ordering::Relaxed);
-                }
-            }
+        let root = j.find(node as u32);
+        link.slots[s].1 = j.nodes[root as usize].key;
+        if root != node as u32 {
+            lbloom.insert(key);
+        } else if key & PTAG != 0 {
+            names.insert(key, j.srefs[root as usize]);
         }
     }
+    Links { link, lbloom, names }
 }
 
-/// per user: `k | name << 9` when its linked ids are exactly aliases 0..=k, else GENERAL
-fn finish_utab(u: &mut [u32]) {
-    for e in u.iter_mut() {
-        if *e & GENERAL != 0 {
-            *e = GENERAL;
-        } else if *e != 0 {
-            let (root, cnt, mx) = (*e & 511, (*e >> 9) & 1023, (*e >> 19) & 511);
-            *e = if mx == cnt { mx | (root << 9) } else { GENERAL };
-        }
+/// `Ctx::person_of` against links that are not published yet
+#[inline(always)]
+fn person_in(lk: &Links, user: &[u8]) -> u64 {
+    let key = person_key(user);
+    if !lk.lbloom.maybe(key) {
+        return key;
     }
+    lk.link.get(key).unwrap_or(key)
 }
 
 #[inline(always)]
@@ -774,6 +813,7 @@ fn group_clicks(
 
 struct Sh<'a> {
     ctx: &'a Ctx,
+    lk: &'a Links,
     k: &'a Keys,
     u: &'a [u32],
     eb: &'a [Vec<Blk<FRec>>],
@@ -919,7 +959,8 @@ impl<'a> Wk<'a> {
             let mut nb = [0u8; 9];
             let n = sh.k.user_str(un, &mut nb);
             self.g_un = un;
-            self.g_person = sh.ctx.person_of(&nb[..n], &mut self.hits);
+            self.hits += 1;
+            self.g_person = person_in(sh.lk, &nb[..n]);
         }
         let person = self.g_person;
         self.general_ev += 1;
@@ -928,8 +969,8 @@ impl<'a> Wk<'a> {
 
     /// an event whose user id is not the generator's: resolve the bytes
     fn general_str(&mut self, sh: &Sh, user: Span, ts: u32, pc: u32) {
-        let person = sh.ctx.person_of(user.bytes(sh.ctx), &mut self.hits);
-        if person & PTAG != 0 && sh.ctx.links().names.get(person).is_none() {
+        let person = person_in(sh.lk, user.bytes(sh.ctx));
+        if person & PTAG != 0 && sh.lk.names.get(person).is_none() {
             self.xn.push((person, user.sref()));
         }
         self.general_ev += 1;
@@ -1133,7 +1174,7 @@ pub(crate) fn run(
     // ---- parse, with the links built alongside
     const CHUNK: usize = 1 << 20;
     let mut chunks: Vec<(u8, usize, usize, usize)> = Vec::new();
-    for (kind, r) in [(0u8, i_ev.clone()), (1u8, i_cl.clone())] {
+    for (kind, r) in [(2u8, i_lk.clone()), (0u8, i_ev.clone()), (1u8, i_cl.clone())] {
         for fi in r {
             let n = ctx.maps[fi].len;
             let mut a = 0;
@@ -1147,12 +1188,13 @@ pub(crate) fn run(
     let nb_c = ((k.ucap >> CSHIFT) + 1) as usize;
     let next = AtomicUsize::new(0);
     let mut utab: Blob<u32> = Blob::zeroed(k.ucap as usize);
-    // the same words, shared while every thread fills them
+    // the same words, while several threads fill disjoint users
     let scratch: &[AtomicU32] = unsafe { std::slice::from_raw_parts(utab.as_mut_ptr() as *const AtomicU32, utab.len()) };
-    let unext = AtomicUsize::new(0);
-    let utab_ns = AtomicU64::new(0);
-    let (parts, t_links) = {
+    let nb_l = ((k.ucap >> LSHIFT) + 1) as usize;
+    let shared: Vec<AtomicU64> = (0..(k.ucap as usize + 63) / 64).map(|_| AtomicU64::new(0)).collect();
+    let mut parts: Vec<Parsed> = {
         let cx: &Ctx = ctx;
+        let shared = &shared[..];
         let work = || -> Parsed {
             let mut st = PSt {
                 es: Sink::new(arena, nb_e, 512),
@@ -1162,6 +1204,8 @@ pub(crate) fn run(
                 oddc: Vec::new(),
                 dc: DateCache::new(),
                 ix: Box::new(split::Index::new()),
+                lloc: (0..nb_l).map(|_| Vec::new()).collect(),
+                lglob: Vec::new(),
                 maxc: 0,
                 rows: 0,
             };
@@ -1171,39 +1215,89 @@ pub(crate) fn run(
                     break;
                 }
                 let (kind, fi, a, b) = chunks[i];
-                if kind == 0 {
-                    parse_ev(cx, k, fi, a, b, &mut st);
-                } else {
-                    parse_cl(cx, k, i_cl.start, fi, a, b, &mut st);
+                match kind {
+                    0 => parse_ev(cx, k, fi, a, b, &mut st),
+                    1 => parse_cl(cx, k, i_cl.start, fi, a, b, &mut st),
+                    _ => parse_lk(cx, k, shared, fi, a, b, &mut st),
                 }
             }
-            // whoever is done parsing helps build the user table from the links
-            cx.wait_links();
-            let tu = std::time::Instant::now();
-            loop {
-                let lo = unext.fetch_add(1, Ordering::Relaxed) * UTAB_STEP;
-                if lo >= cx.links().link.slots.len() {
-                    break;
-                }
-                utab_range(cx.links(), k, scratch, lo, lo + UTAB_STEP);
+            Parsed {
+                es: st.es.finish(),
+                cs: st.cs.finish(),
+                odd: st.odd,
+                esc: st.esc,
+                oddc: st.oddc,
+                lloc: st.lloc,
+                lglob: st.lglob,
+                maxc: st.maxc,
+                rows: st.rows,
             }
-            utab_ns.fetch_add(tu.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            Parsed { es: st.es.finish(), cs: st.cs.finish(), odd: st.odd, esc: st.esc, oddc: st.oddc, maxc: st.maxc, rows: st.rows }
         };
         std::thread::scope(|s| {
             let hs: Vec<_> = (1..nt).map(|_| s.spawn(work)).collect();
-            let links = build_links(&cx.maps, i_lk.clone());
-            let t_links = t0.elapsed();
-            // the fast parsers never read links, so publishing now is safe
-            cx.set_links(links);
             let mut parts = vec![work()];
             for h in hs {
                 parts.push(h.join().unwrap());
             }
-            (parts, t_links)
+            parts
         })
     };
-    finish_utab(&mut utab);
+    let t_rows = t0.elapsed();
+
+    // ---- links: each user from its own rows, the link map for the rest
+    let mut global: Vec<GlobalLink> = Vec::new();
+    let mut local: Vec<Vec<Vec<LocalLink>>> = (0..nb_l).map(|_| Vec::new()).collect();
+    for p in parts.iter_mut() {
+        global.append(&mut p.lglob);
+        for (r, v) in std::mem::take(&mut p.lloc).into_iter().enumerate() {
+            if !v.is_empty() {
+                local[r].push(v);
+            }
+        }
+    }
+    let (n_global, n_local) = (global.len(), local.iter().flatten().map(|v| v.len()).sum::<usize>());
+    {
+        let lnext = AtomicUsize::new(0);
+        let (local, shared) = (&local, &shared[..]);
+        std::thread::scope(|s| {
+            let hs: Vec<_> = (0..nt)
+                .map(|_| {
+                    let lnext = &lnext;
+                    s.spawn(move || {
+                        let mut moved: Vec<GlobalLink> = Vec::new();
+                        let mut rows: Vec<LocalLink> = Vec::new();
+                        loop {
+                            let r = lnext.fetch_add(1, Ordering::Relaxed);
+                            if r >= local.len() {
+                                break;
+                            }
+                            rows.clear();
+                            for v in &local[r] {
+                                rows.extend_from_slice(v);
+                            }
+                            resolve_local(k, &mut rows, shared, scratch, &mut moved);
+                        }
+                        moved
+                    })
+                })
+                .collect();
+            for h in hs {
+                global.extend(h.join().unwrap());
+            }
+        });
+    }
+    // users with a global link and no local one
+    for (w, bits) in shared.iter().enumerate() {
+        let mut m = bits.load(Ordering::Relaxed);
+        while m != 0 {
+            utab[w * 64 + m.trailing_zeros() as usize] = GENERAL;
+            m &= m - 1;
+        }
+    }
+    let links = links_from_rows(&ctx.maps, &global);
+    let lk: &Links = &links;
+    let n_moved = global.len() - n_global;
+    let t_links = t0.elapsed() - t_rows;
     let u: &[u32] = &utab;
     if timing {
         let ng = u.iter().filter(|&&e| e & GENERAL != 0).count();
@@ -1280,7 +1374,8 @@ pub(crate) fn run(
                                     let mut nb = [0u8; 9];
                                     let n = k.user_str(un, &mut nb);
                                     l_un = un;
-                                    l_person = ctx.person_of(&nb[..n], &mut hits);
+                                    hits += 1;
+                                    l_person = person_in(lk, &nb[..n]);
                                 }
                                 let fi = cl0 + ((f.b >> 40) & 255) as usize;
                                 let off = ((f.b >> 4) & ((1 << 36) - 1)) as usize;
@@ -1323,7 +1418,6 @@ pub(crate) fn run(
     {
         let mut gp: Sink<PRec> = Sink::new(arena, nbg, 64);
         let mut gc: Sink<CRec> = Sink::new(arena, nbg, 64);
-        let mut hits = 0usize;
         let mut win: HashMap<(u64, u32), usize> = HashMap::new();
         for (i, r) in odd.iter().enumerate() {
             let e = win.entry((r.klo, r.khi)).or_insert(i);
@@ -1331,7 +1425,7 @@ pub(crate) fn run(
                 *e = i;
             }
         }
-        let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows: 0, forced: &[], defer: &[], seen: &seen, bad: &bad, cl0, gbits };
+        let sh = Sh { ctx, lk, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows: 0, forced: &[], defer: &[], seen: &seen, bad: &bad, cl0, gbits };
         // the user whose own person these bytes name, if they name one
         let own = |bytes: &[u8]| -> Option<u32> {
             let un = k.user(bytes)?;
@@ -1357,7 +1451,7 @@ pub(crate) fn run(
                     }
                     person
                 }
-                None => ctx.person_of(bytes, &mut hits),
+                None => person_in(lk, bytes),
             };
             gc.push(gbk(person), CRec { person, sref: r.sref, ts: r.ts, camp: r.camp });
         }
@@ -1377,9 +1471,9 @@ pub(crate) fn run(
                     continue;
                 }
                 Some(ui) => sh.own_key(ui),
-                None => ctx.person_of(bytes, &mut hits),
+                None => person_in(lk, bytes),
             };
-            if person & PTAG != 0 && ctx.links().names.get(person).is_none() {
+            if person & PTAG != 0 && lk.names.get(person).is_none() {
                 xn.push((person, r.user.sref()));
             }
             gp.push(gbk(person), PRec { person, ts, pc });
@@ -1395,7 +1489,7 @@ pub(crate) fn run(
     let t_odd = t0.elapsed();
     // a fair share at one row per event: far more than needed, and untouched pages cost nothing
     let out_rows = rows / nt.max(1) + 4096;
-    let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows, forced: &forced, defer: &defer, seen: &seen, bad: &bad, cl0, gbits };
+    let sh = Sh { ctx, lk, k, u, eb: &eb, cg: &cg, esc: &esc, out_rows, forced: &forced, defer: &defer, seen: &seen, bad: &bad, cl0, gbits };
     let sh = &sh;
     let nbu = ((maxc >> k.shift) + 1) as usize;
     let next = AtomicUsize::new(0);
@@ -1499,10 +1593,12 @@ pub(crate) fn run(
     cb.resize_with(nb_per, Vec::new);
     if timing {
         eprintln!(
-            "  fast: links {:?} (main thread, in parse) user table {:?} thread time | parse {:?} merge {:?} clicks {:?} odd {:?} walk {:?} regroup {:?} (thread time {:?}, longest {:?} for {} events) tail {:?} | rows {} odd {} esc {} odd clicks {} | folded here {} general {} groups {}",
+            "  fast: links after parse {:?}, rows local {} global {} moved {} | parse {:?} merge {:?} clicks {:?} odd {:?} walk {:?} regroup {:?} (thread time {:?}, longest {:?} for {} events) tail {:?} | rows {} odd {} esc {} odd clicks {} | folded here {} general {} groups {}",
             t_links,
-            std::time::Duration::from_nanos(utab_ns.load(Ordering::Relaxed)),
-            t_parse,
+            n_local,
+            n_global,
+            n_moved,
+            t_rows,
             t_merged - t_parse,
             t_cg - t_merged,
             t_odd - t_cg,
@@ -1521,6 +1617,8 @@ pub(crate) fn run(
             groups.len()
         );
     }
+    // nothing below needs more than these links
+    ctx.set_links(links);
     Some(FastOut { pb, cb, outs, xn })
 }
 
@@ -1630,35 +1728,6 @@ mod tests {
             let mut up = b;
             up[..n].make_ascii_uppercase();
             assert_eq!(k.user(&up[..n]), None);
-        }
-        // the same answers straight from a person key
-        let mut x = 0x2545_f491_4f6c_dd1du64;
-        let pool = b"0123456789abcdefghijklmnopqrstuvwxyzAZ_";
-        for i in 0..300_000u64 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let mut s = Vec::new();
-            if i % 3 != 0 {
-                s.push(b'u');
-            }
-            let mut y = x;
-            for _ in 0..(x >> 60) % 11 {
-                s.push(pool[(y % if i % 5 == 0 { 39 } else { 36 }) as usize]);
-                y /= 39;
-            }
-            let wide = Keys { ucap: 1 << 22, ..Keys { ek: k.ek, uk: k.uk, ncap: k.ncap, ucap: 0, shift: 12 } };
-            let key = person_key(&s);
-            if key & PTAG == 0 {
-                assert_eq!(wide.user_of_key(key), wide.user(&s), "{:?}", s);
-            } else {
-                assert_eq!(wide.user_of_key(key), None);
-            }
-        }
-        for un in [0u64, 1, 35, 36, 511, 512, 1 << 20, (1 << 21) + 77] {
-            let mut b = [0u8; 9];
-            let n = k.user_str(un, &mut b);
-            assert_eq!(k.user_of_key(person_key(&b[..n])), k.user(&b[..n]));
         }
         let mut b = [0u8; 9];
         let n = k.user_str(1 << 39, &mut b);

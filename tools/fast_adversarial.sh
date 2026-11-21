@@ -52,6 +52,7 @@ for base in $bases; do
     # the same with the odd-row limit lifted, so the merge paths run too
     pair "$(basename "$base")/$v" "$TMP/d" SS_FODD=1000000000
     pair "$(basename "$base")/$v" "$TMP/d" NCPU=3 SS_FSHIFT=9
+    case "$v" in *link*) for n in 1 8; do pair "$(basename "$base")/$v" "$TMP/d" NCPU=$n; done;; esac
   done
 done
 

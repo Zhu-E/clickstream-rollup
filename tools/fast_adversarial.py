@@ -251,6 +251,30 @@ def v_wide_general(src, dst):
     v_wide_fast(src, dst, True)
 
 
+def v_link_shared_chain(src, dst):
+    # three users through one id that is nobody's
+    us = busiest(src)
+    add(dst, "links", "zz-extra.csv", LK_HEAD, ["%s,shared-kiosk" % us[20], "shared-kiosk,%s" % us[21], '"%s","shared-kiosk"' % us[22]])
+
+
+def v_link_self_and_header(src, dst):
+    # self-links change nothing; a data row that repeats the header is a link
+    us = busiest(src)
+    add(dst, "links", "zz-extra.csv", LK_HEAD, [LK_HEAD, "%s,%s" % (us[40], us[40]), "%s,%s" % (us[41], us[41]), "odd one,odd one", "user_id_a,%s" % us[42]])
+
+
+def v_link_dup_reversed(src, dst):
+    out = []
+    for f in files(src, "links"):
+        _, rs = rows(os.path.join(src, "links", f), 2)
+        out += ["%s,%s" % (fl[1], fl[0]) for _, fl in rs if fl and fl[0] and fl[1]][::2]
+    add(dst, "links", "zz-extra.csv", LK_HEAD, out + out[:500])
+
+
+def v_links_all_global(src, dst):
+    rewrite(src, dst, "links", lambda fi, ri, f: [f[0], f[1].upper()] if f[0] and f[1] else None)
+
+
 VARIANTS = {k[2:]: v for k, v in list(globals().items()) if k.startswith("v_")}
 
 
