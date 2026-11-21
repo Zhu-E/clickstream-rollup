@@ -1067,6 +1067,17 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
     }
 }
 
+/// Bucket indices, fattest first.
+fn order_by_size<T: Copy>(b: &[Vec<Blk<T>>]) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..b.len()).collect();
+    let sz: Vec<u64> = b
+        .iter()
+        .map(|l| l.iter().map(|x| x.len as u64).sum())
+        .collect();
+    v.sort_unstable_by(|&x, &y| sz[y].cmp(&sz[x]));
+    v
+}
+
 // ------------------------------------------------------------ input metadata
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -1512,7 +1523,10 @@ fn main() {
         per_bits,
     };
 
-    let arena = Arena::new((ev_bytes + cl_bytes) * 2 + (3 << 30));
+    // Two arenas: the event-id shuffle is dropped as soon as dedup is done,
+    // which halves peak memory and the page faults that go with it.
+    let arena_e = Arena::new(ev_bytes + (ev_bytes >> 1) + (1 << 30));
+    let arena = Arena::new(ev_bytes + cl_bytes + (1 << 30));
 
     // ---- optional parse micro-benchmark: SS_BENCH=<ablation level>
     if let Ok(lv) = std::env::var("SS_BENCH") {
@@ -1600,8 +1614,9 @@ fn main() {
                 let chunks = &chunks;
                 let ctx = &ctx;
                 let arena = &arena;
+                let arena_e = &arena_e;
                 s.spawn(move || {
-                    let mut es = Sink::<ERec>::new(arena, nb_eid, BLK_E);
+                    let mut es = Sink::<ERec>::new(arena_e, nb_eid, BLK_E);
                     let mut cs = Sink::<CRec>::new(arena, nb_per, BLK_P);
                     let mut dc = DateCache::new();
                     loop {
@@ -1630,7 +1645,9 @@ fn main() {
     let cbuckets = merge_blocks(cparts, nb_per);
     let t_parse = t0.elapsed();
 
-    // ---- dedup
+    // ---- dedup. Process the fattest buckets first: one whale bucket at the
+    // end of the queue would leave seven threads idle.
+    let eorder = order_by_size(&ebuckets);
     let next = AtomicUsize::new(0);
     let mut pparts: Vec<Vec<Vec<Blk<PRec>>>> = Vec::new();
     std::thread::scope(|s| {
@@ -1638,6 +1655,7 @@ fn main() {
             .map(|_| {
                 let next = &next;
                 let ebuckets = &ebuckets;
+                let eorder = &eorder;
                 let arena = &arena;
                 s.spawn(move || {
                     let mut sink = Sink::<PRec>::new(arena, nb_per, BLK_P);
@@ -1648,7 +1666,7 @@ fn main() {
                         if k >= nb_eid {
                             break;
                         }
-                        dedup_bucket(&ebuckets[k], &mut tbl, &mut sink, pb);
+                        dedup_bucket(&ebuckets[eorder[k]], &mut tbl, &mut sink, pb);
                     }
                     sink.finish()
                 })
@@ -1659,6 +1677,9 @@ fn main() {
         }
     });
     let pbuckets = merge_blocks(pparts, nb_per);
+    drop(ebuckets);
+    drop(arena_e);
+    let porder = order_by_size(&pbuckets);
     let t_dedup = t0.elapsed();
 
     // ---- fold + write user_daily
@@ -1676,6 +1697,7 @@ fn main() {
                 let next = &next;
                 let pbuckets = &pbuckets;
                 let cbuckets = &cbuckets;
+                let porder = &porder;
                 let ctx = &ctx;
                 let ud = &ud;
                 s.spawn(move || {
@@ -1723,6 +1745,7 @@ fn main() {
                         if k >= nb_per {
                             break;
                         }
+                        let k = porder[k];
                         fold_bucket(ctx, &mut f, &pbuckets[k], &cbuckets[k]);
                     }
                     let n = f.o.day.len();

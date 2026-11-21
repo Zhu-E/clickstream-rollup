@@ -62,6 +62,12 @@ pub struct Arena {
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
+impl Drop for Arena {
+    fn drop(&mut self) {
+        unsafe { munmap(self.base, self.cap) };
+    }
+}
+
 impl Arena {
     pub fn new(cap: usize) -> Arena {
         let cap = (cap + (1 << 21) - 1) & !((1 << 21) - 1);
