@@ -313,6 +313,251 @@ mod fast {
     }
 }
 
+// ---------------------------------------------------------- one row at a time
+
+/// bytes a row reader may touch, counted from the row start
+#[allow(dead_code)]
+pub const REACH: usize = 128;
+
+/// one line through the reference splitter; returns where the next starts
+#[inline(always)]
+pub fn line<const N: usize, F: FnMut(usize, &[u32; 8], &[u32; 8])>(d: &[u8], p: usize, simd: bool, f: &mut F) -> usize {
+    one_line::<N, F>(d, p, simd, f)
+}
+
+/// content starts and ends of the fields in a 64-byte window, a bit each
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct Win {
+    pub s: u64,
+    pub e: u64,
+}
+
+impl Win {
+    /// the span of the next field
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn next(&mut self) -> (usize, usize) {
+        let r = (self.s.trailing_zeros() as usize, self.e.trailing_zeros() as usize);
+        self.s &= self.s.wrapping_sub(1);
+        self.e &= self.e.wrapping_sub(1);
+        r
+    }
+}
+
+/// none unless every quote in `q` wraps a whole field ended by a bit of `d`
+#[allow(dead_code)]
+#[inline(always)]
+fn wrap(d: u64, q: u64) -> Option<Win> {
+    let after = (d << 1) | 1;
+    let open = q & after;
+    // the borrow of an opening quote clears its field's delimiter
+    let close = (d & !d.wrapping_sub(open)) >> 1;
+    if open.wrapping_add(close) != q {
+        return None;
+    }
+    Some(Win { s: after.wrapping_add(open), e: d.wrapping_sub(close) })
+}
+
+/// the fields the first `K` commas close, and where the last comma is
+#[allow(dead_code)]
+#[inline(always)]
+pub fn head<const K: usize>(c: u64, q: u64, n: u64) -> Option<(Win, usize)> {
+    let mut t = c;
+    for _ in 1..K {
+        t &= t.wrapping_sub(1);
+    }
+    if t == 0 {
+        return None;
+    }
+    let upto = t ^ t.wrapping_sub(1);
+    if n & upto != 0 {
+        return None;
+    }
+    let w = wrap(c & upto, q & upto)?;
+    Some((w, t.trailing_zeros() as usize))
+}
+
+/// the fields up to a newline that exactly `K` commas precede, and where it is
+#[allow(dead_code)]
+#[inline(always)]
+pub fn tail<const K: u32>(c: u64, q: u64, n: u64) -> Option<(Win, usize)> {
+    if n == 0 {
+        return None;
+    }
+    let upto = n ^ n.wrapping_sub(1);
+    if (c & upto).count_ones() != K {
+        return None;
+    }
+    let w = wrap((c | n) & upto, q & upto)?;
+    Some((w, n.trailing_zeros() as usize))
+}
+
+/// two 32-bit compare masks as one word, the first in the low half
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
+#[inline(always)]
+unsafe fn join(lo: u32, hi: u32) -> u64 {
+    // spelled out: left to the compiler the two compares become one on a 512-bit register
+    let m: u64;
+    core::arch::asm!("kunpckdq {m}, {hi}, {lo}", m = lateout(kreg) m, hi = in(kreg) hi, lo = in(kreg) lo, options(pure, nomem, nostack, preserves_flags));
+    m
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn eq2(a: core::arch::x86_64::__m256i, b: core::arch::x86_64::__m256i, k: core::arch::x86_64::__m256i) -> (u32, u32) {
+    use core::arch::x86_64::*;
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vl"))]
+    return (_mm256_cmpeq_epi8_mask(a, k), _mm256_cmpeq_epi8_mask(b, k));
+    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vl")))]
+    return (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, k)) as u32, _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, k)) as u32);
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2", not(all(target_feature = "avx512bw", target_feature = "avx512vl"))))]
+#[inline(always)]
+unsafe fn join(lo: u32, hi: u32) -> u64 {
+    lo as u64 | ((hi as u64) << 32)
+}
+
+/// comma, quote and newline, each spread over a vector
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[derive(Clone, Copy)]
+pub struct Cut(core::arch::x86_64::__m256i, core::arch::x86_64::__m256i, core::arch::x86_64::__m256i);
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+impl Cut {
+    /// hidden from the compiler, which would rebuild a known constant at every use
+    #[inline(always)]
+    pub fn new() -> Cut {
+        use core::arch::x86_64::*;
+        let f = |c: u8| std::hint::black_box(unsafe { _mm256_set1_epi8(c as i8) });
+        Cut(f(b','), f(b'"'), f(b'\n'))
+    }
+}
+
+/// commas, quotes and newlines of 64 bytes, a bit each
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[inline(always)]
+pub unsafe fn masks(p: *const u8, k: &Cut) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |k: __m256i| -> u64 {
+        let (lo, hi) = eq2(a, b, k);
+        join(lo, hi)
+    };
+    (m(k.0), m(k.1), m(k.2))
+}
+
+/// the same, but every bit of the last is set when any byte is a newline
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+#[inline(always)]
+pub unsafe fn masks_any(p: *const u8, k: &Cut) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |k: __m256i| -> u64 {
+        let (lo, hi) = eq2(a, b, k);
+        join(lo, hi)
+    };
+    let (lo, hi) = eq2(a, b, k.2);
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vl"))]
+    let none = _kortestz_mask32_u8(lo, hi) != 0;
+    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vl")))]
+    let none = lo | hi == 0;
+    (m(k.0), m(k.1), if none { 0 } else { !0 })
+}
+
+/// the same masks a byte at a time, for checking the vector ones
+#[allow(dead_code)]
+pub fn masks_sw(b: &[u8]) -> (u64, u64, u64) {
+    let (mut c, mut q, mut n) = (0u64, 0u64, 0u64);
+    for (i, &x) in b.iter().take(64).enumerate() {
+        c |= ((x == b',') as u64) << i;
+        q |= ((x == b'"') as u64) << i;
+        n |= ((x == b'\n') as u64) << i;
+    }
+    (c, q, n)
+}
+
+/// spans of a seven-field row: three fields from `p`, four from past the third comma
+#[allow(dead_code)]
+#[inline(always)]
+pub fn row7(w0: (u64, u64, u64), w1: impl FnOnce(usize) -> (u64, u64, u64)) -> Option<(Win, Win, usize, usize)> {
+    let (a, p3) = head::<3>(w0.0, w0.1, w0.2)?;
+    let m = w1(p3 + 1);
+    let (b, nl) = tail::<3>(m.0, m.1, m.2)?;
+    Some((a, b, p3 + 1, nl))
+}
+
+/// rows as the fast path takes them: windows where they fit, the reference elsewhere
+#[allow(dead_code)]
+fn collect_win<const N: usize>(d: &[u8], cuts: &[usize], vector: bool) -> Vec<[usize; 16]> {
+    let mut out = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    let cut = Cut::new();
+    let mk = |at: usize| -> (u64, u64, u64) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+        if vector {
+            return unsafe { masks(d.as_ptr().add(at), &cut) };
+        }
+        let _ = vector;
+        masks_sw(&d[at..])
+    };
+    // the first window of a long row only says whether it holds a newline
+    let mk0 = |at: usize| -> (u64, u64, u64) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+        if vector {
+            return unsafe { masks_any(d.as_ptr().add(at), &cut) };
+        }
+        let m = masks_sw(&d[at..]);
+        (m.0, m.1, if m.2 != 0 { !0 } else { 0 })
+    };
+    for w in cuts.windows(2) {
+        let mut p = crate::first_line_start(d, w[0]);
+        while p < w[1] {
+            let mut r = [0usize; 16];
+            let mut next = 0;
+            if p + REACH <= d.len() {
+                if N == 7 {
+                    if let Some((mut a, mut b, at, nl)) = row7(mk0(p), |o| mk(p + o)) {
+                        for k in 0..7 {
+                            let (base, (s, e)) = if k < 3 { (p, a.next()) } else { (p + at, b.next()) };
+                            r[2 * k] = base + s;
+                            r[2 * k + 1] = base + e;
+                        }
+                        next = p + at + nl + 1;
+                    }
+                } else if N == 4 {
+                    let m = mk(p);
+                    if let Some((mut a, nl)) = tail::<3>(m.0, m.1, m.2) {
+                        for k in 0..4 {
+                            let (s, e) = a.next();
+                            r[2 * k] = p + s;
+                            r[2 * k + 1] = p + e;
+                        }
+                        next = p + nl + 1;
+                    }
+                }
+            }
+            if next != 0 {
+                out.push(r);
+                p = next;
+                continue;
+            }
+            p = line::<N, _>(d, p, true, &mut |lp, s, e| {
+                let mut r = [0usize; 16];
+                for k in 0..N {
+                    r[2 * k] = lp + s[k] as usize;
+                    r[2 * k + 1] = lp + e[k] as usize;
+                }
+                out.push(r);
+            });
+        }
+    }
+    out
+}
+
 fn collect<const N: usize>(d: &[u8], cuts: &[usize], simd: bool) -> Vec<[usize; 16]> {
     let mut out = Vec::new();
     let mut ix = Index::new();
@@ -433,6 +678,72 @@ pub fn agrees() -> bool {
         && collect::<4>(&d, &cuts, true) == collect::<4>(&d, &cuts, false)
         && collect::<2>(&d, &cuts, true) == collect::<2>(&d, &cuts, false)
         && collect::<4>(&e, &[0, e.len()], true) == collect::<4>(&e, &[0, e.len()], false)
+        && wins_agree()
+}
+
+/// the vector windows against the reference splitter, at startup
+fn wins_agree() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+    {
+        let d = sample_rows(0x1319_8a2e_0370_7344, 800);
+        let cuts = [0, d.len() / 3, d.len()];
+        if collect_win::<7>(&d, &cuts, true) != collect::<7>(&d, &cuts, false) || collect_win::<4>(&d, &cuts, true) != collect::<4>(&d, &cuts, false) {
+            return false;
+        }
+    }
+    true
+}
+
+/// rows of four and seven fields sized to straddle the 64-byte windows
+#[allow(dead_code)]
+fn sample_rows(seed: u64, lines: usize) -> Vec<u8> {
+    const PLAIN: &[u8] = b"ab01 -_:.\r\xffZ";
+    let mut x = seed | 1;
+    let mut r = move |n: usize| -> usize {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ((x >> 11) % n as u64) as usize
+    };
+    let mut b: Vec<u8> = b"header\n".to_vec();
+    for _ in 0..lines {
+        let nf = match r(12) {
+            0 => 1 + r(9),
+            1 | 2 | 3 | 4 => 4,
+            _ => 7,
+        };
+        let width = [6, 14, 24, 34][r(4)];
+        for k in 0..nf {
+            if k > 0 {
+                b.push(b',');
+            }
+            let len = match r(16) {
+                0 => 0,
+                1 => 20 + r(50),
+                _ => r(width),
+            };
+            let kind = r(160);
+            if kind <= 40 {
+                b.push(b'"');
+            }
+            for j in 0..len {
+                b.push(PLAIN[r(PLAIN.len())]);
+                if kind == 43 && j == len / 2 {
+                    b.push(b'"');
+                }
+            }
+            if kind <= 39 || kind == 41 {
+                b.push(b'"');
+            }
+            if kind == 42 {
+                b.extend_from_slice(b"\"\"");
+            }
+        }
+        if r(80) != 0 {
+            b.push(b'\n');
+        }
+    }
+    b
 }
 
 #[cfg(test)]
@@ -488,6 +799,11 @@ mod tests {
                     4 => (collect::<4>(&d, &cuts, true), collect::<4>(&d, &cuts, false)),
                     _ => (collect::<2>(&d, &cuts, true), collect::<2>(&d, &cuts, false)),
                 };
+                match n {
+                    7 => assert!(collect_win::<7>(&d, &cuts, true) == b, "{:?}: windows", path),
+                    4 => assert!(collect_win::<4>(&d, &cuts, true) == b, "{:?}: windows", path),
+                    _ => {}
+                }
                 if a != b {
                     let k = (0..a.len().min(b.len())).find(|&k| a[k] != b[k]).unwrap_or(a.len().min(b.len()));
                     let show = |r: Option<&[usize; 16]>| match r {
@@ -543,6 +859,187 @@ mod tests {
     }
 
     #[test]
+    fn windows_match_the_reference_splitter() {
+        let mut total = 0usize;
+        let mut check = |d: &[u8], cuts: &[usize]| {
+            let want7 = collect::<7>(d, &[0, d.len()], false);
+            let want4 = collect::<4>(d, &[0, d.len()], false);
+            for vector in [false, true] {
+                assert!(collect_win::<7>(d, cuts, vector) == want7);
+                assert!(collect_win::<4>(d, cuts, vector) == want4);
+            }
+            total += want7.len() + want4.len();
+        };
+        for seed in 1..=600u64 {
+            let d = sample_rows(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 1500);
+            let mut cuts = vec![0usize];
+            let mut x = seed;
+            while *cuts.last().unwrap() < d.len() {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let step = 1 + ((x >> 33) as usize % if seed % 3 == 0 { 300 } else { 40_000 });
+                cuts.push((cuts.last().unwrap() + step).min(d.len()));
+            }
+            check(&d, &cuts);
+        }
+        for seed in 1..=100u64 {
+            let d = sample(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 600, if seed % 8 == 0 { 30 } else { 0 });
+            check(&d, &[0, d.len() / 2, d.len()]);
+        }
+        let e = edges();
+        check(&e, &[0, e.len()]);
+        assert!(total > 400_000, "the sample has too few good rows: {}", total);
+    }
+
+    #[test]
+    fn windows_match_on_dense_input() {
+        // mostly delimiters and quotes, so every mask pattern turns up
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut good = 0usize;
+        for round in 0..400 {
+            let pool: &[u8] = if round % 2 == 0 { b"aa,,\"\n" } else { b"aaaaaaaaaa,,,,\"\"\n" };
+            let mut d = b"h\n".to_vec();
+            for _ in 0..20_000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                d.push(pool[((x >> 11) % pool.len() as u64) as usize]);
+            }
+            let cuts = [0, d.len() / 2, d.len()];
+            let want7 = collect::<7>(&d, &[0, d.len()], false);
+            let want4 = collect::<4>(&d, &[0, d.len()], false);
+            for vector in [false, true] {
+                assert!(collect_win::<7>(&d, &cuts, vector) == want7);
+                assert!(collect_win::<4>(&d, &cuts, vector) == want4);
+            }
+            good += want7.len() + want4.len();
+        }
+        assert!(good > 20_000, "too few good rows: {}", good);
+    }
+
+    /// what `wrap` decides, by the reference rule for one field
+    fn wrap_ref(d: u64, q: u64) -> Option<(Vec<usize>, Vec<usize>)> {
+        let (mut ss, mut es) = (Vec::new(), Vec::new());
+        let mut s = 0usize;
+        for e in 0..64 {
+            if d >> e & 1 == 0 {
+                continue;
+            }
+            let (a, b) = crate::unq(s, e, q as u128)?;
+            ss.push(a as usize);
+            es.push(b as usize);
+            s = e + 1;
+        }
+        Some((ss, es))
+    }
+
+    #[test]
+    fn wrap_matches_the_field_rule() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut some, mut none) = (0usize, 0usize);
+        for i in 0..3_000_000u64 {
+            // sparse delimiters, and quotes mostly where they are legal
+            let mut d = next() & next() & next();
+            if i % 3 == 0 {
+                d &= next();
+            }
+            if d == 0 {
+                continue;
+            }
+            let top = 63 - d.leading_zeros();
+            let upto = if top == 63 { !0u64 } else { (1u64 << (top + 1)) - 1 };
+            let after = (d << 1) | 1;
+            let mut q = match i % 4 {
+                0 => 0,
+                1 => next() & next() & next() & next(),
+                _ => (after & next()) | ((d >> 1) & next()),
+            };
+            if i % 16 == 5 {
+                q |= 1 << (next() % 64);
+            }
+            q &= upto & !d;
+            let got = wrap(d, q).map(|mut w| {
+                let (mut ss, mut es) = (Vec::new(), Vec::new());
+                for _ in 0..d.count_ones() {
+                    let (s, e) = w.next();
+                    ss.push(s);
+                    es.push(e);
+                }
+                (ss, es)
+            });
+            let want = wrap_ref(d, q);
+            assert_eq!(got, want, "d {:#x} q {:#x}", d, q);
+            if want.is_some() {
+                some += 1;
+            } else {
+                none += 1;
+            }
+        }
+        assert!(some > 300_000 && none > 300_000, "{} {}", some, none);
+    }
+
+    /// Not a test: as `bench_split`, for the window splitter.
+    #[test]
+    #[ignore]
+    fn bench_win() {
+        let dir = std::env::var("SS_SPLIT_DIR").unwrap();
+        let kind = std::env::var("SS_KIND").unwrap_or("events".to_string());
+        let n: usize = std::env::var("SS_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let mut names: Vec<_> = std::fs::read_dir(format!("{}/{}", dir, kind)).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        let files: Vec<Vec<u8>> = names.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let (mut rows, mut acc, mut slow) = (0usize, 0usize, 0usize);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi1", target_feature = "bmi2"))]
+        for _ in 0..n {
+            let cut = Cut::new();
+            for d in &files {
+                let mut p = crate::first_line_start(d, 0);
+                while p + REACH <= d.len() {
+                    let at = unsafe { d.as_ptr().add(p) };
+                    if kind == "events" {
+                        if let Some((mut a, mut b, o, nl)) = row7(unsafe { masks_any(at, &cut) }, |o| unsafe { masks(at.add(o), &cut) }) {
+                            for _ in 0..3 {
+                                let (s, e) = a.next();
+                                acc += s ^ e;
+                            }
+                            for _ in 0..4 {
+                                let (s, e) = b.next();
+                                acc += s ^ e;
+                            }
+                            rows += 1;
+                            p += o + nl + 1;
+                            continue;
+                        }
+                    } else {
+                        let m = unsafe { masks(at, &cut) };
+                        if let Some((mut a, nl)) = tail::<3>(m.0, m.1, m.2) {
+                            for _ in 0..4 {
+                                let (s, e) = a.next();
+                                acc += s ^ e;
+                            }
+                            rows += 1;
+                            p += nl + 1;
+                            continue;
+                        }
+                    }
+                    slow += 1;
+                    while d[p] != b'\n' {
+                        p += 1;
+                    }
+                    p += 1;
+                }
+            }
+        }
+        let _ = (n, &files);
+        println!("rows {} slow {} acc {}", rows, slow, std::hint::black_box(acc));
+    }
+
+    #[test]
     fn rows_match_at_block_edges() {
         let e = edges();
         let a = collect::<4>(&e, &[0, e.len()], true);
@@ -576,6 +1073,10 @@ mod tests {
             assert!(collect::<4>(d, &cuts, true) == collect::<4>(d, &[0, d.len()], false));
             assert!(collect::<7>(d, &cuts, true) == collect::<7>(d, &[0, d.len()], false));
             assert!(collect::<2>(d, &cuts, true) == collect::<2>(d, &[0, d.len()], false));
+            for vector in [false, true] {
+                assert!(collect_win::<4>(d, &cuts, vector) == collect::<4>(d, &[0, d.len()], false));
+                assert!(collect_win::<7>(d, &cuts, vector) == collect::<7>(d, &[0, d.len()], false));
+            }
         }
     }
 }

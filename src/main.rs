@@ -2021,7 +2021,7 @@ fn check_simd() -> bool {
         }
         p = a.nl + 1;
     }
-    split::agrees()
+    split::agrees() && fast::wide_ok()
 }
 
 fn main() {
@@ -2671,6 +2671,9 @@ fn main() {
                 HUGE_BYTES.load(Ordering::Relaxed) >> 20
             );
         }
+    }
+    if std::env::var_os("SS_KEEPMAPS").is_none() {
+        sys::drop_pages(&ctx.maps, nt);
     }
     // both tables are closed: let the kernel free everything at once
     std::process::exit(0);
