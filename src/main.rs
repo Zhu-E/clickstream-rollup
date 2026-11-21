@@ -2180,5 +2180,23 @@ fn main() {
             nrows_tot,
             n
         );
+        if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            let kb = |k: &str| -> u64 {
+                s.lines()
+                    .find(|l| l.starts_with(k))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            let (anon, huge) = (kb("Anonymous:"), kb("AnonHugePages:"));
+            eprintln!(
+                "  at exit: rss {} MB, anonymous {} MB of which 4K pages {} MB",
+                kb("Rss:") >> 10,
+                anon >> 10,
+                (anon - huge.min(anon)) >> 10
+            );
+        }
     }
+    // both tables are closed: let the kernel free everything at once
+    std::process::exit(0);
 }
