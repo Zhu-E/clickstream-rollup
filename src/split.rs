@@ -391,6 +391,42 @@ mod tests {
         assert!(total > 100_000, "the sample has too few good rows: {}", total);
     }
 
+    /// `SS_SPLIT_DIR=<dataset> cargo test --release rows_match_on_files`
+    /// runs the comparison over real files, cut where the pipeline cuts.
+    #[test]
+    fn rows_match_on_files() {
+        let dir = match std::env::var("SS_SPLIT_DIR") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for (sub, n) in [("events", 7usize), ("clicks", 4), ("links", 2)] {
+            let mut names: Vec<_> = std::fs::read_dir(format!("{}/{}", dir, sub)).unwrap().map(|e| e.unwrap().path()).collect();
+            names.sort();
+            for path in names {
+                let d = std::fs::read(&path).unwrap();
+                let mut cuts: Vec<usize> = (0..d.len()).step_by(1 << 20).collect();
+                cuts.push(d.len());
+                let (a, b) = match n {
+                    7 => (collect::<7>(&d, &cuts, true), collect::<7>(&d, &cuts, false)),
+                    4 => (collect::<4>(&d, &cuts, true), collect::<4>(&d, &cuts, false)),
+                    _ => (collect::<2>(&d, &cuts, true), collect::<2>(&d, &cuts, false)),
+                };
+                if a != b {
+                    let k = (0..a.len().min(b.len())).find(|&k| a[k] != b[k]).unwrap_or(a.len().min(b.len()));
+                    let show = |r: Option<&[usize; 16]>| match r {
+                        Some(r) => {
+                            let s = d[..r[0]].iter().rposition(|&c| c == b'\n').map_or(0, |x| x + 1);
+                            let e = d[s..].iter().position(|&c| c == b'\n').map_or(d.len(), |x| s + x);
+                            format!("@{} {:?} {:?}", s, &r[..2 * n], String::from_utf8_lossy(&d[s.saturating_sub(120)..(e + 120).min(d.len())]))
+                        }
+                        None => "none".to_string(),
+                    };
+                    panic!("{:?}: rows {} vs {}, first difference at {}\n fast {}\n slow {}", path, a.len(), b.len(), k, show(a.get(k)), show(b.get(k)));
+                }
+            }
+        }
+    }
+
     #[test]
     fn rows_match_on_dense_and_degenerate_input() {
         let mut cases: Vec<Vec<u8>> = vec![
