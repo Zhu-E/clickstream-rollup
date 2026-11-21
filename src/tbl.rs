@@ -680,6 +680,54 @@ pub fn ingest(b: &[u8], dc: &mut DateCache) -> Ingest {
     ingest_slow(b)
 }
 
+/// seconds into the day of the `HH:MM:SS` at `a[11..]` and at `b[11..]`, or none if either is not one
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn tod2(a: &[u8], b: &[u8]) -> Option<(u32, u32)> {
+    use core::arch::x86_64::*;
+    unsafe {
+        let x = _mm_set_epi64x(rd8(b, 11) as i64, rd8(a, 11) as i64);
+        let t = _mm_sub_epi8(x, _mm_set1_epi64x(i64::from_le_bytes(*b"00:00:00")));
+        // each digit under its limit and nothing where a colon goes
+        let over = _mm_subs_epu8(t, _mm_set1_epi64x(i64::from_le_bytes([2, 9, 0, 5, 9, 0, 5, 9])));
+        // hours, ten-minutes times ten, minutes, seconds
+        let w = _mm_maddubs_epi16(t, _mm_set1_epi64x(i64::from_le_bytes([10, 1, 0, 10, 1, 0, 10, 1])));
+        let late = _mm_subs_epu16(w, _mm_set1_epi64x(23 | (50 << 16) | (9 << 32) | (59 << 48)));
+        let bad = _mm_or_si128(over, late);
+        if _mm_testz_si128(bad, bad) == 0 {
+            return None;
+        }
+        let d = _mm_madd_epi16(w, _mm_set1_epi64x(3600 | (60 << 16) | (60 << 32) | (1 << 48)));
+        let d = _mm_add_epi32(d, _mm_srli_epi64(d, 32));
+        Some((_mm_cvtsi128_si32(d) as u32, _mm_extract_epi32(d, 2) as u32))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+fn tod2(a: &[u8], b: &[u8]) -> Option<(u32, u32)> {
+    let (x, y) = (tod(a, 11), tod(b, 11));
+    if (x | y) < TBAD {
+        Some((x, y))
+    } else {
+        None
+    }
+}
+
+/// `parse_ts_c(ts)` and `ingest(ing)` at once when both are `...Z` on one cached date; none says nothing
+#[inline(always)]
+pub fn same_day(ts: &[u8], ing: &[u8], dc: &mut DateCache) -> Option<(i64, Ingest)> {
+    if ts.len() != 20 || ing.len() != 20 {
+        return None;
+    }
+    if ((rd8(ts, 0) ^ rd8(ing, 0)) | (rd8(ts, 3) ^ rd8(ing, 3))) != 0 || ts[19] != b'Z' || ing[19] != b'Z' {
+        return None;
+    }
+    let e = *dc.day(ing)?;
+    let (t, i) = tod2(ts, ing)?;
+    Some((e.ms + t as i64 * 1000, Ingest { ms: e.ms + i as i64 * 1000, sec: (e.sec + i as i64) as u32 }))
+}
+
 /// The number in `c_` plus two to four digits with no leading zero, which
 /// is all but nine of the campaign ids the generator writes. None says only
 /// that the id is not of that shape.
@@ -1082,6 +1130,82 @@ mod tests {
                 v[i] = keep;
             }
         }
+    }
+
+    #[test]
+    fn two_times_of_day_agree_with_the_tables() {
+        let chk = |a: &[u8; 20], b: &[u8; 20]| {
+            let (x, y) = (tod(a, 11), tod(b, 11));
+            let want = if (x | y) < TBAD { Some((x, y)) } else { None };
+            assert_eq!(tod2(a, b), want, "{:?} {:?}", std::str::from_utf8(a), std::str::from_utf8(b));
+        };
+        let base = *b"2027-12-16T15:30:03Z";
+        // every byte value at every position of either time
+        for pos in 11..19 {
+            for c in 0..=255u8 {
+                let mut v = base;
+                v[pos] = c;
+                chk(&v, &base);
+                chk(&base, &v);
+            }
+        }
+        // every pair of bytes at every pair of neighbours, over the characters that matter
+        let pool = b"0123456789:/;-. 5";
+        for pos in 11..18 {
+            for &c0 in pool.iter() {
+                for &c1 in pool.iter() {
+                    let mut v = base;
+                    v[pos] = c0;
+                    v[pos + 1] = c1;
+                    chk(&v, &base);
+                    chk(&base, &v);
+                }
+            }
+        }
+        // every time of day
+        for sec in 0..86_400u32 {
+            let mut v = base;
+            let t = format!("{:02}:{:02}:{:02}", sec / 3600, sec / 60 % 60, sec % 60);
+            v[11..19].copy_from_slice(t.as_bytes());
+            assert_eq!(tod2(&v, &base), Some((sec, 15 * 3600 + 30 * 60 + 3)));
+            assert_eq!(tod2(&base, &v), Some((15 * 3600 + 30 * 60 + 3, sec)));
+        }
+    }
+
+    #[test]
+    fn same_day_agrees_with_the_two_parsers() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let pool = b"0123456789:TZ-z +.";
+        let mut hits = 0;
+        for i in 0..400_000u64 {
+            let day = 10 + next() % 3;
+            let mut a = format!("2027-12-{:02}T{:02}:{:02}:{:02}Z", day, next() % 25, next() % 61, next() % 61).into_bytes();
+            let day = if i % 5 == 0 { 10 + next() % 3 } else { day };
+            let mut b = format!("2027-12-{:02}T{:02}:{:02}:{:02}Z", day, next() % 25, next() % 61, next() % 61).into_bytes();
+            if i % 3 == 0 {
+                let v = if next() % 2 == 0 { &mut a } else { &mut b };
+                let at = (next() % 20) as usize;
+                v[at] = pool[(next() % pool.len() as u64) as usize];
+            }
+            if i % 97 == 0 {
+                a.push(b'Z');
+            }
+            let mut dc = DateCache::new();
+            let mut dc2 = DateCache::new();
+            if let Some((t, g)) = same_day(&a, &b, &mut dc) {
+                let w = ingest(&b, &mut dc2);
+                assert_eq!((Some(t), g.ms, g.sec), (parse_ts_c(&a, &mut dc2), w.ms, w.sec), "{:?} {:?}", std::str::from_utf8(&a), std::str::from_utf8(&b));
+                assert_eq!(Some(t), parse_ts(&a));
+                hits += 1;
+            }
+        }
+        assert!(hits > 100_000, "{}", hits);
     }
 
     #[test]

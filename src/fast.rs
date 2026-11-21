@@ -281,10 +281,10 @@ unsafe fn unscramble2(val: core::arch::x86_64::__m128i, k0: u64, k1: u64) -> (u6
 }
 
 impl Keys {
-    /// `event_at` for ids with sixteen readable bytes each and under 64 long
+    /// `event_at` for ids with sixteen readable bytes each and under 64 long; none unless both decode
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[inline(always)]
-    unsafe fn ids_wide(&self, pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> (u64, u64) {
+    unsafe fn ids_fast(&self, pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> Option<(u64, u64)> {
         use core::arch::x86_64::*;
         debug_assert!(ne < 64 && nu < 64);
         let ld = |p: *const u8| _mm_loadu_si128(p as *const __m128i);
@@ -305,16 +305,31 @@ impl Keys {
         let val = _mm_add_epi64(_mm_mul_epu32(q, _mm_set1_epi64x(1_679_616)), _mm_srli_epi64(q, 32));
         let over = _mm_movemask_epi8(_mm_cmpgt_epi64(val, _mm_set1_epi64x(M40 as i64)));
         let (c, un) = unscramble2(val, self.ek, self.uk);
-        if digits == !0 && lead & 0x0300_0300 == 0x0100_0100 && over == 0 && c < self.ncap && un < self.ucap << 9 {
-            (c, un)
+        if (digits == !0) & (lead & 0x0300_0300 == 0x0100_0100) & (over == 0) & (c < self.ncap) & (un < self.ucap << 9) {
+            Some((c, un))
         } else {
-            self.ids_slow(pe, ne, pu, nu)
+            None
         }
     }
-    /// `user_at` for an id with sixteen readable bytes and under 64 long
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    /// `ids_fast`, and the byte loop for what it leaves
+    #[inline(always)]
+    unsafe fn ids_wide(&self, pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> (u64, u64) {
+        match self.ids_fast(pe, ne, pu, nu) {
+            Some(r) => r,
+            None => self.ids_slow(pe, ne, pu, nu),
+        }
+    }
     #[inline(always)]
     unsafe fn user_wide(&self, p: *const u8, n: usize) -> u64 {
+        match self.user_fast(p, n) {
+            Some(r) => r,
+            None => self.user_slow(p, n),
+        }
+    }
+    /// `user_at` for an id with sixteen readable bytes and under 64 long; none unless it decodes
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    unsafe fn user_fast(&self, p: *const u8, n: usize) -> Option<u64> {
         use core::arch::x86_64::*;
         debug_assert!(n < 64);
         let x = _mm_loadu_si128(p as *const __m128i);
@@ -330,21 +345,21 @@ impl Keys {
         let z = _mm_cvtsi128_si64(q) as u64;
         let val = (z & 0xffff_ffff) * 1_679_616 + (z >> 32);
         let un = unscramble(val & M40, self.uk);
-        if digits == 0xffff && lead & 0x0300 == 0x0100 && val <= M40 && un < self.ucap << 9 {
-            un
+        if (digits == 0xffff) & (lead & 0x0300 == 0x0100) & (val <= M40) & (un < self.ucap << 9) {
+            Some(un)
         } else {
-            self.user_slow(p, n)
+            None
         }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     #[inline(always)]
-    unsafe fn ids_wide(&self, pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> (u64, u64) {
-        self.ids_slow(pe, ne, pu, nu)
+    unsafe fn ids_fast(&self, _pe: *const u8, _ne: usize, _pu: *const u8, _nu: usize) -> Option<(u64, u64)> {
+        None
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     #[inline(always)]
-    unsafe fn user_wide(&self, p: *const u8, n: usize) -> u64 {
-        self.user_slow(p, n)
+    unsafe fn user_fast(&self, _p: *const u8, _n: usize) -> Option<u64> {
+        None
     }
     /// both ids by the byte loop
     #[cold]
@@ -784,7 +799,8 @@ unsafe fn ev_esc(d: *const u8, fi: usize, p0: *const u8, s1: usize, e1: usize, c
     es.put(tab, b, r);
 }
 
-/// an event row by the rules of `parse_events`: `h` spans from `p0`, `tail` yields the rest from `p1`
+/// an event row by the rules of `parse_events`: `h` spans from `p0`, `tail` yields the rest from `p1`;
+/// false, with nothing written, for a wide row whose ids the vector decoder leaves
 #[inline(always)]
 unsafe fn ev_row<const WIDE: bool>(
     x: Env,
@@ -797,36 +813,38 @@ unsafe fn ev_row<const WIDE: bool>(
     odd: &mut Vec<OddEv>,
     esc: &mut Vec<(u64, Esc)>,
     dc: &mut DateCache,
-) {
+) -> bool {
     let ((s0, e0), (s1, e1), (s2, e2)) = (h[0], h[1], h[2]);
     let (ne, nu) = (e0 - s0, e1 - s1);
     if ne == 0 {
-        return;
+        return true;
     }
     let (ctx, k) = (x.ctx, x.k);
     let (c, un) = if WIDE {
-        k.ids_wide(p0.add(s0), ne, p0.add(s1), nu)
+        match k.ids_fast(p0.add(s0), ne, p0.add(s1), nu) {
+            Some(r) => {
+                // both are under their caps, which are far below the marker
+                std::hint::assert_unchecked(r.0 != NONE && r.1 != NONE);
+                r
+            }
+            None => return false,
+        }
     } else {
         let at = p0 as usize - x.d.as_ptr() as usize;
         k.event_at(x.d, at + s0, at + e0, at + s1, at + e1, x.simd)
     };
     let (s3, e3) = tail();
-    let g = ingest(std::slice::from_raw_parts(p1.add(s3), e3 - s3), dc);
+    let (tsb, ingb) = (std::slice::from_raw_parts(p0.add(s2), e2 - s2), std::slice::from_raw_parts(p1.add(s3), e3 - s3));
+    // the usual pair shares a date and is read together; anything else each by itself
+    let (both, g) = match same_day(tsb, ingb, dc) {
+        Some((t, g)) => (Some(t), g),
+        None => (None, ingest(ingb, dc)),
+    };
     'dead: {
         if nu == 0 {
             break 'dead;
         }
-        let ts = match parse_ts_c(std::slice::from_raw_parts(p0.add(s2), e2 - s2), dc) {
-            Some(t) => t,
-            None => break 'dead,
-        };
-        if ts.wrapping_sub(x.lo) as u64 >= x.span {
-            break 'dead;
-        }
-        // more than a day late; no ingest time is near enough the ends to wrap
-        if g.ms - LATE_MS > ts {
-            break 'dead;
-        }
+        // the fields off the second window first, so its masks are done with
         let (s4, e4) = tail();
         let tp = p1.add(s4);
         let is_pur = match e4 - s4 {
@@ -858,10 +876,24 @@ unsafe fn ev_row<const WIDE: bool>(
             };
             pc = (ctx.cat_of(std::slice::from_raw_parts(p1.add(s5), e5 - s5)) << 24) | price;
         }
+        let ts = match both {
+            Some(t) => t,
+            None => match parse_ts_c(tsb, dc) {
+                Some(t) => t,
+                None => break 'dead,
+            },
+        };
+        if ts.wrapping_sub(x.lo) as u64 >= x.span {
+            break 'dead;
+        }
+        // more than a day late; no ingest time is near enough the ends to wrap
+        if g.ms - LATE_MS > ts {
+            break 'dead;
+        }
         let tsf = (ts - ctx.base) as u32;
         if c == NONE {
             ev_odd(x.d.as_ptr(), x.fi, p0, s0, e0, s1, e1, g.sec, tsf | 0x8000_0000, pc, odd);
-            return;
+            return true;
         }
         let b = (c >> k.shift) as usize;
         let cl = c & ((1u64 << k.shift) - 1);
@@ -871,13 +903,14 @@ unsafe fn ev_row<const WIDE: bool>(
         } else {
             ev_esc(x.d.as_ptr(), x.fi, p0, s1, e1, c, b, FRec { a: ESC, b: ((g.sec as u64) << 32) | cl }, tsf, pc, tab, es, esc);
         }
-        return;
+        return true;
     }
     if c == NONE {
         ev_odd(x.d.as_ptr(), x.fi, p0, s0, e0, s1, e1, g.sec, 0, 0, odd);
     } else {
         ev_put(tab, es, (c >> k.shift) as usize, FRec { a: DEAD, b: ((g.sec as u64) << 32) | (c & ((1u64 << k.shift) - 1)) });
     }
+    true
 }
 
 /// the line at `p` through the reference splitter; returns where the next starts
@@ -892,7 +925,7 @@ fn ev_line(x: Env, p: usize, es: &mut EvBins, odd: &mut Vec<OddEv>, esc: &mut Ve
             k += 1;
             f(k)
         };
-        unsafe { ev_row::<false>(x, at, &[f(0), f(1), f(2)], at, tail, tab, es, odd, esc, dc) }
+        unsafe { ev_row::<false>(x, at, &[f(0), f(1), f(2)], at, tail, tab, es, odd, esc, dc) };
     })
 }
 
@@ -924,10 +957,11 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
                     let p1 = p0.add(p3 + 1);
                     let w = split::masks(p1, &cut);
                     if let Some((mut b, nl)) = split::tail::<3>(w.0, w.1, w.2) {
-                        p += p3 + nl + 2;
                         let h = [a.next(), a.next(), a.next()];
-                        ev_row::<true>(x, p0, &h, p1, || b.next(), tab, es, odd, esc, dc);
-                        continue;
+                        if ev_row::<true>(x, p0, &h, p1, || b.next(), tab, es, odd, esc, dc) {
+                            p += p3 + nl + 2;
+                            continue;
+                        }
                     }
                 }
             }
@@ -950,27 +984,34 @@ unsafe fn cl_row<const WIDE: bool>(
     cs: &mut ClBins,
     oddc: &mut Vec<OddCl>,
     dc: &mut DateCache,
-) {
+) -> bool {
     let ((s0, e0), (s1, e1)) = (next(), next());
     let (len, nu) = (e0 - s0, e1 - s1);
     if len == 0 || nu == 0 {
-        return;
+        return true;
     }
     let (ctx, k) = (x.ctx, x.k);
     let at = p0 as usize - x.d.as_ptr() as usize;
-    let un = if WIDE { k.user_wide(p0.add(s1), nu) } else { k.user_at(x.d, at + s1, at + e1, x.simd) };
+    let un = if WIDE {
+        match k.user_fast(p0.add(s1), nu) {
+            Some(r) => r,
+            None => return false,
+        }
+    } else {
+        k.user_at(x.d, at + s1, at + e1, x.simd)
+    };
     let (s2, e2) = next();
     let camp = match ctx.camp_of(std::slice::from_raw_parts(p0.add(s2), e2 - s2)) {
         Some(c) => c,
-        None => return,
+        None => return true,
     };
     let (s3, e3) = next();
     let ts = match parse_ts_c(std::slice::from_raw_parts(p0.add(s3), e3 - s3), dc) {
         Some(t) => t,
-        None => return,
+        None => return true,
     };
     if ts.wrapping_sub(x.lo) as u64 >= x.span {
-        return;
+        return true;
     }
     let ts = (ts - ctx.base) as u32;
     let off = (at + s0) as u64;
@@ -984,6 +1025,7 @@ unsafe fn cl_row<const WIDE: bool>(
     } else {
         cl_odd(x.fi, off, len, at + s1, nu, ts, camp, oddc);
     }
+    true
 }
 
 /// a click the buckets cannot hold
@@ -1002,7 +1044,7 @@ fn cl_line(x: Env, fr: u64, p: usize, cs: &mut ClBins, oddc: &mut Vec<OddCl>, dc
             k += 1;
             (s[k - 1] as usize, e[k - 1] as usize)
         };
-        unsafe { cl_row::<false>(x, fr, x.d.as_ptr().add(lp), next, tab, cs, oddc, dc) }
+        unsafe { cl_row::<false>(x, fr, x.d.as_ptr().add(lp), next, tab, cs, oddc, dc) };
     })
 }
 
@@ -1031,9 +1073,10 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
                 let p0 = d.as_ptr().add(p);
                 let m = split::masks(p0, &cut);
                 if let Some((mut a, nl)) = split::tail::<3>(m.0, m.1, m.2) {
-                    p += nl + 1;
-                    cl_row::<true>(x, fr, p0, || a.next(), tab, cs, oddc, dc);
-                    continue;
+                    if cl_row::<true>(x, fr, p0, || a.next(), tab, cs, oddc, dc) {
+                        p += nl + 1;
+                        continue;
+                    }
                 }
             }
             p = cl_rare(x, fr, p, cs, oddc, dc);
