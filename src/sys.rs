@@ -68,7 +68,9 @@ impl<T: Copy> Blob<T> {
             let a = ((base as usize) + HUGE - 1) & !(HUGE - 1);
             #[cfg(target_os = "linux")]
             unsafe {
-                madvise(a as *mut u8, want, MADV_HUGEPAGE);
+                if std::env::var_os("SS_NOHUGE").is_none() {
+                    madvise(a as *mut u8, want, MADV_HUGEPAGE);
+                }
             }
             a as *mut u8
         };
@@ -248,6 +250,25 @@ impl Map {
         if len == 0 {
             return Ok(Map { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
         }
+        // probe A/B: copy the file into anonymous memory instead of mapping it
+        if std::env::var_os("SS_READ").is_some() {
+            use std::os::unix::fs::FileExt;
+            let p = unsafe {
+                mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+            };
+            if p as isize == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let buf = unsafe { std::slice::from_raw_parts_mut(p, len) };
+            let mut got = 0usize;
+            while got < len {
+                match f.read_at(&mut buf[got..], got as u64)? {
+                    0 => break,
+                    k => got += k,
+                }
+            }
+            return Ok(Map { ptr: p, len });
+        }
         let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(std::io::Error::last_os_error());
@@ -293,7 +314,9 @@ impl Arena {
         assert!(p as isize != -1, "arena mmap failed");
         #[cfg(target_os = "linux")]
         unsafe {
-            madvise(p, cap, MADV_HUGEPAGE);
+            if std::env::var_os("SS_NOHUGE").is_none() {
+                madvise(p, cap, MADV_HUGEPAGE);
+            }
         }
         Arena { base: p, cap, next: AtomicUsize::new(0) }
     }

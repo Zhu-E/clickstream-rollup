@@ -6,6 +6,7 @@
 //   fold   -> per person bucket: sort, sessionize, attribute, aggregate
 //   write  -> Parquet
 mod pq;
+mod probe;
 mod split;
 mod sys;
 mod tbl;
@@ -1680,7 +1681,18 @@ fn check_simd() -> bool {
     split::agrees()
 }
 
+static LINK_US: AtomicUsize = AtomicUsize::new(0);
+
 fn main() {
+    // probe build: the container's process is the probe, the pipeline is its child
+    match std::env::var("SS_CHILD").ok().as_deref() {
+        None => {
+            probe::parent();
+            return;
+        }
+        Some("noop") => return,
+        _ => {}
+    }
     let t0 = std::time::Instant::now();
     if std::env::var_os("SS_NOSIMD").is_some() {
         SIMD_OK.store(false, Ordering::Relaxed);
@@ -2045,6 +2057,7 @@ fn main() {
                 "bench lv={} {:?}  {:.2} GB/s  acc {}",
                 lv, el, nb as f64 / el.as_secs_f64() / 1e9, ACC.load(Ordering::Relaxed)
             );
+            eprintln!("BENCH_MS lv={} ms={:.3}", lv, el.as_secs_f64() * 1e3);
         }
         return;
     }
@@ -2088,6 +2101,7 @@ fn main() {
                         std::thread::sleep(std::time::Duration::from_millis(link_delay));
                         let links = build_links(&ctx.maps, i_lk);
                         ctx.set_links(links);
+                        LINK_US.store((t0.elapsed() - t_pre).as_micros() as usize, Ordering::Relaxed);
                         if std::env::var("SS_TIMING").is_ok() {
                             eprintln!("  pre {:?} links {:?} (overlapped)", t_pre, t0.elapsed() - t_pre);
                         }
@@ -2299,6 +2313,18 @@ fn main() {
             total,
             nrows_tot,
             n
+        );
+        let m = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        // links overlap parse here, so parse runs from the end of setup
+        eprintln!(
+            "STAGE_MS pre={:.1} links={:.1} parse={:.1} dedup={:.1} fold={:.1} write={:.1} total={:.1}",
+            m(t_pre),
+            LINK_US.load(Ordering::Relaxed) as f64 / 1e3,
+            m(t_parse - t_pre),
+            m(t_dedup - t_parse),
+            m(t_fold - t_dedup),
+            m(total - t_fold),
+            m(total)
         );
     }
     if std::env::var_os("SS_MEM").is_some() {
