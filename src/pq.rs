@@ -91,6 +91,8 @@ pub enum Kind<'a> {
     Date,
     // string, plain-encoded by push_str
     Utf8,
+    // the same, equal values next to each other: one dictionary entry per run
+    Utf8Runs,
     // nullable string, plain-encoded, only the rows whose def is 1
     Utf8Opt,
     // nullable string from one byte a row: an index into these names or NO_CODE
@@ -114,7 +116,7 @@ fn type_code(k: Kind) -> i32 {
     match k {
         Kind::I64 => 2,                                   // INT64
         Kind::I32 | Kind::I64As32 | Kind::Date => 1,      // INT32
-        Kind::Utf8 | Kind::Utf8Opt | Kind::Dict(_) => 6,  // BYTE_ARRAY
+        Kind::Utf8 | Kind::Utf8Runs | Kind::Utf8Opt | Kind::Dict(_) => 6, // BYTE_ARRAY
     }
 }
 
@@ -314,6 +316,60 @@ impl Sink {
                 self.put(c.vals)?;
                 Ok(None)
             }
+            Kind::Utf8Runs => {
+                let v = c.vals;
+                // (offset of the value with its length, its bytes, rows in the run)
+                let mut runs: Vec<(usize, usize, u32)> = Vec::new();
+                let rd8 = |i: usize| u64::from_le_bytes(v[i..i + 8].try_into().unwrap());
+                let mut p = 0usize;
+                let (mut q, mut ql) = (0usize, usize::MAX);
+                for _ in 0..n {
+                    let len = 4 + u32::from_le_bytes(v[p..p + 4].try_into().unwrap()) as usize;
+                    // same length, then two overlapping words for ids of 8 to 16 bytes
+                    let same = len == ql
+                        && if len >= 12 && len <= 20 {
+                            rd8(p + 4) == rd8(q + 4) && rd8(p + len - 8) == rd8(q + len - 8)
+                        } else {
+                            v[q..q + len] == v[p..p + len]
+                        };
+                    if same {
+                        runs.last_mut().unwrap().2 += 1;
+                    } else {
+                        runs.push((p, len, 1));
+                        (q, ql) = (p, len);
+                    }
+                    p += len;
+                }
+                assert!(p == v.len(), "column length");
+                let width = bits_for(runs.len().saturating_sub(1) as u64);
+                let vb = ((width + 7) / 8) as usize;
+                let dict_bytes: usize = runs.iter().map(|r| r.1).sum();
+                let index_bytes = 1 + runs.iter().map(|r| varint_len((r.2 as u64) << 1) + vb).sum::<usize>();
+                if n == 0 || dict_bytes + index_bytes + 64 >= v.len() {
+                    self.header(DATA_PAGE, v.len(), n, PLAIN)?;
+                    self.put(v)?;
+                    return Ok(None);
+                }
+                self.header(DICTIONARY_PAGE, dict_bytes, runs.len(), PLAIN)?;
+                for r in &runs {
+                    self.small(&v[r.0..r.0 + r.1])?;
+                }
+                let data_at = self.pos;
+                self.header(DATA_PAGE, index_bytes, n, RLE_DICTIONARY)?;
+                self.small(&[width as u8])?;
+                // one rle run per value: its row count, then its index
+                let mut t = Th::new();
+                for (k, r) in runs.iter().enumerate() {
+                    t.uvarint((r.2 as u64) << 1);
+                    t.b.extend_from_slice(&(k as u32).to_le_bytes()[..vb]);
+                    if t.b.len() > BUF / 2 {
+                        self.small(&t.b)?;
+                        t.b.clear();
+                    }
+                }
+                self.small(&t.b)?;
+                Ok(Some(data_at))
+            }
             Kind::Utf8Opt => {
                 self.header(DATA_PAGE, 4 + packed_len(n, 1) + c.vals.len(), n, PLAIN)?;
                 assert!(c.defs.len() == n, "column length");
@@ -393,7 +449,7 @@ pub fn write(path: &std::path::Path, nrows: i64, cols: &[Col]) -> std::io::Resul
                     t.stop();
                     t.stop();
                 }
-                Kind::Utf8 | Kind::Utf8Opt | Kind::Dict(_) => {
+                Kind::Utf8 | Kind::Utf8Runs | Kind::Utf8Opt | Kind::Dict(_) => {
                     t.i32f(&mut l, 6, 0); // UTF8
                     t.fh(&mut l, 10, T_STRUCT);
                     let mut l2 = 0i16;

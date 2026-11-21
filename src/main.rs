@@ -839,7 +839,7 @@ impl Out {
         let int = if narrow { pq::Kind::I64As32 } else { pq::Kind::I64 };
         let col = |name, kind, vals| pq::Col { name, kind, vals, defs: &[], nvals: n };
         let cols = [
-            col("user_id", pq::Kind::Utf8, &self.uid[..]),
+            col("user_id", pq::Kind::Utf8Runs, &self.uid[..]),
             col("day", pq::Kind::Date, pq::as_bytes(&self.day)),
             col("sessions", int, pq::as_bytes(&self.sessions)),
             col("events", int, pq::as_bytes(&self.events)),
