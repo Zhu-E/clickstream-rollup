@@ -132,15 +132,121 @@ fn b36f(b: &[u8]) -> Option<u64> {
     }
 }
 
+const L8: u64 = 0x0101_0101_0101_0101;
+
+/// The eight bytes that end at `e`, with the ones before `s` read as '0'.
+/// None unless the id is 1 to 8 bytes with no leading zero.
+#[inline(always)]
+fn word(d: &[u8], s: usize, e: usize) -> Option<u64> {
+    let n = e.wrapping_sub(s);
+    if n.wrapping_sub(1) > 7 || e < 8 || e > d.len() || (n > 1 && d[s] == b'0') {
+        return None;
+    }
+    let w = u64::from_le_bytes(d[e - 8..e].try_into().unwrap());
+    Some(if n == 8 { w } else { (w & (!0u64 << (64 - 8 * n))) | ((L8 * 0x30) >> (8 * n)) })
+}
+
+/// Eight base-36 digits, first digit in the low byte: digit values, checked
+/// by encoding them back, then folded up in pairs.
+#[inline(always)]
+fn swar36(w: u64) -> Option<u64> {
+    let alpha = (w >> 6) & L8;
+    let v = (w & (L8 * 0x0f)) + alpha * 9 + (alpha & (w >> 4)) * 16;
+    let ten = ((v + L8 * 118) >> 7) & L8;
+    if v + L8 * 0x30 + ten * 0x27 != w || (v + L8 * 92) & (L8 * 0x80) != 0 {
+        return None;
+    }
+    let v = (v & 0x00ff_00ff_00ff_00ff) * 36 + ((v >> 8) & 0x00ff_00ff_00ff_00ff);
+    let v = (v & 0x0000_ffff_0000_ffff) * 1296 + ((v >> 16) & 0x0000_ffff_0000_ffff);
+    let v = (v & 0xffff_ffff) * 1_679_616 + (v >> 32);
+    if v > M40 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// `b36f(&d[s..e])` without the loop
+#[inline(always)]
+fn b36w(d: &[u8], s: usize, e: usize) -> Option<u64> {
+    if e < 8 {
+        return if s <= e && e <= d.len() { b36f(&d[s..e]) } else { None };
+    }
+    let w = word(d, s, e)?;
+    if cfg!(all(target_arch = "x86_64", target_feature = "sse4.1")) {
+        pair36(w, w).0
+    } else {
+        swar36(w)
+    }
+}
+
+/// two words of digits in one vector
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn pair36(w0: u64, w1: u64) -> (Option<u64>, Option<u64>) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let x = _mm_set_epi64x(w1 as i64, w0 as i64);
+        let alpha = _mm_cmpgt_epi8(x, _mm_set1_epi8(0x60));
+        let v = _mm_sub_epi8(x, _mm_add_epi8(_mm_set1_epi8(0x30), _mm_and_si128(alpha, _mm_set1_epi8(0x27))));
+        let lim = _mm_add_epi8(_mm_set1_epi8(9), _mm_and_si128(alpha, _mm_set1_epi8(26)));
+        let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(v, lim), v)) as u32;
+        let p = _mm_maddubs_epi16(v, _mm_set1_epi16(0x0124));
+        let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_0510));
+        let z0 = _mm_cvtsi128_si64(q) as u64;
+        let z1 = _mm_extract_epi64(q, 1) as u64;
+        let v0 = (z0 & 0xffff_ffff) * 1_679_616 + (z0 >> 32);
+        let v1 = (z1 & 0xffff_ffff) * 1_679_616 + (z1 >> 32);
+        (
+            if ok & 0xff == 0xff && v0 <= M40 { Some(v0) } else { None },
+            if ok >> 8 == 0xff && v1 <= M40 { Some(v1) } else { None },
+        )
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+fn pair36(w0: u64, w1: u64) -> (Option<u64>, Option<u64>) {
+    (swar36(w0), swar36(w1))
+}
+
+/// `(b36w(d, s0, e0), b36w(d, s1, e1))`
+#[inline(always)]
+fn b36pair(d: &[u8], s0: usize, e0: usize, s1: usize, e1: usize) -> (Option<u64>, Option<u64>) {
+    if e0 < 8 || e1 < 8 {
+        return (b36w(d, s0, e0), b36w(d, s1, e1));
+    }
+    match (word(d, s0, e0), word(d, s1, e1)) {
+        (Some(a), Some(b)) => pair36(a, b),
+        (a, b) => (a.and_then(swar36), b.and_then(swar36)),
+    }
+}
+
 impl Keys {
+    /// the counter of the non-empty event id at `d[es..ee]` and `user` of
+    /// the id at `d[us..ue]`
     #[inline(always)]
-    fn counter(&self, eid: &[u8]) -> Option<u64> {
-        if eid[0] != b'e' {
+    fn event_at(&self, d: &[u8], es: usize, ee: usize, us: usize, ue: usize) -> (Option<u64>, Option<u64>) {
+        let (xe, xu) = b36pair(d, es + 1, ee, us + 1, ue);
+        let c = match xe {
+            Some(x) if d[es] == b'e' => Some(unscramble(x, self.ek)).filter(|&c| c < self.ncap),
+            _ => None,
+        };
+        let u = match xu {
+            Some(x) if d[us] == b'u' => Some(unscramble(x, self.uk)).filter(|&v| v < self.ucap << 9),
+            _ => None,
+        };
+        (c, u)
+    }
+    /// `user` for the id at `d[s..e]`, which must not be empty
+    #[inline(always)]
+    fn user_at(&self, d: &[u8], s: usize, e: usize) -> Option<u64> {
+        if d[s] != b'u' {
             return None;
         }
-        let c = unscramble(b36f(&eid[1..])?, self.ek);
-        if c < self.ncap {
-            Some(c)
+        let v = unscramble(b36w(d, s + 1, e)?, self.uk);
+        if v < self.ucap << 9 {
+            Some(v)
         } else {
             None
         }
@@ -152,6 +258,43 @@ impl Keys {
             return None;
         }
         let v = unscramble(b36f(&uid[1..])?, self.uk);
+        if v < self.ucap << 9 {
+            Some(v)
+        } else {
+            None
+        }
+    }
+    /// `user` of the id a person key encodes, without writing the id out:
+    /// the key holds ten 6-bit codes, '0'-'9' as 1-10 and 'a'-'z' as 38-63
+    fn user_of_key(&self, key: u64) -> Option<u64> {
+        if key & PTAG != 0 || key == 0 {
+            return None;
+        }
+        let acc = key - 1;
+        if acc >> 54 != 58 || acc & 63 != 0 {
+            return None;
+        }
+        let mut v = 0u64;
+        let mut n = 0;
+        while n < 8 {
+            let c = (acc >> (48 - 6 * n)) & 63;
+            let d = match c {
+                0 => break,
+                1..=10 => c - 1,
+                38..=63 => c - 28,
+                _ => return None,
+            };
+            if n == 1 && v == 0 {
+                return None;
+            }
+            v = v * 36 + d;
+            n += 1;
+        }
+        // nothing but padding may follow the digits
+        if n == 0 || acc & ((1u64 << (54 - 6 * n)) - 1) != 0 || v > M40 {
+            return None;
+        }
+        let v = unscramble(v, self.uk);
         if v < self.ucap << 9 {
             Some(v)
         } else {
@@ -412,7 +555,8 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
         }
         let tsf = if valid { (ts - ctx.base) as u32 } else { 0 };
         let uspan = Span { fi: fi as u32, len: user.len() as u32, off: (lp + f[1].0 as usize) as u64 };
-        let c = match k.counter(eid) {
+        let (c, un) = k.event_at(d, lp + f[0].0 as usize, lp + f[0].1 as usize, lp + f[1].0 as usize, lp + f[1].1 as usize);
+        let c = match c {
             Some(c) => c,
             None => {
                 let (klo, khi) = key96(eid);
@@ -435,7 +579,7 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
             continue;
         }
         let delta = ing as i64 - ts.div_euclid(1000) + BIAS;
-        match k.user(user) {
+        match un {
             Some(un) if delta >= 0 && delta <= DELTA_MASK as i64 => {
                 st.es.push(
                     b,
@@ -492,7 +636,7 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
         let ts = (ts - ctx.base) as u32;
         let off = (lp + f[0].0 as usize) as u64;
         let len = (f[0].1 - f[0].0) as u64;
-        match k.user(user) {
+        match k.user_at(d, lp + f[1].0 as usize, lp + f[1].1 as usize) {
             Some(un) if len <= 15 && fr < 256 && off < (1 << 36) && camp < (1 << 16) => {
                 let ui = un >> 9;
                 st.cs.push(
@@ -523,14 +667,7 @@ fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, 
 fn build_utab(links: &Links, k: &Keys) -> Blob<u32> {
     const HAS: u32 = 1 << 30;
     let mut u: Blob<u32> = Blob::zeroed(k.ucap as usize);
-    let dec = |key: u64| -> Option<u64> {
-        if key & PTAG != 0 {
-            return None;
-        }
-        let mut buf = [0u8; MAXENC];
-        let n = dec_name(key, &mut buf);
-        k.user(&buf[..n])
-    };
+    let dec = |key: u64| k.user_of_key(key);
     // scratch layout: root alias:9 | members beside the root:10 | max alias:9
     for &(id, root) in links.link.slots.iter() {
         if id == 0 {
@@ -642,8 +779,10 @@ struct Sh<'a> {
     eb: &'a [Vec<Blk<FRec>>],
     cg: &'a [CG],
     esc: &'a HashMap<u64, Esc>,
-    /// users whose own person has rows outside the slots
+    /// users whose own person has clicks only the general fold can read
     forced: &'a [u64],
+    /// users whose own person has events outside the slots
+    defer: &'a [u64],
     /// users folded in place, to catch one showing up twice
     seen: &'a [AtomicU64],
     bad: &'a AtomicBool,
@@ -700,7 +839,8 @@ impl<'a> Sh<'a> {
     }
 }
 
-/// The first or last run of a bucket: it may continue next door.
+/// A piece of one user's events: a run cut by a bucket edge, or events
+/// that came from outside the slots.
 struct Frag {
     ui: u32,
     at: u32,
@@ -863,7 +1003,7 @@ impl<'a> Wk<'a> {
         if self.run.is_empty() {
             return;
         }
-        if edge {
+        if edge || sh.defer[(ui >> 6) as usize] >> (ui & 63) & 1 != 0 {
             self.frags.push(Frag { ui, at, ev: std::mem::take(&mut self.run) });
         } else {
             self.finish(sh, ui, unsorted);
@@ -1056,6 +1196,11 @@ pub(crate) fn run(
     set_links(ctx, links);
     let ctx: &Ctx = ctx;
     let u: &[u32] = &utab;
+    if timing {
+        let ng = u.iter().filter(|&&e| e & GENERAL != 0).count();
+        let first: Vec<String> = u.iter().take(12).map(|e| format!("{:x}", e)).collect();
+        eprintln!("  fast: general users {} of {}; first {:?}", ng, u.len(), first);
+    }
     let t_parse = t0.elapsed();
 
     let mut eparts = Vec::new();
@@ -1159,6 +1304,8 @@ pub(crate) fn run(
 
     let nw = (k.ucap as usize + 63) / 64;
     let mut forced = vec![0u64; nw];
+    let mut defer = vec![0u64; nw];
+    let mut frags: Vec<Frag> = Vec::new();
     let seen: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
     let bad = AtomicBool::new(false);
     let mut xn: Vec<(u64, u64)> = Vec::new();
@@ -1175,12 +1322,23 @@ pub(crate) fn run(
                 *e = i;
             }
         }
-        let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, forced: &[], seen: &seen, bad: &bad, cl0, gbits };
-        // a user whose own person gets such a row is folded generally, whole
-        let mut resolve = |bytes: &[u8], gc: &mut Sink<CRec>| -> u64 {
-            if let Some(un) = k.user(bytes) {
-                let ui = (un >> 9) as u32;
-                if member(u[ui as usize], un & ALIAS) {
+        let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, forced: &[], defer: &[], seen: &seen, bad: &bad, cl0, gbits };
+        // the user whose own person these bytes name, if they name one
+        let own = |bytes: &[u8]| -> Option<u32> {
+            let un = k.user(bytes)?;
+            let ui = (un >> 9) as u32;
+            if member(u[ui as usize], un & ALIAS) {
+                Some(ui)
+            } else {
+                None
+            }
+        };
+        // a click the click groups cannot hold sends its person to the
+        // general fold, whole
+        for r in &oddc {
+            let bytes = r.user.bytes(ctx);
+            let person = match own(bytes) {
+                Some(ui) => {
                     let person = sh.own_key(ui);
                     let w = &mut forced[(ui >> 6) as usize];
                     if *w >> (ui & 63) & 1 == 0 {
@@ -1189,32 +1347,44 @@ pub(crate) fn run(
                             gc.push(gbk(person), sh.crec(f, person));
                         }
                     }
-                    return person;
+                    person
                 }
-            }
-            ctx.person_of(bytes, &mut hits)
-        };
+                None => ctx.person_of(bytes, &mut hits),
+            };
+            gc.push(gbk(person), CRec { person, sref: r.sref, ts: r.ts, camp: r.camp });
+        }
+        // an event joins its user's runs as one more piece
+        let mut extra: HashMap<u32, Vec<PRec>> = HashMap::new();
         for &i in win.values() {
             let r = &odd[i];
             if r.tsf & 0x8000_0000 == 0 {
                 continue;
             }
-            let person = resolve(r.user.bytes(ctx), &mut gc);
+            let bytes = r.user.bytes(ctx);
+            let (ts, pc) = (r.tsf & 0x7fff_ffff, r.pc);
+            let person = match own(bytes) {
+                Some(ui) if forced[(ui >> 6) as usize] >> (ui & 63) & 1 == 0 => {
+                    defer[(ui >> 6) as usize] |= 1 << (ui & 63);
+                    extra.entry(ui).or_default().push(PRec { person: 0, ts, pc });
+                    continue;
+                }
+                Some(ui) => sh.own_key(ui),
+                None => ctx.person_of(bytes, &mut hits),
+            };
             if person & PTAG != 0 && ctx.names.get(person).is_none() {
                 xn.push((person, r.user.sref()));
             }
-            gp.push(gbk(person), PRec { person, ts: r.tsf & 0x7fff_ffff, pc: r.pc });
+            gp.push(gbk(person), PRec { person, ts, pc });
         }
-        for r in &oddc {
-            let person = resolve(r.user.bytes(ctx), &mut gc);
-            gc.push(gbk(person), CRec { person, sref: r.sref, ts: r.ts, camp: r.camp });
+        for (ui, ev) in extra {
+            frags.push(Frag { ui, at: u32::MAX, ev });
         }
         gpp.push(gp.finish());
         gcp.push(gc.finish());
     }
 
     // ---- walk the counters
-    let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, forced: &forced, seen: &seen, bad: &bad, cl0, gbits };
+    let sh = Sh { ctx, k, u, eb: &eb, cg: &cg, esc: &esc, forced: &forced, defer: &defer, seen: &seen, bad: &bad, cl0, gbits };
     let sh = &sh;
     let nbu = ((maxc >> k.shift) + 1) as usize;
     let next = AtomicUsize::new(0);
@@ -1243,7 +1413,6 @@ pub(crate) fn run(
     let t_walk = t0.elapsed();
 
     // ---- runs cut by a bucket edge: put each user's pieces back together
-    let mut frags: Vec<Frag> = Vec::new();
     for w in wks.iter_mut() {
         frags.append(&mut w.0.frags);
     }
@@ -1371,6 +1540,67 @@ mod tests {
     }
 
     #[test]
+    fn b36w_matches_reference() {
+        // every byte value at every position of every length, in a buffer
+        // with other bytes around it
+        let mut buf = vec![b'q'; 40];
+        for n in 0..=10usize {
+            for s in [0usize, 1, 3, 7, 8, 9, 20] {
+                let e = s + n;
+                for pos in s..e.max(s + 1).min(40) {
+                    for c in 0..=255u8 {
+                        for fill in [b'0', b'7', b'a', b'z', b'1'] {
+                            for x in buf.iter_mut() {
+                                *x = b',';
+                            }
+                            for x in buf[s..e].iter_mut() {
+                                *x = fill;
+                            }
+                            if pos < e {
+                                buf[pos] = c;
+                            }
+                            let want = crate::genid::b36(&buf[s..e]);
+                            assert_eq!(b36w(&buf, s, e), want, "{:?}", &buf[s..e]);
+                            if e >= 8 {
+                                assert_eq!(word(&buf, s, e).and_then(swar36), want, "{:?}", &buf[s..e]);
+                            }
+                            assert_eq!(b36pair(&buf, s, e, 28, 33), (want, crate::genid::b36(&buf[28..33])), "{:?}", &buf[s..e]);
+                            assert_eq!(b36pair(&buf, 29, 37, s, e), (crate::genid::b36(&buf[29..37]), want), "{:?}", &buf[s..e]);
+                        }
+                    }
+                }
+            }
+        }
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let dig = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 9) as usize;
+            let mut y = x >> 8;
+            let mut b = b"xxxxxxxxxx,u".to_vec();
+            let s = b.len();
+            for _ in 0..n {
+                b.push(dig[(y % 36) as usize]);
+                y /= 36;
+            }
+            let e = b.len();
+            b.extend_from_slice(b",rest");
+            assert_eq!(b36w(&b, s, e), crate::genid::b36(&b[s..e]), "{:?}", &b[s..e]);
+            let want = crate::genid::b36(&b[s..e]);
+            assert_eq!(b36pair(&b, s, e, 2, 10), (want, None));
+            assert_eq!(b36pair(&b, s, e, s, e), (want, want));
+            let mut two = b[s..e].to_vec();
+            two.extend_from_slice(b"|0az19zz|");
+            two.extend_from_slice(&b[s..e]);
+            let m = two.len();
+            assert_eq!(b36pair(&two, m - n, m, n + 1, n + 8), (want, crate::genid::b36(b"0az19zz")));
+            assert_eq!(b36pair(&two, n + 2, n + 8, m - n, m), (crate::genid::b36(b"az19zz"), want));
+        }
+    }
+
+    #[test]
     fn user_ids_round_trip() {
         let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 20, ucap: 1 << 12, shift: 12 };
         for un in [0u64, 1, 511, 512, 513, (1 << 21) - 1, 4095 << 9 | 400] {
@@ -1380,6 +1610,35 @@ mod tests {
             let mut up = b;
             up[..n].make_ascii_uppercase();
             assert_eq!(k.user(&up[..n]), None);
+        }
+        // the same answers straight from a person key
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let pool = b"0123456789abcdefghijklmnopqrstuvwxyzAZ_";
+        for i in 0..300_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut s = Vec::new();
+            if i % 3 != 0 {
+                s.push(b'u');
+            }
+            let mut y = x;
+            for _ in 0..(x >> 60) % 11 {
+                s.push(pool[(y % if i % 5 == 0 { 39 } else { 36 }) as usize]);
+                y /= 39;
+            }
+            let wide = Keys { ucap: 1 << 22, ..Keys { ek: k.ek, uk: k.uk, ncap: k.ncap, ucap: 0, shift: 12 } };
+            let key = person_key(&s);
+            if key & PTAG == 0 {
+                assert_eq!(wide.user_of_key(key), wide.user(&s), "{:?}", s);
+            } else {
+                assert_eq!(wide.user_of_key(key), None);
+            }
+        }
+        for un in [0u64, 1, 35, 36, 511, 512, 1 << 20, (1 << 21) + 77] {
+            let mut b = [0u8; 9];
+            let n = k.user_str(un, &mut b);
+            assert_eq!(k.user_of_key(person_key(&b[..n])), k.user(&b[..n]));
         }
         let mut b = [0u8; 9];
         let n = k.user_str(1 << 39, &mut b);
