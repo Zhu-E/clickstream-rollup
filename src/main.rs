@@ -106,7 +106,7 @@ impl Ctx {
         let _g = self.links_gate.lock().unwrap();
         self.links_cv.notify_all();
     }
-    /// Blocks until the link thread has published the link map.
+    // blocks until the link map is published
     fn wait_links(&self) {
         if self.links.get().is_some() {
             return;
@@ -583,8 +583,7 @@ fn parse_events<const ABL: u32>(
             // dedup resolves the user to a person once links are built
             ukey = person_key(user);
             if ukey & PTAG != 0 {
-                // An id too long or too odd to encode: keep track of where
-                // its bytes are in case it turns out to name a person.
+                // unencodable id: remember where its bytes are
                 xn.push((ukey, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
             }
             tsf = (ts - ctx.base) as u32 | 0x8000_0000;
@@ -661,8 +660,7 @@ struct DEnt {
     ptr: *const ERec,
 }
 
-/// Keeps one copy per event id, then resolves each valid survivor's user to
-/// its person and scatters it by person. Returns how many were linked.
+// returns how many survivors were linked
 fn dedup_bucket(
     blocks: &[Blk<ERec>],
     tbl: &mut Vec<DEnt>,
@@ -698,8 +696,7 @@ fn dedup_bucket(
             }
         }
     }
-    // Unlinked survivors go straight out. The rest wait in a short ring
-    // while their link-map line is fetched.
+    // linked survivors wait while their link-map line is fetched
     let mut ring = [PRec { person: 0, ts: 0, pc: 0 }; RESOLVE_LAG];
     let mut at = 0usize;
     let mut hits = 0usize;
@@ -727,7 +724,7 @@ fn dedup_bucket(
 
 const RESOLVE_LAG: usize = 8;
 
-/// Pushes one event under its person; a zero key is an empty ring slot.
+// a zero key is an empty ring slot
 #[inline(always)]
 fn emit_linked(lk: &Links, sink: &mut Sink<PRec>, per_bits: u32, mut rec: PRec) -> usize {
     if rec.person == 0 {
@@ -1362,8 +1359,7 @@ struct LinkNode {
     parent: u32,
 }
 
-/// Union-find over the linked ids. The smaller id always becomes the root,
-/// so a component's root is the person's name and no second pass looks for it.
+// union-find where the smaller id is the root, so a root names its person
 struct Joiner<'a> {
     maps: &'a [Map],
     idx: Map64, // id key -> node
@@ -1401,14 +1397,20 @@ impl<'a> Joiner<'a> {
             }
         }
     }
-    fn bytes(&self, node: u32) -> &[u8] {
+    // decoded from the key, or read back from the file
+    fn id_bytes<'b>(&'b self, node: u32, buf: &'b mut [u8; MAXENC]) -> &'b [u8] {
+        let key = self.nodes[node as usize].key;
+        if key & PTAG == 0 {
+            let n = dec_name(key, buf);
+            return &buf[..n];
+        }
         let s = self.srefs[node as usize];
         let len = (s >> 56) as usize;
         let fi = ((s >> 40) & 0xffff) as usize;
         let off = (s & 0xff_ffff_ffff) as usize;
         unsafe { std::slice::from_raw_parts(self.maps[fi].ptr.add(off), len) }
     }
-    /// Byte order of the two ids; encoded keys already sort that way.
+    // encoded keys sort like their bytes
     #[inline(always)]
     fn id_less(&self, a: u32, b: u32) -> bool {
         let (ka, kb) = (self.nodes[a as usize].key, self.nodes[b as usize].key);
@@ -1421,10 +1423,7 @@ impl<'a> Joiner<'a> {
     fn mixed_less(&self, a: u32, b: u32) -> bool {
         let mut ea = [0u8; MAXENC];
         let mut eb = [0u8; MAXENC];
-        let (ka, kb) = (self.nodes[a as usize].key, self.nodes[b as usize].key);
-        let ba = if ka & PTAG == 0 { let n = dec_name(ka, &mut ea); &ea[..n] } else { self.bytes(a) };
-        let bb = if kb & PTAG == 0 { let n = dec_name(kb, &mut eb); &eb[..n] } else { self.bytes(b) };
-        ba < bb
+        self.id_bytes(a, &mut ea) < self.id_bytes(b, &mut eb)
     }
     #[inline(always)]
     fn union(&mut self, a: u32, b: u32) {
@@ -1447,7 +1446,7 @@ impl<'a> Joiner<'a> {
 const JOIN_LAG: usize = 8;
 const NAME_AHEAD: usize = 16;
 
-/// Runs on one thread: the others are parsing events meanwhile.
+// runs on one worker while the others parse events
 fn build_links(maps: &[Map], range: std::ops::Range<usize>) -> Links {
     let t_start = std::time::Instant::now();
     let simd = SIMD_OK.load(Ordering::Relaxed);
@@ -1457,13 +1456,12 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>) -> Links {
     let mut j = Joiner {
         maps,
         idx: Map64::with_capacity(bytes / 12 + 16),
-        nodes: Blob::zeroed(max_nodes),
-        srefs: Blob::zeroed(max_nodes),
+        nodes: Blob::reserved(max_nodes),
+        srefs: Blob::reserved(max_nodes),
         n: 0,
     };
 
-    // Two short rings keep the misses in flight: a row's map slots are
-    // fetched when it is read, its nodes when its ids are interned.
+    // map slots are fetched at read time, nodes at intern time
     let mut read = [(0u64, 0u64, 0u64, 0u64); JOIN_LAG];
     let mut interned = [(0u32, 0u32); JOIN_LAG];
     let mut rows = 0usize;
@@ -1516,8 +1514,7 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>) -> Links {
     }
     let t_join = t_start.elapsed();
 
-    // The intern map becomes the link map in place: each id's node number
-    // is overwritten with its person's key. A root maps to itself.
+    // the intern map becomes the link map; a root maps to itself
     let n = j.n;
     let mut lbloom = Bloom::new(n + 16);
     let mut names = Map64::with_capacity(n / 2 + 16);
@@ -1536,7 +1533,7 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>) -> Links {
         if root != node as u32 {
             lbloom.insert(key);
         } else if key & PTAG != 0 {
-            // Only ids that do not fit the encoding need their bytes kept.
+            // only unencodable names need their bytes kept
             names.insert(key, j.srefs[root as usize]);
         }
     }
@@ -1949,9 +1946,7 @@ fn main() {
         return;
     }
 
-    // ---- links + parse. The first worker joins the links while the others
-    // already parse events, which do not need a person until dedup. Click
-    // chunks come last and wait for the link map.
+    // ---- links + parse: worker 0 joins links while the rest parse events
     const CHUNK: usize = 1 << 20;
     let mut chunks: Vec<(u8, u32, usize, usize)> = Vec::new();
     for fi in i_ev.clone() {
@@ -2006,6 +2001,7 @@ fn main() {
                             parse_events::<0>(ctx, fi as usize, a, b, &mut es, &mut dc, &mut xn);
                             NS_EV.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         } else {
+                            // clicks are scattered by person
                             ctx.wait_links();
                             let tc = std::time::Instant::now();
                             parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc);

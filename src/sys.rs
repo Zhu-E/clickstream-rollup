@@ -40,13 +40,20 @@ const HUGE: usize = 1 << 21;
 
 impl<T: Copy> Blob<T> {
     pub fn zeroed(len: usize) -> Blob<T> {
+        Self::map(len, 0)
+    }
+    // for a generous upper bound: untouched pages are never backed
+    pub fn reserved(len: usize) -> Blob<T> {
+        Self::map(len, MAP_NORESERVE)
+    }
+    fn map(len: usize, flags: i32) -> Blob<T> {
         let want = len * std::mem::size_of::<T>();
         // Over-allocate large tables so the start can be moved to a 2 MB
         // boundary; without that the kernel has nowhere to put a huge page.
         let pad = if want >= HUGE { HUGE } else { 0 };
         let bytes = want + pad;
         let base = unsafe {
-            mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+            mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | flags, -1, 0)
         };
         assert!(base as isize != -1, "blob mmap failed");
         let ptr = if pad == 0 {
