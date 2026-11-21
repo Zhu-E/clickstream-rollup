@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 const ALIAS: u64 = 511;
 const DELTA_BITS: u32 = 17;
 const DELTA_MASK: u64 = (1 << DELTA_BITS) - 1;
-/// ingest second minus event second, shifted so 24 h late still fits
+/// how far before its event an ingest may be and still fit: with 24 h after, 2^17 seconds
 const BIAS: i64 = (1 << DELTA_BITS) - 1 - 86_400;
 const MAX_SHIFT: u32 = 15;
 const CSHIFT: u32 = 10;
@@ -352,6 +352,40 @@ fn find_key(samples: &[u64], ncand: u64, lim: u64, users: bool, nt: usize) -> Op
     None
 }
 
+/// both keys from rows of the busiest users, whose numbers are smallest; none: search
+fn quick_keys(both: &[(u64, u64)], es: &[u64], us: &[u64], ncap: u64, ucap: u64) -> Option<(u64, u64)> {
+    let ulim = ucap << 9;
+    let mut uk: Option<u64> = None;
+    for &(_, hu) in both.iter().take(512) {
+        for v in 0..64u64 {
+            let key = hu ^ ((((v >> 3) << 9) | (v & 7)).wrapping_mul(A) & M40);
+            if us.iter().all(|&h| ((h ^ key).wrapping_mul(AINV) & M40) < ulim) {
+                match uk {
+                    Some(seen) if seen != key => return None,
+                    _ => uk = Some(key),
+                }
+            }
+        }
+    }
+    let uk = uk?;
+    let zero: Vec<u64> = both.iter().filter(|p| ((p.1 ^ uk).wrapping_mul(AINV) & M40) >> 9 == 0).map(|p| p.0).take(8).collect();
+    if zero.len() < 3 {
+        return None;
+    }
+    // no user has more than a fiftieth of the events
+    let lim = ncap / 32 + 4096;
+    let mut found = Vec::new();
+    scan_keys(&zero, 0, lim, lim, false, &mut found);
+    found.retain(|&key| es.iter().all(|&h| ((h ^ key).wrapping_mul(AINV) & M40) < ncap));
+    found.sort_unstable();
+    found.dedup();
+    if found.len() == 1 {
+        Some((found[0], uk))
+    } else {
+        None
+    }
+}
+
 /// both id keys from the first rows; none means the general pipeline
 pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
     if std::env::var_os("SS_NOFAST").is_some() {
@@ -370,6 +404,9 @@ pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
     let mut es: Vec<u64> = Vec::new();
     let mut us: Vec<u64> = Vec::new();
     let mut lines = 0;
+    // rows to look through for the busiest users
+    const ROWS: usize = 2048;
+    let mut both: Vec<(u64, u64)> = Vec::new();
     'files: for m in maps {
         let d = m.as_slice();
         let mut p = first_line_start(d, 0);
@@ -383,17 +420,18 @@ pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
             let Some(f) = fields::<7>(line, &sc) else { continue };
             let e = &line[f[0].0 as usize..f[0].1 as usize];
             let u = &line[f[1].0 as usize..f[1].1 as usize];
-            if es.len() < WANT && e.len() > 1 && e[0] == b'e' {
-                if let Some(x) = b36f(&e[1..]) {
-                    es.push(half(x));
-                }
+            let ex = if e.len() > 1 && e[0] == b'e' { b36f(&e[1..]) } else { None };
+            let ux = if u.len() > 1 && u[0] == b'u' { b36f(&u[1..]) } else { None };
+            if let (Some(x), true) = (ex, es.len() < WANT) {
+                es.push(half(x));
             }
-            if us.len() < WANT && u.len() > 1 && u[0] == b'u' {
-                if let Some(x) = b36f(&u[1..]) {
-                    us.push(half(x));
-                }
+            if let (Some(x), true) = (ux, us.len() < WANT) {
+                us.push(half(x));
             }
-            if es.len() >= WANT && us.len() >= WANT {
+            if let (Some(a), Some(b)) = (ex, ux) {
+                both.push((half(a), half(b)));
+            }
+            if es.len() >= WANT && us.len() >= WANT && both.len() >= ROWS {
                 break 'files;
             }
         }
@@ -404,8 +442,10 @@ pub(crate) fn probe(maps: &[Map], nt: usize) -> Option<Keys> {
     if es.len() < WANT || us.len() < WANT {
         return None;
     }
-    let ek = find_key(&es, ncap, ncap, false, nt)?;
-    let uk = find_key(&us, ucap * 8, ucap << 9, true, nt)?;
+    let (ek, uk) = match quick_keys(&both, &es, &us, ncap, ucap) {
+        Some(found) => found,
+        None => (find_key(&es, ncap, ncap, false, nt)?, find_key(&us, ucap * 8, ucap << 9, true, nt)?),
+    };
     let est = (bytes / 88) as u64;
     let mut shift = 12;
     while shift < MAX_SHIFT && (est >> shift) > 2048 {
@@ -535,14 +575,14 @@ fn parse_ev(ctx: &Ctx, k: &Keys, fi: usize, from: usize, to: usize, st: &mut PSt
             es.push(b, FRec { a: DEAD, b: ((ing as u64) << 32) | cl });
             return;
         }
-        let delta = ing as i64 - ts.div_euclid(1000) + BIAS;
+        // not late, so at most 24 h after the event; this bounds it below
         match un {
-            un if un != NONE && delta >= 0 && delta <= DELTA_MASK as i64 => {
+            un if un != NONE && ing_ms + BIAS * 1000 >= ts => {
                 es.push(
                     b,
                     FRec {
                         a: ((tsf as u64) << 33) | (un << 2) | LIVE,
-                        b: ((pc as u64) << 32) | ((delta as u64) << MAX_SHIFT) | cl,
+                        b: ((pc as u64) << 32) | ((ing as u64 & DELTA_MASK) << MAX_SHIFT) | cl,
                     },
                 );
             }
@@ -651,7 +691,58 @@ fn parse_lk(ctx: &Ctx, k: &Keys, shared: &[AtomicU64], fi: usize, from: usize, t
 
 /// One range of users from their local links: a table entry each, and the
 /// links of users that need the link map after all.
-fn resolve_local(k: &Keys, rows: &mut [LocalLink], shared: &[AtomicU64], u: &[AtomicU32], moved: &mut Vec<GlobalLink>) {
+const P36: [u64; 9] = [1, 36, 1_296, 46_656, 1_679_616, 60_466_176, 2_176_782_336, 78_364_164_096, 2_821_109_907_456];
+
+/// orders like the bytes of `u` + base 36 of x
+#[inline(always)]
+fn id_order(x: u64) -> u64 {
+    let mut nd = 1;
+    while nd < 8 && x >= P36[nd] {
+        nd += 1;
+    }
+    ((x * P36[8 - nd]) << 4) | nd as u64
+}
+
+/// One range of users from their local links; `mask` is a zeroed word per user of the range.
+fn resolve_local(k: &Keys, rows: &mut [LocalLink], shared: &[AtomicU64], u: &[AtomicU32], moved: &mut Vec<GlobalLink>, mask: &mut [u64]) {
+    if rows.is_empty() {
+        return;
+    }
+    let n = mask.len();
+    for &row in rows.iter() {
+        let hi = ((row >> 9) & ALIAS).max(row & ALIAS);
+        // bit 0: an alias too large for the word
+        mask[((row >> 18) as usize) & (n - 1)] |= if hi < 64 { 1u64 << hi } else { 1 };
+    }
+    let base = (rows[0] >> 18) & !(n as u64 - 1);
+    let mut left = false;
+    for l in 0..n {
+        let m = mask[l];
+        if m == 0 {
+            continue;
+        }
+        let ui = base | l as u64;
+        let top = 63 - m.leading_zeros() as u64;
+        // every alias from 1 to top is linked to a smaller one: one person, aliases 0..=top
+        if m == (!0u64 >> (63 - top)) & !1 && shared[(ui >> 6) as usize].load(Ordering::Relaxed) >> (ui & 63) & 1 == 0 {
+            let name = (0..=top).min_by_key(|&a| id_order(scramble((ui << 9) | a, k.uk))).unwrap();
+            u[ui as usize].store(top as u32 | ((name as u32) << 9), Ordering::Relaxed);
+            mask[l] = 0;
+        } else {
+            left = true;
+        }
+    }
+    if left {
+        let mut rest: Vec<LocalLink> = rows.iter().copied().filter(|&row| mask[((row >> 18) as usize) & (n - 1)] != 0).collect();
+        resolve_local_any(k, &mut rest, shared, u, moved);
+        for &row in rows.iter() {
+            mask[((row >> 18) as usize) & (n - 1)] = 0;
+        }
+    }
+}
+
+/// the same for any shape of links, by union-find
+fn resolve_local_any(k: &Keys, rows: &mut [LocalLink], shared: &[AtomicU64], u: &[AtomicU32], moved: &mut Vec<GlobalLink>) {
     fn find(par: &mut [u16; 512], mut x: u16) -> u16 {
         while par[x as usize] != x {
             par[x as usize] = par[par[x as usize] as usize];
@@ -874,7 +965,9 @@ impl<'a> Sh<'a> {
     #[inline(always)]
     fn ing(&self, r: &FRec) -> i64 {
         if r.a & 3 == LIVE {
-            (self.ctx.base + (r.a >> 33) as i64).div_euclid(1000) + ((r.b >> MAX_SHIFT) & DELTA_MASK) as i64 - BIAS
+            // the one second in the event's window with these low bits
+            let lo = (self.ctx.base + (r.a >> 33) as i64).div_euclid(1000) - BIAS;
+            lo + ((((r.b >> MAX_SHIFT) & DELTA_MASK) as i64 - lo) & DELTA_MASK as i64)
         } else {
             (r.b >> 32) as i64
         }
@@ -1170,6 +1263,10 @@ pub(crate) fn run(
     if ctx.cl_hi - ctx.base >= (1 << 31) || ctx.cl_hi < ctx.base || ctx.base < 0 {
         return None;
     }
+    // ingest seconds are kept as a u32
+    if ctx.cl_hi >= (u32::MAX as i64 - 86_400) * 1000 {
+        return None;
+    }
 
     // ---- parse, with the links built alongside
     const CHUNK: usize = 1 << 20;
@@ -1266,6 +1363,7 @@ pub(crate) fn run(
                     s.spawn(move || {
                         let mut moved: Vec<GlobalLink> = Vec::new();
                         let mut rows: Vec<LocalLink> = Vec::new();
+                        let mut mask = vec![0u64; 1 << LSHIFT];
                         loop {
                             let r = lnext.fetch_add(1, Ordering::Relaxed);
                             if r >= local.len() {
@@ -1275,7 +1373,7 @@ pub(crate) fn run(
                             for v in &local[r] {
                                 rows.extend_from_slice(v);
                             }
-                            resolve_local(k, &mut rows, shared, scratch, &mut moved);
+                            resolve_local(k, &mut rows, shared, scratch, &mut moved, &mut mask);
                         }
                         moved
                     })
