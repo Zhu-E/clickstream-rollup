@@ -33,17 +33,15 @@ struct ERec {
     klo: u64,
     khi: u32,
     ing: u32,
-    person: u64,
-    sref: u64,
-    tsf: u32, // ts offset from base, bit 31 = valid
-    pc: u32,  // (cat << 24) | price, 0 when not a purchase
+    person: u64, // the user id itself when it fits in 63 bits, else a hash
+    tsf: u32,    // ts offset from base, bit 31 = valid
+    pc: u32,     // (cat << 24) | price, 0 when not a purchase
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct PRec {
     person: u64,
-    sref: u64,
     ts: u32,
     pc: u32,
 }
@@ -305,10 +303,10 @@ impl Ctx {
     }
     #[inline(always)]
     fn person_of(&self, user: &[u8]) -> u64 {
-        let h = hash(user);
-        match self.link.get(h) {
+        let k = person_key(user);
+        match self.link.get(k) {
             Some(r) => r,
-            None => h,
+            None => k,
         }
     }
 }
@@ -335,12 +333,22 @@ fn first_line_start(d: &[u8], start: usize) -> usize {
     (i + 1).min(d.len())
 }
 
+static NS_EV: AtomicUsize = AtomicUsize::new(0);
+static NS_CL: AtomicUsize = AtomicUsize::new(0);
 static ACC: AtomicUsize = AtomicUsize::new(0);
 
 /// `ABL` is a diagnostic: 0 is the real thing, higher levels stop early so the
 /// cost of each parse step can be measured. It is a const, so only the level-0
 /// code survives in the shipping call.
-fn parse_events<const ABL: u32>(ctx: &Ctx, fi: usize, from: usize, to: usize, sink: &mut Sink<ERec>, dc: &mut DateCache) {
+fn parse_events<const ABL: u32>(
+    ctx: &Ctx,
+    fi: usize,
+    from: usize,
+    to: usize,
+    sink: &mut Sink<ERec>,
+    dc: &mut DateCache,
+    xn: &mut Vec<(u64, u64)>,
+) {
     let d = ctx.maps[fi].as_slice();
     let mut p = first_line_start(d, from);
     let mut acc = 0usize;
@@ -376,7 +384,6 @@ fn parse_events<const ABL: u32>(ctx: &Ctx, fi: usize, from: usize, to: usize, si
         let mut tsf = 0u32;
         let mut pc = 0u32;
         let mut person = 0u64;
-        let mut sref = 0u64;
         loop {
             let user = &line[f[1].0 as usize..f[1].1 as usize];
             if user.is_empty() {
@@ -428,16 +435,20 @@ fn parse_events<const ABL: u32>(ctx: &Ctx, fi: usize, from: usize, to: usize, si
                 break;
             }
             person = ctx.person_of(user);
-            sref = sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize);
+            if person & PTAG != 0 && ctx.names.get(person).is_none() {
+                // An id too long or too odd to encode, and in no link: keep
+                // track of where its bytes are so the name can be written out.
+                xn.push((person, sref_of(fi, lp + f[1].0 as usize, (f[1].1 - f[1].0) as usize)));
+            }
             tsf = (ts - ctx.base) as u32 | 0x8000_0000;
             break;
         }
         let b = (mix(klo ^ (khi as u64), 0x9e37_79b9_7f4a_7c15) >> (64 - ctx.eid_bits)) as usize;
         if ABL == 6 {
-            acc += b ^ tsf as usize ^ pc as usize ^ person as usize ^ sref as usize ^ ing as usize;
+            acc += b ^ tsf as usize ^ pc as usize ^ person as usize ^ ing as usize;
             continue;
         }
-        sink.push(b, ERec { klo, khi, ing, person, sref, tsf, pc });
+        sink.push(b, ERec { klo, khi, ing, person, tsf, pc });
     }
     if ABL != 0 {
         ACC.fetch_add(acc, Ordering::Relaxed);
@@ -532,7 +543,7 @@ fn dedup_bucket(blocks: &[Blk<ERec>], tbl: &mut Vec<DEnt>, sink: &mut Sink<PRec>
             if r.tsf & 0x8000_0000 != 0 {
                 sink.push(
                     person_bucket(r.person, per_bits),
-                    PRec { person: r.person, sref: r.sref, ts: r.tsf & 0x7fff_ffff, pc: r.pc },
+                    PRec { person: r.person, ts: r.tsf & 0x7fff_ffff, pc: r.pc },
                 );
             }
         }
@@ -572,8 +583,8 @@ struct Tmp {
     mark: Vec<u32>,
     tc: Vec<u32>,
     gen: u32,
-    catrev: [u64; 32],
-    touch: [u8; 32],
+    catrev: Vec<u64>,
+    touch: Vec<u32>,
 }
 
 #[inline]
@@ -714,7 +725,7 @@ fn process_person(ctx: &Ctx, ev: &[PRec], cl: &[CRec], t: &mut Tmp, o: &mut Out,
                 let price = (pc & 0x00ff_ffff) as u64;
                 let c = (pc >> 24) as usize;
                 if t.catrev[c] == 0 {
-                    t.touch[ntouch] = c as u8;
+                    t.touch[ntouch] = c as u32;
                     ntouch += 1;
                 }
                 t.catrev[c] += price;
@@ -836,7 +847,7 @@ struct Fold {
     cl: Vec<CRec>,
     dense: Vec<u32>,
     cdense: Vec<u32>,
-    persons: Vec<(u64, u64)>,
+    persons: Vec<u64>,
     pslot: Vec<u32>,
     ecnt: Vec<u32>,
     ccnt: Vec<u32>,
@@ -890,7 +901,7 @@ fn sort_small_c(v: &mut [CRec]) {
 
 /// One person bucket: group by person with a counting sort, order each
 /// person's rows by timestamp, then sessionize and attribute.
-fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
+fn fold_bucket(ctx: &Ctx, xn: &Map64, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
     let n: usize = evb.iter().map(|b| b.len as usize).sum();
     if n == 0 {
         return;
@@ -914,7 +925,7 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
             let d = if unsafe { tbl.get_unchecked(i) }.0 == 0 {
                 let d = persons.len() as u32;
                 tbl[i] = (r.person, d);
-                persons.push((r.person, r.sref));
+                persons.push(r.person);
                 pslot.push(i as u32);
                 ecnt.push(0);
                 // keep the load factor under ~0.6
@@ -929,7 +940,7 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
                     want = nw;
                     mask = nw - 1;
                     pslot.clear();
-                    for (k, &(key, _)) in persons.iter().enumerate() {
+                    for (k, &key) in persons.iter().enumerate() {
                         let j = tprobe(tbl, mask, key);
                         tbl[j] = (key, k as u32);
                         pslot.push(j as u32);
@@ -1051,10 +1062,17 @@ fn fold_bucket(ctx: &Ctx, f: &mut Fold, evb: &[Blk<PRec>], clb: &[Blk<CRec>]) {
                 cls.sort_unstable_by_key(|r| r.ts);
             }
         }
-        let (pkey, psref) = persons[d];
-        let name = match ctx.names.get(pkey) {
-            Some(x) => ctx.bytes(x),
-            None => ctx.bytes(psref),
+        let pkey = persons[d];
+        let mut nbuf = [0u8; MAXENC];
+        let name: &[u8] = if pkey & PTAG == 0 {
+            let n = dec_name(pkey, &mut nbuf);
+            &nbuf[..n]
+        } else {
+            // Hashed key: the bytes are in the link names or the side table.
+            match ctx.names.get(pkey).or_else(|| xn.get(pkey)) {
+                Some(x) => ctx.bytes(x),
+                None => b"",
+            }
         };
         process_person(ctx, &ev[es..ee], &cl[cs..ce], t, o, name);
     }
@@ -1187,9 +1205,9 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
                                 let a1 = &line[f[0].0 as usize..f[0].1 as usize];
                                 let b1 = &line[f[1].0 as usize..f[1].1 as usize];
                                 out.push((
-                                    hash(a1),
+                                    person_key(a1),
                                     sref_of(fi, lp + f[0].0 as usize, a1.len()),
-                                    hash(b1),
+                                    person_key(b1),
                                     sref_of(fi, lp + f[1].0 as usize, b1.len()),
                                 ));
                             }
@@ -1275,7 +1293,8 @@ fn build_links(maps: &[Map], range: std::ops::Range<usize>, nt: usize) -> Links 
         let mn = minnode[r] as usize;
         if mn != i {
             link.insert(keys[i], keys[mn]);
-        } else {
+        } else if keys[mn] & PTAG != 0 {
+            // Only ids that do not fit the encoding need their bytes kept.
             names.insert(keys[mn], srefs[mn]);
         }
     }
@@ -1363,7 +1382,7 @@ fn main() {
     }
     let cats: Vec<Vec<u8>> = order.iter().map(|&o| cat_names[o as usize].clone()).collect();
     let unknown_cat = remap[cat_names.iter().position(|c| c == b"unknown").unwrap()];
-    assert!(cats.len() <= 31, "too many categories");
+    assert!(cats.len() <= 255, "too many categories");
 
     let getb = |s: u64| -> &[u8] {
         let len = (s >> 56) as usize;
@@ -1479,7 +1498,11 @@ fn main() {
     };
 
     // ---- links
+    let t_pre = t0.elapsed();
     let links = build_links(&maps, i_lk.clone(), nt);
+    if std::env::var("SS_TIMING").is_ok() {
+        eprintln!("  pre {:?} links {:?}", t_pre, t0.elapsed() - t_pre);
+    }
 
     let ev_bytes: usize = i_ev.clone().map(|i| maps[i].len).sum();
     let cl_bytes: usize = i_cl.clone().map(|i| maps[i].len).sum();
@@ -1556,6 +1579,7 @@ fn main() {
                     s.spawn(move || {
                         let mut es = Sink::<ERec>::new(ar, nb_eid, BLK_E);
                         let mut dc = DateCache::new();
+                        let mut xn: Vec<(u64, u64)> = Vec::new();
                         loop {
                             let k = next.fetch_add(1, Ordering::Relaxed);
                             if k >= cks.len() {
@@ -1563,13 +1587,13 @@ fn main() {
                             }
                             let (fi, a, b) = cks[k];
                             match lv {
-                                1 => parse_events::<1>(ctx, fi, a, b, &mut es, &mut dc),
-                                2 => parse_events::<2>(ctx, fi, a, b, &mut es, &mut dc),
-                                3 => parse_events::<3>(ctx, fi, a, b, &mut es, &mut dc),
-                                4 => parse_events::<4>(ctx, fi, a, b, &mut es, &mut dc),
-                                5 => parse_events::<5>(ctx, fi, a, b, &mut es, &mut dc),
-                                6 => parse_events::<6>(ctx, fi, a, b, &mut es, &mut dc),
-                                _ => parse_events::<0>(ctx, fi, a, b, &mut es, &mut dc),
+                                1 => parse_events::<1>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                2 => parse_events::<2>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                3 => parse_events::<3>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                4 => parse_events::<4>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                5 => parse_events::<5>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                6 => parse_events::<6>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
+                                _ => parse_events::<0>(ctx, fi, a, b, &mut es, &mut dc, &mut xn),
                             }
                         }
                         std::mem::forget(es);
@@ -1607,6 +1631,7 @@ fn main() {
     let next = AtomicUsize::new(0);
     let mut eparts: Vec<Vec<Vec<Blk<ERec>>>> = Vec::new();
     let mut cparts: Vec<Vec<Vec<Blk<CRec>>>> = Vec::new();
+    let mut xraw: Vec<(u64, u64)> = Vec::new();
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
@@ -1619,31 +1644,53 @@ fn main() {
                     let mut es = Sink::<ERec>::new(arena_e, nb_eid, BLK_E);
                     let mut cs = Sink::<CRec>::new(arena, nb_per, BLK_P);
                     let mut dc = DateCache::new();
+                    let mut xn: Vec<(u64, u64)> = Vec::new();
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         if k >= chunks.len() {
                             break;
                         }
                         let (kind, fi, a, b) = chunks[k];
+                        let tc = std::time::Instant::now();
                         if kind == 0 {
-                            parse_events::<0>(ctx, fi as usize, a, b, &mut es, &mut dc);
+                            parse_events::<0>(ctx, fi as usize, a, b, &mut es, &mut dc, &mut xn);
+                            NS_EV.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         } else {
                             parse_clicks(ctx, fi as usize, a, b, &mut cs, &mut dc);
+                            NS_CL.fetch_add(tc.elapsed().as_nanos() as usize, Ordering::Relaxed);
                         }
                     }
-                    (es.finish(), cs.finish())
+                    (es.finish(), cs.finish(), xn)
                 })
             })
             .collect();
         for h in hs {
-            let (e, c) = h.join().unwrap();
+            let (e, c, x) = h.join().unwrap();
             eparts.push(e);
             cparts.push(c);
+            xraw.extend_from_slice(&x);
         }
     });
+    // Names of ids that could not be encoded: normally none at all.
+    let mut xnames = Map64::with_capacity(xraw.len() + 16);
+    for &(k, v) in xraw.iter() {
+        xnames.insert(k, v);
+    }
+    let xnames = &xnames;
+    let t_pp = t0.elapsed();
     let ebuckets = merge_blocks(eparts, nb_eid);
     let cbuckets = merge_blocks(cparts, nb_per);
     let t_parse = t0.elapsed();
+    if std::env::var("SS_TIMING").is_ok() {
+        eprintln!(
+            "  parse-only {:?} merge {:?} ev-thread-ms {} cl-thread-ms {} xn {}",
+            t_pp,
+            t_parse - t_pp,
+            NS_EV.load(Ordering::Relaxed) / 1_000_000,
+            NS_CL.load(Ordering::Relaxed) / 1_000_000,
+            xraw.len()
+        );
+    }
 
     // ---- dedup. Process the fattest buckets first: one whale bucket at the
     // end of the queue would leave seven threads idle.
@@ -1725,8 +1772,8 @@ fn main() {
                             mark: vec![0; ctx.ncamp + 1],
                             tc: vec![0; ctx.ncamp + 1],
                             gen: 0,
-                            catrev: [0; 32],
-                            touch: [0; 32],
+                            catrev: vec![0; ctx.cats.len() + 1],
+                            touch: vec![0; ctx.cats.len() + 1],
                         },
                         o: Out {
                             cd: vec![CD::default(); (ctx.ncamp + 1) * stride],
@@ -1746,7 +1793,7 @@ fn main() {
                             break;
                         }
                         let k = porder[k];
-                        fold_bucket(ctx, &mut f, &pbuckets[k], &cbuckets[k]);
+                        fold_bucket(ctx, xnames, &mut f, &pbuckets[k], &cbuckets[k]);
                     }
                     let n = f.o.day.len();
                     if n > 0 {

@@ -241,8 +241,13 @@ impl Map64 {
         Map64 { slots: vec![(0u64, 0u64); cap], mask: (cap - 1) as u64 }
     }
     #[inline(always)]
+    fn home(&self, k: u64) -> usize {
+        // Keys may be dense encodings rather than hashes, so mix before masking.
+        (mix(k, 0x9e37_79b9_7f4a_7c15) & self.mask) as usize
+    }
+    #[inline(always)]
     pub fn get(&self, k: u64) -> Option<u64> {
-        let mut i = (k & self.mask) as usize;
+        let mut i = self.home(k);
         loop {
             let s = unsafe { *self.slots.get_unchecked(i) };
             if s.0 == k {
@@ -256,7 +261,7 @@ impl Map64 {
     }
     #[inline]
     pub fn insert(&mut self, k: u64, v: u64) {
-        let mut i = (k & self.mask) as usize;
+        let mut i = self.home(k);
         loop {
             let s = unsafe { *self.slots.get_unchecked(i) };
             if s.0 == k {
@@ -273,7 +278,7 @@ impl Map64 {
     /// Insert only if absent; returns the value now stored.
     #[inline]
     pub fn get_or_insert(&mut self, k: u64, v: u64) -> u64 {
-        let mut i = (k & self.mask) as usize;
+        let mut i = self.home(k);
         loop {
             let s = unsafe { *self.slots.get_unchecked(i) };
             if s.0 == k {
@@ -440,6 +445,112 @@ pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
     }
 }
 
+// --------------------------------------------- invertible short-id encoding
+//
+// Ids in this dataset are short strings over a small alphabet. Encoding one
+// into a u64 means a record can carry the id itself instead of a pointer to
+// where it was read from, which is 8 bytes less to shuffle per event.
+//
+//   key = 1 + S(len) + sum d_i * 64^i,   S(len) = (64^len - 1) / 63
+//
+// The per-length ranges are disjoint, so the map is injective, and `1 +`
+// keeps the key away from 0, which the hash tables use for "empty".
+// Ids that are too long or use other bytes fall back to a hashed key with
+// the top bit set; their names live in a side table.
+
+/// Set on keys that are hashes rather than encodings.
+pub const PTAG: u64 = 1 << 63;
+pub const MAXENC: usize = 10;
+
+const fn enc_tbl() -> [u8; 256] {
+    let mut t = [0xffu8; 256];
+    let mut i = 0u8;
+    while i < 10 {
+        t[(b'0' + i) as usize] = i;
+        i += 1;
+    }
+    let mut i = 0u8;
+    while i < 26 {
+        t[(b'a' + i) as usize] = 10 + i;
+        t[(b'A' + i) as usize] = 36 + i;
+        i += 1;
+    }
+    t[b'_' as usize] = 62;
+    t[b'-' as usize] = 63;
+    t
+}
+
+const fn dec_tbl() -> [u8; 64] {
+    let mut t = [0u8; 64];
+    let e = enc_tbl();
+    let mut c = 0usize;
+    while c < 256 {
+        let d = e[c];
+        if d != 0xff {
+            t[d as usize] = c as u8;
+        }
+        c += 1;
+    }
+    t
+}
+
+const fn sum_tbl() -> [u64; MAXENC + 2] {
+    let mut t = [0u64; MAXENC + 2];
+    let mut i = 1usize;
+    while i < MAXENC + 2 {
+        t[i] = t[i - 1] * 64 + 1;
+        i += 1;
+    }
+    t
+}
+
+static ENC: [u8; 256] = enc_tbl();
+static DEC: [u8; 64] = dec_tbl();
+static SUM: [u64; MAXENC + 2] = sum_tbl();
+
+/// The id itself as a u64, or None if it does not fit the alphabet.
+#[inline(always)]
+pub fn enc_name(b: &[u8]) -> Option<u64> {
+    if b.len() > MAXENC {
+        return None;
+    }
+    let mut acc = 0u64;
+    let mut mul = 1u64;
+    for &c in b {
+        let d = unsafe { *ENC.get_unchecked(c as usize) };
+        if d == 0xff {
+            return None;
+        }
+        acc += (d as u64) * mul;
+        mul <<= 6;
+    }
+    Some(1 + SUM[b.len()] + acc)
+}
+
+/// The person key for a user id: the id itself when it fits, else a hash.
+#[inline(always)]
+pub fn person_key(b: &[u8]) -> u64 {
+    match enc_name(b) {
+        Some(v) => v,
+        None => hash(b) | PTAG,
+    }
+}
+
+/// Writes the id back out; only valid for keys without PTAG.
+pub fn dec_name(k: u64, out: &mut [u8; MAXENC]) -> usize {
+    debug_assert_eq!(k & PTAG, 0);
+    let mut len = 0usize;
+    while len < MAXENC && k >= 1 + SUM[len + 1] {
+        len += 1;
+    }
+    let mut r = k - 1 - SUM[len];
+    for i in 0..len {
+        out[i] = DEC[(r & 63) as usize];
+        r >>= 6;
+    }
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +558,69 @@ mod tests {
     fn both(x: &str) -> (Option<i64>, Option<i64>) {
         let mut dc = DateCache::new();
         (parse_ts(x.as_bytes()), parse_ts_c(x.as_bytes(), &mut dc))
+    }
+
+
+    #[test]
+    fn name_encoding_round_trips() {
+        let mut seen: Vec<u64> = Vec::new();
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        names.push(Vec::new());
+        for n in 1..=12usize {
+            for seed in 0..64u64 {
+                let mut v = Vec::new();
+                let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (n as u64);
+                for _ in 0..n {
+                    v.push(DEC[(x & 63) as usize]);
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+                names.push(v);
+            }
+        }
+        names.push(b"u8w84o3T".to_vec());
+        names.push(b"u8w84o3t".to_vec());
+        names.push(b"-".to_vec());
+        names.push(b"_".to_vec());
+        names.push(b"0".to_vec());
+        names.push(b"00".to_vec());
+        names.push(b"000000000".to_vec());
+        names.push(b"\xffbad".to_vec());
+        names.push(b"has space".to_vec());
+        names.push(b"u.dot".to_vec());
+        names.sort();
+        names.dedup();
+        for v in &names {
+            let k = person_key(v);
+            assert_ne!(k, 0, "{:?}", v);
+            let encodable = v.len() <= MAXENC && v.iter().all(|&c| ENC[c as usize] != 0xff);
+            assert_eq!(k & PTAG == 0, encodable, "{:?}", v);
+            if encodable {
+                let mut out = [0u8; MAXENC];
+                let n = dec_name(k, &mut out);
+                assert_eq!(&out[..n], &v[..], "round trip {:?} -> {:x}", v, k);
+                seen.push(k);
+            }
+        }
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "encoding is not injective");
+    }
+
+    #[test]
+    fn map64_handles_dense_keys() {
+        let mut m = Map64::with_capacity(4096);
+        let mut keys = Vec::new();
+        for i in 0..2000u64 {
+            let s = format!("u{}", i);
+            let k = person_key(s.as_bytes());
+            m.insert(k, i + 1);
+            keys.push((k, i + 1));
+        }
+        for (k, v) in keys {
+            assert_eq!(m.get(k), Some(v));
+        }
+        assert_eq!(m.get(person_key(b"nope")), None);
     }
 
     #[test]
