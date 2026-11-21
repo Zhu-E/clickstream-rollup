@@ -761,6 +761,58 @@ impl Out {
     }
 }
 
+fn write_campaign_daily(ctx: &Ctx, camp_name: &[u64], mut cds: Vec<Vec<CD>>, path: &Path) -> usize {
+    let stride = ctx.ndays + 2;
+    let mut agg = cds.pop().unwrap();
+    for c in &cds {
+        for i in 0..agg.len() {
+            agg[i].sessions += c[i].sessions;
+            agg[i].purch += c[i].purch;
+            agg[i].assist += c[i].assist;
+            agg[i].rev += c[i].rev;
+        }
+    }
+    let mut cid = Vec::new();
+    let mut chv = Vec::new();
+    let mut cday: Vec<i32> = Vec::new();
+    let mut csess: Vec<i64> = Vec::new();
+    let mut cpur: Vec<i64> = Vec::new();
+    let mut crev: Vec<i64> = Vec::new();
+    let mut cass: Vec<i64> = Vec::new();
+    for ci in 0..=ctx.ncamp {
+        for d in 0..stride {
+            let e = agg[ci * stride + d];
+            if e.sessions == 0 && e.purch == 0 && e.assist == 0 && e.rev == 0 {
+                continue;
+            }
+            if ci == ctx.ncamp {
+                pq::push_str(&mut cid, b"organic");
+                pq::push_str(&mut chv, b"organic");
+            } else {
+                pq::push_str(&mut cid, ctx.bytes(camp_name[ci]));
+                pq::push_str(&mut chv, &ctx.chans[ctx.chan[ci] as usize]);
+            }
+            cday.push((ctx.day0 + d as i64) as i32);
+            csess.push(e.sessions as i64);
+            cpur.push(e.purch as i64);
+            crev.push(e.rev as i64);
+            cass.push(e.assist as i64);
+        }
+    }
+    let n = cday.len();
+    let cols = [
+        pq::Col { name: "campaign_id", kind: pq::Kind::Utf8, vals: &cid, defs: &[], nvals: n as i64 },
+        pq::Col { name: "channel", kind: pq::Kind::Utf8, vals: &chv, defs: &[], nvals: n as i64 },
+        pq::Col { name: "day", kind: pq::Kind::Date, vals: pq::as_bytes(&cday), defs: &[], nvals: n as i64 },
+        pq::Col { name: "sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&csess), defs: &[], nvals: n as i64 },
+        pq::Col { name: "purchasing_sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&cpur), defs: &[], nvals: n as i64 },
+        pq::Col { name: "revenue_cents", kind: pq::Kind::I64, vals: pq::as_bytes(&crev), defs: &[], nvals: n as i64 },
+        pq::Col { name: "assisted_sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&cass), defs: &[], nvals: n as i64 },
+    ];
+    pq::write(path, n as i64, &cols).unwrap();
+    n
+}
+
 struct Tmp {
     ss: Vec<u32>,
     sd: Vec<u8>,
@@ -2049,9 +2101,11 @@ fn main() {
     let rows: usize = pbuckets.iter().flatten().map(|b| b.len as usize).sum();
     let rows_per_thread = rows / nt + 4096;
     let all_bits = std::sync::atomic::AtomicU64::new(0);
-    let folded = std::sync::Barrier::new(nt);
-    let mut cds: Vec<Vec<CD>> = Vec::new();
+    let folded = std::sync::Barrier::new(nt + 1);
+    let cds: std::sync::Mutex<Vec<Vec<CD>>> = std::sync::Mutex::new(Vec::new());
     let mut nrows_tot: usize = 0;
+    let mut t_fold = t_dedup;
+    let mut n = 0;
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|t| {
@@ -2063,6 +2117,7 @@ fn main() {
                 let ud = &ud;
                 let all_bits = &all_bits;
                 let folded = &folded;
+                let cds = &cds;
                 s.spawn(move || {
                     let mut f = Fold {
                         ev: Vec::new(),
@@ -2103,86 +2158,44 @@ fn main() {
                     }
                     // every file must use the same integer type, so agree on it
                     all_bits.fetch_or(f.o.all_bits, Ordering::Relaxed);
+                    cds.lock().unwrap().push(std::mem::take(&mut f.o.cd));
                     folded.wait();
                     let n = f.o.day.len();
                     if n > 0 {
                         let narrow = Out::fits_i32(all_bits.load(Ordering::Relaxed));
                         f.o.write(&ud.join(format!("part-{:02}.parquet", t)), &ctx.cats, narrow).unwrap();
                     }
-                    (std::mem::take(&mut f.o.cd), n)
+                    n
                 })
             })
             .collect();
+        // campaign_daily is written while the threads write user_daily
+        folded.wait();
+        t_fold = t0.elapsed();
+        let cds = std::mem::take(&mut *cds.lock().unwrap());
+        n = write_campaign_daily(&ctx, &camp_name, cds, &cdd.join("part-00.parquet"));
         for h in hs {
-            let (cd, n) = h.join().unwrap();
-            cds.push(cd);
-            nrows_tot += n;
+            nrows_tot += h.join().unwrap();
         }
     });
-    let t_fold = t0.elapsed();
-
-    // ---- campaign_daily
-    let mut agg = cds.pop().unwrap();
-    for c in &cds {
-        for i in 0..agg.len() {
-            agg[i].sessions += c[i].sessions;
-            agg[i].purch += c[i].purch;
-            agg[i].assist += c[i].assist;
-            agg[i].rev += c[i].rev;
-        }
-    }
-    let mut cid = Vec::new();
-    let mut chv = Vec::new();
-    let mut cday: Vec<i32> = Vec::new();
-    let mut csess: Vec<i64> = Vec::new();
-    let mut cpur: Vec<i64> = Vec::new();
-    let mut crev: Vec<i64> = Vec::new();
-    let mut cass: Vec<i64> = Vec::new();
-    for ci in 0..=ctx.ncamp {
-        for d in 0..stride {
-            let e = agg[ci * stride + d];
-            if e.sessions == 0 && e.purch == 0 && e.assist == 0 && e.rev == 0 {
-                continue;
-            }
-            if ci == ctx.ncamp {
-                pq::push_str(&mut cid, b"organic");
-                pq::push_str(&mut chv, b"organic");
-            } else {
-                pq::push_str(&mut cid, ctx.bytes(camp_name[ci]));
-                pq::push_str(&mut chv, &ctx.chans[ctx.chan[ci] as usize]);
-            }
-            cday.push((ctx.day0 + d as i64) as i32);
-            csess.push(e.sessions as i64);
-            cpur.push(e.purch as i64);
-            crev.push(e.rev as i64);
-            cass.push(e.assist as i64);
-        }
-    }
-    let n = cday.len();
-    let cols = [
-        pq::Col { name: "campaign_id", kind: pq::Kind::Utf8, vals: &cid, defs: &[], nvals: n as i64 },
-        pq::Col { name: "channel", kind: pq::Kind::Utf8, vals: &chv, defs: &[], nvals: n as i64 },
-        pq::Col { name: "day", kind: pq::Kind::Date, vals: pq::as_bytes(&cday), defs: &[], nvals: n as i64 },
-        pq::Col { name: "sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&csess), defs: &[], nvals: n as i64 },
-        pq::Col { name: "purchasing_sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&cpur), defs: &[], nvals: n as i64 },
-        pq::Col { name: "revenue_cents", kind: pq::Kind::I64, vals: pq::as_bytes(&crev), defs: &[], nvals: n as i64 },
-        pq::Col { name: "assisted_sessions", kind: pq::Kind::I64, vals: pq::as_bytes(&cass), defs: &[], nvals: n as i64 },
-    ];
-    pq::write(&cdd.join("part-00.parquet"), n as i64, &cols).unwrap();
     if nrows_tot == 0 {
         Out::new(0, 0).write(&ud.join("part-00.parquet"), &ctx.cats, true).unwrap();
     }
 
     if std::env::var("SS_TIMING").is_ok() {
+        let total = t0.elapsed();
         eprintln!(
-            "parse {:?}  dedup {:?}  fold {:?}  total {:?}  rows {} / {}",
+            "parse {:?}  dedup {:?}  fold {:?}  write {:?}  total {:?}  rows {} / {}",
             t_parse,
             t_dedup - t_parse,
             t_fold - t_dedup,
-            t0.elapsed(),
+            total - t_fold,
+            total,
             nrows_tot,
             n
         );
+    }
+    if std::env::var_os("SS_MEM").is_some() {
         if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
             let kb = |k: &str| -> u64 {
                 s.lines()
@@ -2193,7 +2206,7 @@ fn main() {
             };
             let (anon, huge) = (kb("Anonymous:"), kb("AnonHugePages:"));
             eprintln!(
-                "  at exit: rss {} MB, anonymous {} MB of which 4K pages {} MB; {} huge blocks mapped, {} MB",
+                "at exit: rss {} MB, anonymous {} MB of which 4K pages {} MB; {} huge blocks mapped, {} MB",
                 kb("Rss:") >> 10,
                 anon >> 10,
                 (anon - huge.min(anon)) >> 10,
