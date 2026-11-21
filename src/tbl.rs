@@ -72,6 +72,11 @@ fn hash_long(b: &[u8]) -> u64 {
 #[inline(always)]
 pub fn key96(b: &[u8]) -> (u64, u32) {
     let n = b.len();
+    if n.wrapping_sub(8) <= 3 {
+        // the usual length: the tail comes out of the last four bytes
+        let tail = (rd4(b, n - 4) >> (8 * (12 - n))) as u32;
+        return (rd8(b, 0), tail | ((n as u32) << 24));
+    }
     if n <= 11 {
         // Pack the bytes with plain loads; a variable-length copy_from_slice
         // would call memcpy once per row.
@@ -331,75 +336,100 @@ impl Map64 {
 
 // ------------------------------------------------- fast timestamp parsing
 
+const ZEROS: u64 = 0x3030_3030_3030_3030;
+
 /// True when all eight bytes are ASCII digits.
 #[inline(always)]
 fn digits8(w: u64) -> bool {
     const HN: u64 = 0xf0f0_f0f0_f0f0_f0f0;
-    const Z: u64 = 0x3030_3030_3030_3030;
-    (w & HN) == Z && (w.wrapping_add(0x0606_0606_0606_0606) & HN) == Z
+    (w & HN) == ZEROS && (w.wrapping_add(0x0606_0606_0606_0606) & HN) == ZEROS
 }
 
-/// Eight ASCII digits, most significant first, to a number.
+/// Eight digit values, most significant in the low byte, to a number.
 #[inline(always)]
-fn val8(w: u64) -> u64 {
-    let x = w.wrapping_sub(0x3030_3030_3030_3030);
+fn val8x(x: u64) -> u64 {
     let y = (x & 0x000f_000f_000f_000f) * 10 + ((x >> 8) & 0x000f_000f_000f_000f);
     let z = (y & 0x0000_00ff_0000_00ff) * 100 + ((y >> 16) & 0x0000_00ff_0000_00ff);
     (z & 0xffff) * 10000 + ((z >> 32) & 0xffff)
 }
 
-/// `HH:MM:SS` at `b[11..19]` as milliseconds into the day.
+/// Eight ASCII digits, most significant first, to a number.
 #[inline(always)]
-fn time_ms(b: &[u8]) -> Option<i64> {
-    let w = rd8(b, 11);
-    // ':' at word bytes 2 and 5
-    if (w & 0x0000_ff00_00ff_0000) != 0x0000_3a00_003a_0000 {
-        return None;
-    }
-    // replace the separators with '0' so one digit test covers the word
-    let y = (w & !0x0000_ff00_00ff_0000) | 0x0000_3000_0030_0000;
-    if !digits8(y) {
-        return None;
-    }
-    let h = (b[11] - b'0') as i64 * 10 + (b[12] - b'0') as i64;
-    let m = (b[14] - b'0') as i64 * 10 + (b[15] - b'0') as i64;
-    let s = (b[17] - b'0') as i64 * 10 + (b[18] - b'0') as i64;
-    if h > 23 || m > 59 || s > 59 {
-        return None;
-    }
-    Some((h * 3600 + m * 60 + s) * 1000)
+fn val8(w: u64) -> u64 {
+    val8x(w.wrapping_sub(ZEROS))
 }
 
-/// Caches `YYYY-MM-DD` -> days since the epoch. A dataset's window spans a
-/// couple of weeks, so a handful of dates cover almost every row.
+const HI_BITS: u64 = 0x8080_8080_8080_8080;
+
+/// `HH:MM:SS` as a word: seconds into the day, and nonzero when it is not a
+/// time. Each byte is checked against its own limit by one carry-free add.
+#[inline(always)]
+fn hms(t: u64) -> (u64, u64) {
+    let x = t ^ 0x3030_3a30_303a_3030;
+    // per byte 0x7f - limit: h 2 9, colon 0, m 5 9, colon 0, s 5 9
+    let bad = (x.wrapping_add(0x767a_7f76_7a7f_767d) | x) & HI_BITS;
+    let y = x.wrapping_mul(0xa01);
+    let h = (y >> 8) & 0xff;
+    let m = (y >> 32) & 0xff;
+    let s = y >> 56;
+    (h * 3600 + m * 60 + s, bad | (h > 23) as u64)
+}
+
+/// `HH:MM` in the low five bytes: the offset in seconds, and nonzero when bad.
+#[inline(always)]
+fn hm(t: u64) -> (u64, u64) {
+    let x = t ^ 0x30_303a_3030;
+    let bad = (x.wrapping_add(0x76_7a7f_767d) | x) & 0x80_8080_8080;
+    let y = x.wrapping_mul(0xa01);
+    let h = (y >> 8) & 0xff;
+    let m = (y >> 32) & 0xff;
+    (h * 3600 + m * 60, bad | (h > 23) as u64)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DateEnt {
+    klo: u64,
+    khi: u64,
+    ms: i64,
+    pad: u64,
+}
+
+/// Caches `YYYY-MM-DD` -> milliseconds at that midnight. A dataset's window
+/// spans a couple of weeks, so a handful of dates cover almost every row.
 pub struct DateCache {
-    klo: [u64; 64],
-    khi: [u16; 64],
-    val: [i64; 64],
+    e: [DateEnt; 64],
 }
 
 const BAD: i64 = i64::MIN;
 
 impl DateCache {
     pub fn new() -> DateCache {
-        DateCache { klo: [1; 64], khi: [0; 64], val: [BAD; 64] }
+        DateCache { e: [DateEnt { klo: 1, khi: 0, ms: BAD, pad: 0 }; 64] }
     }
+    /// Midnight of the date in `b[..10]`, or `BAD`.
     #[inline(always)]
-    fn days(&mut self, b: &[u8]) -> Option<i64> {
+    fn day_ms(&mut self, b: &[u8]) -> i64 {
         let k = rd8(b, 0);
-        let k2 = u16::from_le_bytes([b[8], b[9]]);
-        let i = (((b[8] as usize) << 4) ^ (b[9] as usize)) & 63;
-        unsafe {
-            if *self.klo.get_unchecked(i) == k && *self.khi.get_unchecked(i) == k2 {
-                let v = *self.val.get_unchecked(i);
-                return if v == BAD { None } else { Some(v) };
-            }
+        let mut t = [0u8; 2];
+        t.copy_from_slice(&b[8..10]);
+        let k2 = u16::from_le_bytes(t) as u64;
+        let i = (((k2 << 4) ^ (k2 >> 8)) & 63) as usize;
+        let e = unsafe { self.e.get_unchecked(i) };
+        if ((e.klo ^ k) | (e.khi ^ k2)) == 0 {
+            return e.ms;
         }
-        let v = date_days(b);
-        self.klo[i] = k;
-        self.khi[i] = k2;
-        self.val[i] = v.unwrap_or(BAD);
-        v
+        self.fill(b, i, k, k2)
+    }
+    #[cold]
+    #[inline(never)]
+    fn fill(&mut self, b: &[u8], i: usize, k: u64, k2: u64) -> i64 {
+        let ms = match date_days(b) {
+            Some(d) => d * DAY_MS,
+            None => BAD,
+        };
+        self.e[i] = DateEnt { klo: k, khi: k2, ms, pad: 0 };
+        ms
     }
 }
 
@@ -422,9 +452,86 @@ fn date_days(b: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, mo, d))
 }
 
-/// Digits-only epoch milliseconds, fast path for up to 18 digits.
+const POW10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
+/// For sixteen bytes read as `b[..8]` then `b[k..k + 8]`: all of the first
+/// word and the last `k` bytes of the second, which repeats the rest.
+const fn fresh_tbl() -> [[u8; 16]; 9] {
+    let mut t = [[0u8; 16]; 9];
+    let mut k = 0;
+    while k < 9 {
+        let mut i = 0;
+        while i < 16 {
+            if i < 8 || i >= 16 - k {
+                t[k][i] = 0xff;
+            }
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+}
+
+static FRESH: [[u8; 16]; 9] = fresh_tbl();
+
+/// Eight to sixteen digits, `k = len - 8`: the first eight as one number and
+/// the remaining `k` as another, or None if any byte is not a digit.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn split_digits(b: &[u8], k: usize) -> Option<(u64, u64)> {
+    use core::arch::x86_64::*;
+    debug_assert!(b.len() == k + 8 && k <= 8);
+    unsafe {
+        let hi = _mm_loadl_epi64(b.as_ptr() as *const __m128i);
+        let lo = _mm_loadl_epi64(b.as_ptr().add(k) as *const __m128i);
+        let x = _mm_sub_epi8(_mm_unpacklo_epi64(hi, lo), _mm_set1_epi8(0x30));
+        let over = _mm_subs_epu8(x, _mm_set1_epi8(9));
+        if _mm_testz_si128(over, over) == 0 {
+            return None;
+        }
+        let x = _mm_and_si128(x, _mm_loadu_si128(FRESH.get_unchecked(k).as_ptr() as *const __m128i));
+        // pairs, then fours, then eights
+        let a = _mm_maddubs_epi16(x, _mm_set1_epi16(0x010a));
+        let c = _mm_madd_epi16(a, _mm_set1_epi32(0x0001_0064));
+        let e = _mm_madd_epi16(_mm_packus_epi32(c, c), _mm_set1_epi32(0x0001_2710));
+        let r = _mm_cvtsi128_si64(e) as u64;
+        Some((r & 0xffff_ffff, r >> 32))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+fn split_digits(b: &[u8], k: usize) -> Option<(u64, u64)> {
+    split_digits_sw(b, k)
+}
+
+/// The same with 64-bit words only.
+#[inline(always)]
+fn split_digits_sw(b: &[u8], k: usize) -> Option<(u64, u64)> {
+    let hi = rd8(b, 0);
+    let lo = rd8(b, k);
+    if !(digits8(hi) & digits8(lo)) {
+        return None;
+    }
+    let fresh = rd8(&FRESH[k], 8);
+    Some((val8(hi), val8x(lo.wrapping_sub(ZEROS) & fresh)))
+}
+
+/// Digits-only epoch milliseconds. Eight to sixteen digits, which is every
+/// one the generator writes, take two overlapping words and no loop.
 #[inline(always)]
 fn epoch_fast(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n.wrapping_sub(8) <= 8 {
+        let k = n - 8;
+        let (hi, lo) = split_digits(b, k)?;
+        return Some((hi * unsafe { *POW10.get_unchecked(k) } + lo) as i64);
+    }
+    epoch_slow(b)
+}
+
+#[inline(never)]
+fn epoch_slow(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 {
         return None;
@@ -433,22 +540,12 @@ fn epoch_fast(b: &[u8]) -> Option<i64> {
         return parse_epoch_ms(b);
     }
     let mut v: u64 = 0;
-    let mut i = 0usize;
-    while i + 8 <= n {
-        let w = rd8(b, i);
-        if !digits8(w) {
-            return None;
-        }
-        v = v * 100_000_000 + val8(w);
-        i += 8;
-    }
-    while i < n {
-        let d = unsafe { *b.get_unchecked(i) }.wrapping_sub(b'0');
+    for &c in b {
+        let d = c.wrapping_sub(b'0');
         if d > 9 {
             return None;
         }
         v = v * 10 + d as u64;
-        i += 1;
     }
     Some(v as i64)
 }
@@ -458,24 +555,28 @@ fn epoch_fast(b: &[u8]) -> Option<i64> {
 pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = b.len();
     if n == 20 {
-        if b[19] != b'Z' || b[10] != b'T' {
-            return epoch_fast(b);
+        if (b[19] ^ b'Z') | (b[10] ^ b'T') != 0 {
+            return epoch_slow(b);
         }
-        let days = dc.days(b)?;
-        Some(days * DAY_MS + time_ms(b)?)
-    } else if n == 25 && (b[19] == b'+' || b[19] == b'-') {
-        if b[10] != b'T' || b[22] != b':' {
+        let day = dc.day_ms(b);
+        let (s, bad) = hms(rd8(b, 11));
+        if (bad != 0) | (day == BAD) {
             return None;
         }
-        let days = dc.days(b)?;
-        let base = days * DAY_MS + time_ms(b)?;
-        let oh = d2(b, 20)?;
-        let om = d2(b, 23)?;
-        if oh > 23 || om > 59 {
+        Some(day + s as i64 * 1000)
+    } else if n == 25 {
+        let neg = b[19] == b'-';
+        if !(neg | (b[19] == b'+')) {
+            return epoch_slow(b);
+        }
+        let day = dc.day_ms(b);
+        let (s, bad) = hms(rd8(b, 11));
+        let (off, obad) = hm(rd4(b, 20) | ((b[24] as u64) << 32));
+        if ((bad | obad) != 0) | (day == BAD) | (b[10] != b'T') {
             return None;
         }
-        let off = (oh as i64 * 3600 + om as i64 * 60) * 1000;
-        Some(if b[19] == b'+' { base - off } else { base + off })
+        let off = off as i64 * 1000;
+        Some(day + s as i64 * 1000 + if neg { off } else { -off })
     } else {
         epoch_fast(b)
     }
@@ -517,9 +618,57 @@ const fn enc_tbl() -> [u8; 256] {
 
 static ENC: [u8; 256] = enc_tbl();
 
+/// Eight to ten bytes at once. The two nibbles of each byte pick one bit set
+/// each, which meet only on a byte outside the alphabet; the high nibble
+/// also picks what to add to get the code, and two multiply-adds pack the
+/// codes six bits apiece.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn enc_wide(b: &[u8]) -> Option<u64> {
+    use core::arch::x86_64::*;
+    let n = b.len();
+    debug_assert!(n >= 8 && n <= MAXENC);
+    let sh = 4 * (16 - n) as u32;
+    let lo = rd8(b, 0);
+    let hi = (rd8(b, n - 8) >> sh) >> sh;
+    unsafe {
+        let v = _mm_set_epi64x(hi as i64, lo as i64);
+        let nib = _mm_set1_epi8(0x0f);
+        let ln = _mm_and_si128(v, nib);
+        let hn = _mm_and_si128(_mm_srli_epi16(v, 4), nib);
+        // classes by high nibble: 3 digits, 4 and 6 letters from 1, 5 P-Z and _, 7 p-z
+        let hcls = _mm_setr_epi8(16, 16, 16, 1, 2, 4, 2, 8, 16, 16, 16, 16, 16, 16, 16, 16);
+        // low nibbles each class does not have
+        let lcls = _mm_setr_epi8(18, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 29, 29, 29, 29, 25);
+        let bad = _mm_and_si128(_mm_shuffle_epi8(hcls, hn), _mm_shuffle_epi8(lcls, ln));
+        let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(bad, _mm_setzero_si128())) as u32;
+        if !ok & ((1u32 << n) - 1) != 0 {
+            return None;
+        }
+        let add = _mm_setr_epi8(0, 0, 0, -0x2f, -0x36, -0x36, -0x3b, -0x3b, 0, 0, 0, 0, 0, 0, 0, 0);
+        let us = _mm_and_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(0x5f)), _mm_set1_epi8(-4));
+        let code = _mm_add_epi8(_mm_add_epi8(v, _mm_shuffle_epi8(add, hn)), us);
+        let pair = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
+        let four = _mm_madd_epi16(pair, _mm_set1_epi32(0x0001_1000));
+        let r = _mm_cvtsi128_si64(four) as u64;
+        let tail = _mm_extract_epi32(four, 2) as u32 as u64;
+        Some((((r & 0xffff_ffff) << 36) | ((r >> 32) << 12) | (tail >> 12)) + 1)
+    }
+}
+
 /// The id itself as a u64, or None if it does not fit the alphabet.
 #[inline(always)]
 pub fn enc_name(b: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    if b.len().wrapping_sub(8) <= MAXENC - 8 {
+        return enc_wide(b);
+    }
+    enc_bytes(b)
+}
+
+/// Any length, a byte at a time.
+#[inline(always)]
+fn enc_bytes(b: &[u8]) -> Option<u64> {
     if b.len() > MAXENC {
         return None;
     }
@@ -625,6 +774,37 @@ mod tests {
     }
 
     #[test]
+    fn name_encoding_agrees_with_the_byte_loop() {
+        let mut x = 0x6a09_e667_f3bc_c909u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for n in 0..=12usize {
+            // every byte value at every position of a valid name
+            let mut v: Vec<u8> = (0..n).map(|i| ALPHA[(i * 7 + n) % 63]).collect();
+            assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
+            for i in 0..n {
+                let keep = v[i];
+                for c in 0..=255u8 {
+                    v[i] = c;
+                    assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
+                }
+                v[i] = keep;
+            }
+        }
+        for it in 0..2_000_000u32 {
+            let n = (next() % 13) as usize;
+            let v: Vec<u8> = (0..n)
+                .map(|_| if it % 5 == 0 && next() % 6 == 0 { next() as u8 } else { ALPHA[(next() % 63) as usize] })
+                .collect();
+            assert_eq!(enc_name(&v), enc_bytes(&v), "{:?}", v);
+        }
+    }
+
+    #[test]
     fn map64_handles_dense_keys() {
         let mut m = Map64::with_capacity(4096);
         let mut keys = Vec::new();
@@ -691,6 +871,207 @@ mod tests {
         for c in cases {
             let (a, b) = both(c);
             assert_eq!(a, b, "mismatch for {:?}: slow {:?} fast {:?}", c, a, b);
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            (self.next() >> 11) % n
+        }
+    }
+
+    const SHAPES: [&str; 12] = [
+        "2026-10-03T23:58:10Z",
+        "2026-10-03T19:58:10-04:00",
+        "2028-02-29T00:00:00+12:00",
+        "2027-12-31T23:59:59-00:00",
+        "1791071890000",
+        "0001791071890000",
+        "17910718",
+        "1791071",
+        "179107189000012345",
+        "12345678901234567890",
+        "1234567890123456789012345",
+        "9223372036854775807",
+    ];
+
+    #[test]
+    fn timestamps_agree_for_every_byte_at_every_position() {
+        let mut dc = DateCache::new();
+        for s in SHAPES {
+            let mut v = s.as_bytes().to_vec();
+            for i in 0..v.len() {
+                let keep = v[i];
+                for c in 0..=255u8 {
+                    v[i] = c;
+                    assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                }
+                v[i] = keep;
+            }
+        }
+    }
+
+    #[test]
+    fn timestamps_agree_for_every_two_digit_field() {
+        let mut dc = DateCache::new();
+        let put = |v: &mut Vec<u8>, at: usize, x: usize| {
+            v[at] = b'0' + (x / 10) as u8;
+            v[at + 1] = b'0' + (x % 10) as u8;
+        };
+        for y in ["1900", "2000", "2024", "2025", "2026", "2027", "2028", "2100"] {
+            let mut v = format!("{}-01-01T00:00:00+00:00", y).into_bytes();
+            for mo in 0..100 {
+                for d in 0..100 {
+                    put(&mut v, 5, mo);
+                    put(&mut v, 8, d);
+                    assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                    assert_eq!(parse_ts(&v[..19]), parse_ts_c(&v[..19], &mut dc));
+                    v[19] = b'Z';
+                    assert_eq!(parse_ts(&v[..20]), parse_ts_c(&v[..20], &mut dc));
+                    v[19] = b'+';
+                }
+            }
+        }
+        for sign in [b'+', b'-'] {
+            for at in [11usize, 14, 17, 20, 23] {
+                let mut v = b"2027-06-15T12:34:56+05:30".to_vec();
+                v[19] = sign;
+                for a in 0..100 {
+                    put(&mut v, at, a);
+                    for at2 in [11usize, 14, 17, 20, 23] {
+                        if at2 == at {
+                            continue;
+                        }
+                        let keep = [v[at2], v[at2 + 1]];
+                        for b in 0..100 {
+                            put(&mut v, at2, b);
+                            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+                            let mut z = v[..20].to_vec();
+                            z[19] = b'Z';
+                            assert_eq!(parse_ts(&z), parse_ts_c(&z, &mut dc), "{:?}", String::from_utf8_lossy(&z));
+                        }
+                        v[at2] = keep[0];
+                        v[at2 + 1] = keep[1];
+                    }
+                }
+            }
+        }
+    }
+
+    fn civil_text(ms: i64, off_min: i64, rng: &mut Rng) -> String {
+        let local = ms + off_min * 60_000;
+        let (y, m, d) = civil_from_days(local.div_euclid(DAY_MS));
+        let s = local.rem_euclid(DAY_MS) / 1000;
+        let head = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, m, d, s / 3600, s / 60 % 60, s % 60);
+        if off_min == 0 && rng.below(2) == 0 {
+            format!("{}Z", head)
+        } else {
+            let a = off_min.abs();
+            format!("{}{}{:02}:{:02}", head, if off_min < 0 { '-' } else { '+' }, a / 60, a % 60)
+        }
+    }
+
+    #[test]
+    fn timestamps_round_trip() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut dc = DateCache::new();
+        for _ in 0..400_000 {
+            let ms = (rng.below(4_000_000_000) as i64) * 1000;
+            let off = if rng.below(3) == 0 { 0 } else { rng.below(24 * 60) as i64 - 12 * 60 };
+            let s = civil_text(ms, off, &mut rng);
+            assert_eq!(parse_ts_c(s.as_bytes(), &mut dc), Some(ms), "{}", s);
+            assert_eq!(parse_ts(s.as_bytes()), Some(ms), "{}", s);
+            let ms = ms + rng.below(1000) as i64;
+            let pad = rng.below(4) as usize;
+            let s = format!("{}{}", "0".repeat(pad), ms);
+            assert_eq!(parse_ts_c(s.as_bytes(), &mut dc), Some(ms), "{}", s);
+        }
+    }
+
+    #[test]
+    fn timestamps_agree_under_random_damage() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut dc = DateCache::new();
+        let pool = b"0123456789-+:TZtz ,.\"e\r\x00\xff/";
+        for it in 0..3_000_000u32 {
+            let mut v: Vec<u8> = if it % 3 == 0 {
+                SHAPES[rng.below(SHAPES.len() as u64) as usize].as_bytes().to_vec()
+            } else if it % 3 == 1 {
+                let ms = (rng.below(4_000_000_000) as i64) * 1000;
+                let off = if rng.below(2) == 0 { 0 } else { rng.below(24 * 60) as i64 - 12 * 60 };
+                civil_text(ms, off, &mut rng).into_bytes()
+            } else {
+                let n = rng.below(22) as usize;
+                (0..n).map(|_| b'0' + rng.below(10) as u8).collect()
+            };
+            for _ in 0..rng.below(4) {
+                match rng.below(8) {
+                    0 if !v.is_empty() => {
+                        let at = rng.below(v.len() as u64) as usize;
+                        v.remove(at);
+                    }
+                    1 => {
+                        let at = rng.below(v.len() as u64 + 1) as usize;
+                        v.insert(at, pool[rng.below(pool.len() as u64) as usize]);
+                    }
+                    _ if !v.is_empty() => {
+                        let at = rng.below(v.len() as u64) as usize;
+                        v[at] = pool[rng.below(pool.len() as u64) as usize];
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut dc), "{:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn digit_words_agree() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for it in 0..2_000_000u32 {
+            let n = 8 + rng.below(9) as usize;
+            let mut v: Vec<u8> = (0..n).map(|_| b'0' + rng.below(10) as u8).collect();
+            if it % 4 == 0 {
+                let at = rng.below(n as u64) as usize;
+                v[at] = rng.next() as u8;
+            }
+            let want = if v.iter().all(|c| c.is_ascii_digit()) {
+                let s = std::str::from_utf8(&v).unwrap();
+                Some((s[..8].parse::<u64>().unwrap(), s[8..].parse::<u64>().unwrap_or(0)))
+            } else {
+                None
+            };
+            assert_eq!(split_digits(&v, n - 8), want, "{:?}", String::from_utf8_lossy(&v));
+            assert_eq!(split_digits_sw(&v, n - 8), want, "{:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn key96_matches_the_byte_loop() {
+        let slow = |b: &[u8]| -> (u64, u32) {
+            let mut lo = 0u64;
+            let mut hi = 0u32;
+            for (i, &c) in b.iter().enumerate() {
+                if i < 8 {
+                    lo |= (c as u64) << (8 * i);
+                } else {
+                    hi |= (c as u32) << (8 * (i - 8));
+                }
+            }
+            (lo, hi | ((b.len() as u32) << 24))
+        };
+        let mut rng = Rng(0x0f0f_1234_5678_9abd);
+        for _ in 0..200_000 {
+            let n = rng.below(12) as usize;
+            let v: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+            assert_eq!(key96(&v), slow(&v), "{:?}", v);
         }
     }
 

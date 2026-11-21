@@ -24,12 +24,23 @@ backed by transparent huge pages.
    binary that takes that path for *every* id and has to produce the same
    answers.
 2. **Parse.** Event and click files are cut into 1 MiB chunks and parsed
-   independently. Sixteen bytes at a time, vector byte compares yield one bit
-   per byte for commas, quotes and newlines; the quote bitmap makes "a quote
-   anywhere but around a whole field is malformed" two shifts and a compare.
+   independently, 8 KiB at a time in two passes (`split.rs`). The first
+   compares 64 bytes against comma, quote and newline and writes down where
+   the delimiters are, plus one bit per delimiter for "is a newline" and "the
+   next field opens with a quote"; nothing in it branches on the data. A
+   quote is legal only next to exactly one delimiter, and a field that opens
+   with one must close with one, which is a handful of shifts and two `pext`
+   per block. A block that breaks either rule is noted, and lines touching it
+   go through the older one-line scanner, as do the last lines of a file, so
+   that scanner stays the definition of the dialect. The second pass takes a
+   row off the index with one test ("six commas, then a newline") and one
+   vector add for all seven spans.
    Timestamps go through a 64-entry cache keyed on `YYYY-MM-DD`, so the
    calendar arithmetic runs about twenty times per thread instead of 120
-   million; the rest is SWAR digit checking. Resolving a user to a person
+   million. The time of day is one 64-bit word: every byte is checked against
+   its own limit by a single carry-free add and one multiply pairs the digits.
+   Epoch digits and the ten-symbol id encoding use `pmaddubsw`/`pmaddwd`.
+   Resolving a user to a person
    would be a miss in a 30-130 MB link map, so a blocked Bloom filter at 16
    bits per linked id answers "no link" from one cache line and keeps the
    half of all events whose user appears in no link out of the map entirely.
@@ -79,6 +90,17 @@ twenty times as much to give back at exit, and the process leaves with
 - Keys here are dense encodings, not hashes, so the hash tables mix before
   masking. One table was still probing on raw low bits, which made link
   building seven times slower than it needed to be.
+- With `target-cpu=cascadelake` the compiler will reach for 512-bit registers
+  on its own: eight scalar `tzcnt` stores were packed into `zmm` with
+  `vplzcntq`, and two adjacent 256-bit compares were merged into one. Both
+  were slower, and on Cascade Lake any 512-bit use lowers the clock for
+  everything around it. The stores are volatile for that reason; `objdump -d
+  | grep zmm` should show nothing in a hot loop.
+- A closure called from two places is not inlined, and vector constants that
+  are live across a call are reloaded after it. The row callback is forced
+  inline and the indexer is forced out of line: left to the compiler, the
+  callback was a real call per row and the indexer's three comparison
+  constants were reloaded inside every timestamp.
 - Credit depends on the session start, not just on which clicks precede it: a
   cache keyed on the click index alone credits sessions more than seven days
   after their last click.
@@ -109,7 +131,17 @@ vector scanner against the scalar one over delimiters at every offset, runs of
 them, lines shorter than a block and lines longer than the mask. A
 disagreement switches the run to the scalar path and says so on stderr, so a
 mistake in a path I cannot run here costs speed, not correctness. Deliberately
-breaking the vector path is part of how that was checked.
+breaking the vector path is part of how that was checked. The two-pass
+splitter gets the same treatment: startup runs it and the one-line scanner
+over a few hundred made-up lines (every field count, quotes in every wrong
+place, a line longer than a batch) and over lines laid out so that a quote or
+a delimiter sits on each side of a 64-byte boundary, and any difference in the
+rows handed out sends the whole run down the old path. The unit tests do the
+same over some twenty megabytes of such lines with chunk boundaries anywhere,
+and `SS_SPLIT_DIR=<dataset> cargo test --release rows_match_on_files` does it
+over real files. Twelve deliberate breaks of the first pass (a carry dropped,
+a rule left out, the chunk end ignored) were each caught by the unit tests
+and by the startup check.
 
 `SS_TIMING=1` prints a per-stage breakdown on stderr, including the share of
 rows that pass validation (97.8% on the dev set, which is why the person key
