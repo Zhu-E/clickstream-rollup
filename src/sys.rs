@@ -23,6 +23,78 @@ const MADV_WILLNEED: i32 = 3;
 #[cfg(target_os = "linux")]
 const MADV_HUGEPAGE: i32 = 14;
 
+/// Zeroed anonymous memory for the big hash tables. The pages arrive zeroed
+/// without a memset, and on Linux they can be huge pages, which matters
+/// because a 64 MB table otherwise takes a TLB miss on most probes. All-zero
+/// bytes must be a valid `T`.
+pub struct Blob<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    base: *mut u8,
+    bytes: usize,
+}
+unsafe impl<T: Copy> Send for Blob<T> {}
+unsafe impl<T: Copy> Sync for Blob<T> {}
+
+const HUGE: usize = 1 << 21;
+
+impl<T: Copy> Blob<T> {
+    pub fn zeroed(len: usize) -> Blob<T> {
+        let want = len * std::mem::size_of::<T>();
+        // Over-allocate large tables so the start can be moved to a 2 MB
+        // boundary; without that the kernel has nowhere to put a huge page.
+        let pad = if want >= HUGE { HUGE } else { 0 };
+        let bytes = want + pad;
+        let base = unsafe {
+            mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+        };
+        assert!(base as isize != -1, "blob mmap failed");
+        let ptr = if pad == 0 {
+            base
+        } else {
+            let a = ((base as usize) + HUGE - 1) & !(HUGE - 1);
+            #[cfg(target_os = "linux")]
+            unsafe {
+                madvise(a as *mut u8, want, MADV_HUGEPAGE);
+            }
+            a as *mut u8
+        };
+        Blob { ptr: ptr as *mut T, len, base, bytes }
+    }
+}
+
+impl<T: Copy> Drop for Blob<T> {
+    fn drop(&mut self) {
+        unsafe { munmap(self.base, self.bytes) };
+    }
+}
+
+impl<T: Copy> std::ops::Deref for Blob<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T: Copy> std::ops::DerefMut for Blob<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+/// Pull a line into cache well before it is needed. A discarded volatile read
+/// rather than a prefetch intrinsic: it does the same job here, and it
+/// compiles on every target, which matters for code paths this machine cannot
+/// execute.
+#[inline(always)]
+pub fn prefetch(p: *const u8) {
+    unsafe {
+        std::ptr::read_volatile(p);
+    }
+}
+
 /// A read-only mapping of a whole file.
 pub struct Map {
     pub ptr: *const u8,

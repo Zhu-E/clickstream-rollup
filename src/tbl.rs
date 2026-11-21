@@ -1,5 +1,7 @@
 // Hashing, exact-ish key packing, timestamp parsing, open-addressing maps.
 #![allow(dead_code)]
+use crate::sys::{prefetch, Blob};
+
 
 #[inline(always)]
 pub fn mix(a: u64, b: u64) -> u64 {
@@ -228,7 +230,7 @@ pub fn parse_epoch_ms(b: &[u8]) -> Option<i64> {
 
 /// Open-addressing map from a non-zero u64 key to a u64 value.
 pub struct Map64 {
-    pub slots: Vec<(u64, u64)>,
+    pub slots: Blob<(u64, u64)>,
     mask: u64,
     len: usize,
     limit: usize,
@@ -243,15 +245,15 @@ impl Map64 {
         while cap * 3 < n * 4 {
             cap <<= 1;
         }
-        Map64 { slots: vec![(0u64, 0u64); cap], mask: (cap - 1) as u64, len: 0, limit: cap * 3 / 4 }
+        Map64 { slots: Blob::zeroed(cap), mask: (cap - 1) as u64, len: 0, limit: cap * 3 / 4 }
     }
     #[cold]
     fn grow(&mut self) {
         let cap = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![(0u64, 0u64); cap]);
+        let old = std::mem::replace(&mut self.slots, Blob::zeroed(cap));
         self.mask = (cap - 1) as u64;
         self.limit = cap * 3 / 4;
-        for (k, v) in old {
+        for &(k, v) in old.iter() {
             if k != 0 {
                 let mut i = self.home(k);
                 while unsafe { self.slots.get_unchecked(i) }.0 != 0 {
@@ -265,6 +267,11 @@ impl Map64 {
     fn home(&self, k: u64) -> usize {
         // Keys may be dense encodings rather than hashes, so mix before masking.
         (mix(k, 0x9e37_79b9_7f4a_7c15) & self.mask) as usize
+    }
+    /// Start the fetch of the line a later `get` will land on.
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        prefetch(unsafe { self.slots.as_ptr().add(self.home(k)) } as *const u8);
     }
     #[inline(always)]
     pub fn get(&self, k: u64) -> Option<u64> {
@@ -742,7 +749,7 @@ mod tests {
 // answer, so only the no-false-negatives property matters here.
 
 pub struct Bloom {
-    w: Vec<u64>,   // 8 words = one 64-byte block
+    w: Blob<u64>,  // 8 words = one 64-byte block
     blocks: usize, // power of two
 }
 
@@ -754,7 +761,7 @@ impl Bloom {
         while blocks * 512 < n * 16 {
             blocks <<= 1;
         }
-        Bloom { w: vec![0u64; blocks * 8], blocks }
+        Bloom { w: Blob::zeroed(blocks * 8), blocks }
     }
     #[inline(always)]
     pub fn insert(&mut self, k: u64) {
