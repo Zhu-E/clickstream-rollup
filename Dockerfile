@@ -14,4 +14,6 @@ FROM debian:bookworm-slim
 COPY --from=build /src/target/release/shopsess /app/shopsess
 USER 1000:1000
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+# glibc heaps on huge pages; the binary re-executes itself once if this is unset
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 CMD ["/app/shopsess"]

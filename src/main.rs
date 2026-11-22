@@ -2025,8 +2025,10 @@ fn check_scan() -> bool {
 }
 
 fn main() {
+    sys::huge_heaps();
     let t0 = std::time::Instant::now();
     sys::stage("start");
+    sys::tune_malloc();
     // the scanner check gates the small files; the rest runs beside them
     let nosimd = std::env::var_os("SS_NOSIMD").is_some();
     let scan_ok = !nosimd && check_scan();
