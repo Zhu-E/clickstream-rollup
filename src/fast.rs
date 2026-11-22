@@ -1330,6 +1330,9 @@ unsafe fn cl_second(
     cl_rare(x, fr, p, cs, oddc, dc)
 }
 
+// kept out of line: inlined into the parse closure next to parse_ev, it
+// costs the event kernel registers (6 instructions per event row on AVX2)
+#[inline(never)]
 fn parse_cl(ctx: &Ctx, k: &Keys, cl0: usize, fi: usize, from: usize, to: usize, st: &mut PSt) {
     let simd = SIMD_OK.load(Ordering::Relaxed);
     let x = Env::new(ctx, k, fi, simd, ctx.cl_lo, ctx.cl_hi);
