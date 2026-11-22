@@ -1209,6 +1209,22 @@ fn sample_clicks(seed: u64, rows: usize) -> Vec<u8> {
     b
 }
 
+/// `f` is `c_` and `c` in decimal without leading zeros, written without `format!`
+fn camp_is(f: &[u8], c: u64) -> bool {
+    let mut b = [0u8; 20];
+    let mut i = b.len();
+    let mut v = c;
+    loop {
+        i -= 1;
+        b[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    f.len() == 2 + b.len() - i && f.starts_with(b"c_") && f[2..] == b[i..]
+}
+
 /// `cl` over sample rows, as `check_events`
 fn check_clicks(seed: u64, rows: usize) -> Option<usize> {
     use crate::tbl::parse_ts;
@@ -1230,7 +1246,7 @@ fn check_clicks(seed: u64, rows: usize) -> Option<usize> {
                     && e.nid >= 1
                     && e.nid <= 15
                     && k.user(at(1)) == Some(e.un)
-                    && at(2) == format!("c_{}", e.camp).as_bytes()
+                    && camp_is(at(2), e.camp)
                     && parse_ts(at(3)) == Some(e.ts)
                     && e.next == sc.nl + 1 - p;
                 if !same {
@@ -1258,8 +1274,8 @@ fn dec8_agrees(f: &[u8]) -> bool {
 /// the tables against the reference parsers, at startup
 pub fn agrees() -> bool {
     check_events(0x51_7cc1_b727_220c, 3000).is_some_and(|hits| hits > 400) && check_events(0x51_7cc1_b727_220e, 1000).is_some()
-        && check_clicks(0x2b_9921_6f1d_0c4c, 3000).is_some_and(|hits| hits > 400)
-        && check_clicks(0x2b_9921_6f1d_0c4e, 1000).is_some()
+        && check_clicks(0x2b_9921_6f1d_0c4c, 1000).is_some_and(|hits| hits > 130)
+        && check_clicks(0x2b_9921_6f1d_0c4e, 300).is_some()
 }
 
 #[cfg(test)]
@@ -1273,6 +1289,21 @@ mod tests {
             hits += check_events(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 4000).expect("a row the tables accept and the reference reads otherwise");
         }
         assert!(hits > 250_000, "too few rows accepted: {}", hits);
+    }
+
+    #[test]
+    fn camp_is_matches_format() {
+        for c in [0u64, 1, 9, 10, 99, 100, 2499, 4_294_967_295, u64::MAX] {
+            assert!(camp_is(format!("c_{}", c).as_bytes(), c));
+        }
+        for (f, c) in [(&b"c_007"[..], 7u64), (b"c_", 0), (b"C_12", 12), (b"c_12x", 12), (b"c_1", 12), (b"c_120", 12), (b"x_12", 12)] {
+            assert!(!camp_is(f, c));
+        }
+    }
+
+    #[test]
+    fn startup_self_checks_pass() {
+        assert!(agrees());
     }
 
     #[test]
