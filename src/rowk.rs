@@ -535,6 +535,36 @@ unsafe fn words02(v: __m256i) -> (u64, u64) {
     return (_mm256_extract_epi64::<0>(v) as u64, _mm256_extract_epi64::<2>(v) as u64);
 }
 
+/// word 0, word 2, word 1
+#[inline(always)]
+unsafe fn word0(v: __m256i) -> u64 {
+    words02(v).0
+}
+
+#[inline(always)]
+unsafe fn word2(v: __m256i) -> u64 {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512vl"))]
+    {
+        let a: u64;
+        core::arch::asm!("vextracti128 {t}, {v}, 1", "vmovq {a}, {t}", v = in(ymm_reg) v, t = out(xmm_reg) _, a = lateout(reg) a, options(pure, nomem, nostack, preserves_flags));
+        return a;
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512vl")))]
+    return _mm256_extract_epi64::<2>(v) as u64;
+}
+
+#[inline(always)]
+unsafe fn word1(v: __m256i) -> i64 {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512vl"))]
+    {
+        let a: i64;
+        core::arch::asm!("vpextrq {a}, {v:x}, 1", v = in(ymm_reg) v, a = lateout(reg) a, options(pure, nomem, nostack, preserves_flags));
+        return a;
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512vl")))]
+    return _mm256_extract_epi64::<1>(v);
+}
+
 /// words 1, 2 and 3
 #[inline(always)]
 unsafe fn words123(v: __m256i) -> (i64, i64, i64) {
@@ -564,25 +594,25 @@ const BINV: u64 = {
 /// `unscramble` of words 0 and 2 under their keys; nonzero where one is not under its cap
 #[cfg(all(target_feature = "avx512dq", target_feature = "avx512vl"))]
 #[inline(always)]
-unsafe fn unscr(v: __m256i, k: &Kern) -> (__m256i, __m256i) {
+unsafe fn unscr(v: __m256i, keys: __m256i, caps: __m256i) -> (__m256i, __m256i) {
     let m40 = _mm256_set1_epi64x(M40 as i64);
     let m = _mm256_and_si256(_mm256_mullo_epi64(v, _mm256_set1_epi64x(BINV as i64)), m40);
     let h = _mm256_xor_si256(_mm256_xor_si256(m, _mm256_srli_epi64::<17>(m)), _mm256_srli_epi64::<34>(m));
-    let r = _mm256_and_si256(_mm256_mullo_epi64(_mm256_xor_si256(h, k.keys), _mm256_set1_epi64x(AINV as i64)), m40);
-    (r, _mm256_cmpgt_epi64(r, k.caps))
+    let r = _mm256_and_si256(_mm256_mullo_epi64(_mm256_xor_si256(h, keys), _mm256_set1_epi64x(AINV as i64)), m40);
+    (r, _mm256_cmpgt_epi64(r, caps))
 }
 
 #[cfg(not(all(target_feature = "avx512dq", target_feature = "avx512vl")))]
 #[inline(always)]
-unsafe fn unscr(v: __m256i, k: &Kern) -> (__m256i, __m256i) {
+unsafe fn unscr(v: __m256i, keys: __m256i, caps: __m256i) -> (__m256i, __m256i) {
     let key = |i: i32| match i {
-        0 => _mm256_extract_epi64::<0>(k.keys) as u64,
-        _ => _mm256_extract_epi64::<2>(k.keys) as u64,
+        0 => _mm256_extract_epi64::<0>(keys) as u64,
+        _ => _mm256_extract_epi64::<2>(keys) as u64,
     };
     let a = unscramble(_mm256_extract_epi64::<0>(v) as u64 & M40, key(0));
     let b = unscramble(_mm256_extract_epi64::<2>(v) as u64 & M40, key(2));
     let r = _mm256_set_epi64x(0, b as i64, 0, a as i64);
-    (r, _mm256_cmpgt_epi64(r, k.caps))
+    (r, _mm256_cmpgt_epi64(r, caps))
 }
 
 /// base-36 digits in bytes 0..8 of each half and bytes that must be zero after them:
@@ -613,6 +643,9 @@ pub struct Kern {
     keys: __m256i,
     /// the largest counter and the largest user number, each followed by no limit
     caps: __m256i,
+    /// the same for a click row: the user in word 0, nothing in word 2
+    ckeys: __m256i,
+    ccaps: __m256i,
     days: *const Day,
 }
 
@@ -627,6 +660,8 @@ impl Kern {
                 quote: f(b'"'),
                 keys: _mm256_set_epi64x(0, k.uk as i64, 0, k.ek as i64),
                 caps: _mm256_set_epi64x(i64::MAX, (k.ucap << 9) as i64 - 1, i64::MAX, k.ncap as i64 - 1),
+                ckeys: _mm256_set_epi64x(0, 0, 0, k.uk as i64),
+                ccaps: _mm256_set_epi64x(i64::MAX, i64::MAX, i64::MAX, (k.ucap << 9) as i64 - 1),
                 days,
             }
         }
@@ -720,7 +755,7 @@ pub unsafe fn ev(p: *const u8, k: &Kern) -> Option<Ev> {
     let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.mask.as_ptr()));
 
     let (n, bad_n) = ids36(two(p, p.add(c0 + 1)), T.id.get_unchecked((c0 << 6) | c1));
-    let (cu, bad_cap) = unscr(n, k);
+    let (cu, bad_cap) = unscr(n, k.keys, k.caps);
 
     let tj = T.ts.get_unchecked(((c2 - c1) << 2) + u3);
     // each date against the cache entry its day picks
@@ -776,6 +811,169 @@ pub unsafe fn dec8(end: *const u8, n: usize) -> Option<u32> {
     let y = (y.wrapping_mul(10) + (y >> 8)) & 0x00ff_00ff_00ff_00ff;
     let y = (y.wrapping_mul(100) + (y >> 16)) & 0x0000_ffff_0000_ffff;
     Some((y.wrapping_mul(10_000) + (y >> 32)) as u32)
+}
+
+// ------------------------------------------------------------------- clicks
+
+/// a user id in the low half, a campaign id in the high half; row `user raw` and row `campaign raw * 2 + plain`
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct HalfRow {
+    ctrl: [u8; 16],
+    subv: [u8; 16],
+    lz: [u8; 16],
+    pad: [u8; 16],
+}
+
+const fn uid_rows() -> [HalfRow; 64] {
+    let mut t = [HalfRow { ctrl: [0; 16], subv: [0; 16], lz: [0; 16], pad: [0; 16] }; 64];
+    let mut raw = 0;
+    while raw < 64 {
+        let x = id_half(b'u', raw);
+        t[raw] = HalfRow { ctrl: x.0, subv: x.1, lz: x.2, pad: [0; 16] };
+        raw += 1;
+    }
+    t
+}
+
+/// `c_` and one to eight digits to bytes 0..8, the letters and quotes after; `plain` is the low bit of the first byte
+const fn camp_rows() -> [HalfRow; 128] {
+    let mut t = [HalfRow { ctrl: [0x80; 16], subv: [0; 16], lz: [0; 16], pad: [0; 16] }; 128];
+    let mut j = 0;
+    while j < 128 {
+        let (raw, q) = (j / 2, 1 - j % 2);
+        let r = &mut t[j];
+        if raw >= 3 + 2 * q && raw <= 10 + 2 * q {
+            let nd = raw - 2 - 2 * q;
+            let mut i = 0;
+            while i < nd {
+                r.ctrl[8 - nd + i] = (2 + q + i) as u8;
+                r.subv[8 - nd + i] = b'0';
+                i += 1;
+            }
+            r.ctrl[8] = q as u8;
+            r.subv[8] = b'c';
+            r.ctrl[9] = 1 + q as u8;
+            r.subv[9] = b'_';
+            if q == 1 {
+                r.ctrl[10] = 0;
+                r.subv[10] = b'"';
+                r.ctrl[11] = (raw - 1) as u8;
+                r.subv[11] = b'"';
+            }
+            if nd > 1 {
+                r.lz[8 - nd] = 1;
+            }
+        } else {
+            // never zero: no such id
+            r.subv[8] = 1;
+        }
+        j += 1;
+    }
+    t
+}
+
+/// the quotes a click id of `raw` bytes may have in its first sixteen: none, or one at each end
+const fn cid_rows() -> [[u32; 2]; 64] {
+    let mut t = [[NO_PAT; 2]; 64];
+    let mut raw = 1;
+    while raw <= 16 {
+        // at most fifteen bytes of id, and not an empty one
+        if raw <= 15 {
+            t[raw][0] = 0;
+        }
+        if raw >= 3 {
+            t[raw][1] = 1 | 1 << (raw - 1);
+        }
+        raw += 1;
+    }
+    t
+}
+
+#[repr(C, align(64))]
+struct ClTables {
+    uid: [HalfRow; 64],
+    camp: [HalfRow; 128],
+    cid: [[u32; 2]; 64],
+}
+
+static TC: ClTables = ClTables { uid: uid_rows(), camp: camp_rows(), cid: cid_rows() };
+
+/// a click row the tables vouch for: an id of 1 to 15 bytes, a valid user under the cap,
+/// a campaign that is `c_` and the number `camp` with no leading zero, a valid time
+#[derive(Clone, Copy)]
+pub struct Cl {
+    pub un: u64,
+    pub camp: u64,
+    pub ts: i64,
+    /// the click id, from the row start
+    pub id: usize,
+    pub nid: usize,
+    /// bytes to the next row
+    pub next: usize,
+}
+
+/// The click row at `p`, on the terms of `ev`.
+#[inline(always)]
+pub unsafe fn cl(p: *const u8, k: &Kern) -> Option<Cl> {
+    let (a, b) = (ld2(p), ld2(p.add(32)));
+    let c = crate::split::join(eq(a, k.comma), eq(b, k.comma));
+    let n = crate::split::join(eq(a, k.nl), eq(b, k.nl));
+    let c0 = c.trailing_zeros() as usize;
+    let t = c & c.wrapping_sub(1);
+    let c1 = t.trailing_zeros() as usize;
+    let t = t & t.wrapping_sub(1);
+    let c2 = t.trailing_zeros() as usize;
+    let m = n.trailing_zeros() as usize;
+    // three commas before the first newline; a fourth would be in the time, which is read whole
+    if (m > 63) | (c2 >= m) {
+        return None;
+    }
+    // the id may hold anything but a quote inside
+    let q = _bzhi_u32(_mm_movemask_epi8(_mm_cmpeq_epi8(ld(p), _mm256_castsi256_si128(k.quote))) as u32, c0 as u32);
+    let pat = TC.cid.get_unchecked(c0);
+    let id_bad = (q != pat[0]) & (q != pat[1]);
+
+    let ur = TC.uid.get_unchecked(c1 - c0 - 1);
+    let cp = p.add(c1 + 1);
+    let cr = TC.camp.get_unchecked(((c2 - c1 - 1) << 1) | (*cp & 1) as usize);
+    let x = two(p.add(c0 + 1), cp);
+    let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, two(ur.ctrl.as_ptr(), cr.ctrl.as_ptr())), two(ur.subv.as_ptr(), cr.subv.as_ptr()));
+    let notdig = _mm256_subs_epu8(v, _mm256_set1_epi8(9));
+    // letters count as digits in the user id only
+    let notlet = _mm256_max_epu8(_mm256_subs_epu8(_mm256_sub_epi8(v, _mm256_set1_epi8(49)), _mm256_set1_epi8(25)), _mm256_set_epi64x(-1, -1, 0, 0));
+    let val = _mm256_min_epu8(v, _mm256_sub_epi8(v, _mm256_set1_epi8(39)));
+    let lz = _mm256_subs_epu8(two(ur.lz.as_ptr(), cr.lz.as_ptr()), val);
+    let cls = or_and(_mm256_min_epu8(notdig, notlet), v, _mm256_set_epi64x(-1, 0, -1, 0));
+    // base 36 below, base 10 above
+    let m1 = _mm256_maddubs_epi16(val, _mm256_set_epi64x(0x010a_010a_010a_010a, 0x010a_010a_010a_010a, 0x0124_0124_0124_0124, 0x0124_0124_0124_0124));
+    let m2 = _mm256_madd_epi16(m1, _mm256_set_epi64x(0x0001_0064_0001_0064, 0x0001_0064_0001_0064, 0x0001_0510_0001_0510, 0x0001_0510_0001_0510));
+    let nn = _mm256_add_epi64(_mm256_mul_epu32(m2, _mm256_set_epi64x(10_000, 10_000, 1_679_616, 1_679_616)), _mm256_srli_epi64::<32>(m2));
+    let (cu, bad_cap) = unscr(nn, k.ckeys, k.ccaps);
+
+    let raw = m - c2 - 1;
+    let tj = T.ts1.get_unchecked(raw);
+    let kp = p.add(c2 + tj.koff as usize);
+    let e = k.days.add(_pext_u64(rd64(kp.add(4)), tj.pm) as usize) as *const u8;
+    let bad_key = _mm_and_si128(_mm_xor_si128(ld(kp), ld(e)), ld(tj.kmask.as_ptr()));
+    let x = _mm256_zextsi128_si256(ld(p.add(m).sub(16)));
+    let d = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ld2(tj.ctrl.as_ptr())), ld2(tj.base.as_ptr()));
+    let m1 = _mm256_maddubs_epi16(d, ld2(tj.w1.as_ptr() as *const u8));
+    let m2 = _mm256_madd_epi16(m1, ld2(tj.w2.as_ptr() as *const u8));
+    let m3 = _mm256_madd_epi16(_mm256_packus_epi32(m2, m2), ld2(tj.w3.as_ptr() as *const u8));
+    let bad_a = _mm256_subs_epu8(d, ld2(tj.lim.as_ptr()));
+    let bad_b = _mm256_cmpgt_epi32(m2, ld2(tj.limv.as_ptr() as *const u8));
+    let t = _mm256_mul_epu32(m3, ld2(tj.ka.as_ptr() as *const u8));
+    let f = _mm256_mul_epi32(_mm256_srli_epi64::<32>(m3), ld2(tj.kb.as_ptr() as *const u8));
+    let r = _mm256_add_epi64(add_or_sub(t, f, d, ld2(tj.ksel.as_ptr())), _mm256_zextsi128_si256(ld(e.add(16))));
+
+    let bad = _mm256_or_si256(or3(cls, lz, _mm256_srli_epi64::<40>(nn)), or3(or3(bad_a, bad_b, bad_cap), _mm256_zextsi128_si256(bad_key), _mm256_setzero_si256()));
+    if id_bad | any(bad) {
+        return None;
+    }
+    let (un, camp, ts) = (word0(cu), word2(nn), word1(r));
+    let quoted = (q & 1) as usize;
+    Some(Cl { un, camp, ts, id: quoted, nid: c0 - 2 * quoted, next: m + 1 })
 }
 
 // ------------------------------------------------------------------- checks
@@ -952,6 +1150,105 @@ fn check_events(seed: u64, rows: usize) -> Option<usize> {
     Some(hits)
 }
 
+/// click rows as the generator writes them, damaged the same ways
+fn sample_clicks(seed: u64, rows: usize) -> Vec<u8> {
+    const DIG: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    const DATES: [&str; 6] = ["2026-04-18", "2026-04-30", "2028-02-29", "2026-05-01", "2026-02-30", "2026-04-00"];
+    let mut r = Rng(seed | 1);
+    let mut b: Vec<u8> = b"click_id,user_id,campaign_id,ts\n".to_vec();
+    let mut f: Vec<u8> = Vec::new();
+    for _ in 0..rows {
+        for letter in [b'k', b'u'] {
+            f.clear();
+            if r.below(30) != 0 {
+                f.push(if r.below(50) == 0 { b'U' } else { letter });
+                let nd = match r.below(24) {
+                    0 => r.below(20),
+                    1 => 7,
+                    _ => 8,
+                };
+                for i in 0..nd {
+                    let low = i == 0 && nd == 8 && r.below(30) != 0;
+                    f.push(DIG[r.below(if low { 14 } else { 36 })]);
+                }
+            }
+            put(&mut b, &mut r, &f, false);
+        }
+        let camp = match r.below(30) {
+            0 => r.one(&["", "c_", "c_007", "C_12", "c-12", "c_1x", "c12", "c_123456789", "c_0", "x_12"]).to_string(),
+            1 => format!("c_{}", r.below(100_000_000)),
+            _ => format!("c_{}", r.below(2500)),
+        };
+        put(&mut b, &mut r, camp.as_bytes(), false);
+        let clock = format!("{:02}:{:02}:{:02}", r.mostly(40, 24, 30), r.mostly(40, 60, 70), r.mostly(40, 60, 70));
+        let date = DATES[r.mostly(12, 3, 6)];
+        let text = match r.below(10) {
+            0 | 5 | 6 | 7 => format!("{}T{}Z", date, clock),
+            1 => format!("{}T{}{}{:02}:{:02}", date, clock, r.one(&["+", "-", "-", "+", " "]), r.mostly(20, 24, 30), r.mostly(20, 60, 70)),
+            2 | 8 | 9 => format!("17{:011}", r.below(100_000_000_000)),
+            3 => format!("{:0w$}", r.below(1_000_000_000), w = 1 + r.below(18)),
+            _ => r.one(&["", "2026-04-18 10:00:00Z", "2026-04-18T10:00:00z", "2026-04-18T10:00:00", "1.79e12", "-5", "2026-04-18T10:00:00.5Z", "2026-04-18T10:00:00+0200"]).to_string(),
+        };
+        match r.below(60) {
+            0 => {
+                put(&mut b, &mut r, text.as_bytes(), false);
+                put(&mut b, &mut r, b"x", true);
+            }
+            1 => {
+                b.pop();
+                b.push(b'\n');
+            }
+            2 => {
+                put(&mut b, &mut r, text.as_bytes(), true);
+                b.push(b'\n');
+            }
+            _ => put(&mut b, &mut r, text.as_bytes(), true),
+        }
+    }
+    b.resize(b.len() + 160, b'\n');
+    b
+}
+
+/// `cl` over sample rows, as `check_events`
+fn check_clicks(seed: u64, rows: usize) -> Option<usize> {
+    use crate::tbl::parse_ts;
+    let tight = seed & 2 != 0;
+    let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 40, ucap: if tight { 1 << 30 } else { 1 << 31 }, shift: 12 };
+    let d = sample_clicks(seed, rows);
+    let mut days = Box::new(Days::new());
+    let mut hits = 0;
+    let mut p = crate::first_line_start(&d, 0);
+    while p + crate::split::REACH <= d.len() {
+        let sc = crate::scan_line(&d, p, false);
+        let line = &d[p..sc.nl];
+        let fs = crate::fields::<4>(line, &sc);
+        if p >= 16 {
+            if let Some(e) = unsafe { cl(d.as_ptr().add(p), &Kern::new(&k, days.as_ptr())) } {
+                let Some(f) = fs else { return None };
+                let at = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
+                let same = (e.id, e.nid) == (f[0].0 as usize, at(0).len())
+                    && e.nid >= 1
+                    && e.nid <= 15
+                    && k.user(at(1)) == Some(e.un)
+                    && at(2) == format!("c_{}", e.camp).as_bytes()
+                    && parse_ts(at(3)) == Some(e.ts)
+                    && e.next == sc.nl + 1 - p;
+                if !same {
+                    return None;
+                }
+                hits += 1;
+            } else if let Some(f) = fs {
+                days.learn(&line[f[3].0 as usize..f[3].1 as usize]);
+            }
+        }
+        p = sc.nl + 1;
+    }
+    if days.e[0].key != [0; 16] || days.e[0].ms != 0 {
+        return None;
+    }
+    Some(hits)
+}
+
 /// `dec8` against the digit loop, for a field well inside its buffer
 fn dec8_agrees(f: &[u8]) -> bool {
     let want = if f.len() <= 8 { crate::digits_u32(f) } else { None };
@@ -961,6 +1258,8 @@ fn dec8_agrees(f: &[u8]) -> bool {
 /// the tables against the reference parsers, at startup
 pub fn agrees() -> bool {
     check_events(0x51_7cc1_b727_220c, 3000).is_some_and(|hits| hits > 400) && check_events(0x51_7cc1_b727_220e, 1000).is_some()
+        && check_clicks(0x2b_9921_6f1d_0c4c, 3000).is_some_and(|hits| hits > 400)
+        && check_clicks(0x2b_9921_6f1d_0c4e, 1000).is_some()
 }
 
 #[cfg(test)]
@@ -974,6 +1273,48 @@ mod tests {
             hits += check_events(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 4000).expect("a row the tables accept and the reference reads otherwise");
         }
         assert!(hits > 250_000, "too few rows accepted: {}", hits);
+    }
+
+    #[test]
+    fn click_rows_match_the_reference_parsers() {
+        let mut hits = 0;
+        for seed in 1..=300u64 {
+            hits += check_clicks(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 4000).expect("a row the tables accept and the reference reads otherwise");
+        }
+        assert!(hits > 250_000, "too few rows accepted: {}", hits);
+    }
+
+    #[test]
+    fn clean_click_rows_are_taken() {
+        let k = Keys { ek: 0x12_3456_789a, uk: 0xab_cdef_0123, ncap: 1 << 40, ucap: 1 << 31, shift: 12 };
+        let mut days = Box::new(Days::new());
+        days.learn(b"2026-04-18T");
+        days.learn(b"2026-04-17T");
+        let q = |on: bool, s: &str| if on { format!("\"{}\"", s) } else { s.to_string() };
+        let mut n = 0;
+        for bits in 0..16u32 {
+            for (id, uid) in [("k1234567", "u7654321"), ("k123456", "u1"), ("k", "u765432"), ("click-number-15", "u1234567")] {
+                for ts in ["2026-04-18T10:20:30Z", "2026-04-18T23:59:59+12:00", "2026-04-17T00:00:00-10:00", "1776500000123"] {
+                    for camp in ["c_0", "c_7", "c_12", "c_823", "c_1975", "c_12345678"] {
+                        if (bits & 2 != 0 && uid.len() < 8) || (bits & 1 != 0 && id.len() > 14) {
+                            continue;
+                        }
+                        let f = [id, uid, camp, ts];
+                        let row: Vec<String> = (0..4).map(|i| q(bits >> i & 1 != 0, f[i])).collect();
+                        if row.join(",").len() > 63 {
+                            continue;
+                        }
+                        let mut d = vec![b'\n'; 16];
+                        d.extend_from_slice(row.join(",").as_bytes());
+                        d.resize(d.len() + 160, b'\n');
+                        let e = unsafe { cl(d.as_ptr().add(16), &Kern::new(&k, days.as_ptr())) };
+                        assert!(e.is_some(), "{}", row.join(","));
+                        n += 1;
+                    }
+                }
+            }
+        }
+        assert!(n > 800, "{}", n);
     }
 
     /// every shape the generator writes must be taken, or the tables are only a detour
